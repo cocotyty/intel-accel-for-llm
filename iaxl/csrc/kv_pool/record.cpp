@@ -93,8 +93,18 @@ class Record::Impl {
             }
         }
 
+        // Re-registering a group must not un-persist it. Labels are
+        // content hashes, so a repeat submit for the same key describes
+        // the same bytes, and those bytes may already be on disk. The
+        // straightforward "INSERT OR REPLACE ... VALUES (?, ?, 0)"
+        // resets persisted to 0 in that case, and Mem::get only falls
+        // back to the Storage tier for groups the Record marks
+        // persisted -- so the data stays on disk, unreadable, and any
+        // manifest pointing at it is stranded. Keep the existing flag
+        // and only refresh created_at.
         const char *insert_sql =
-            "INSERT OR REPLACE INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 0)";
+            "INSERT INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 0) "
+            "ON CONFLICT(chunk_label) DO UPDATE SET created_at = excluded.created_at";
         SQLITE_CHECK(sqlite3_prepare_v2(db_, insert_sql, -1, &stmt_, nullptr));
 
         queue_.init();
