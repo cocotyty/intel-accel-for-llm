@@ -79,7 +79,17 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
                         return;
                     }
 
-                    IAXL_CHECK(false, "unzip_from_mem: cache key missing after retry");
+                    // Retry also failed: the entry is genuinely gone.
+                    // Report it to the waiter instead of aborting. A
+                    // missing cache entry is recoverable -- the caller
+                    // treats it as a miss and recomputes -- so killing
+                    // the whole worker process would turn a cache miss
+                    // into a service outage.
+                    std::cerr << "[iaxl] ERROR: cache miss on unzip retry (giving up): "
+                              << chunk_labels[i] << std::endl;
+                    promise->set_exception(std::make_exception_ptr(std::runtime_error(
+                        "unzip_from_mem: cache key missing after retry: " + chunk_labels[i])));
+                    return;
                 }
                 data_ptrs[i] = ptr;
             }
@@ -206,8 +216,13 @@ bool Context::zip_is_complete() {
 void Context::unzip_wait() {
     IAXL_CHECK(unzip_future_.valid(), "unzip_wait: unzip_from_mem must be called first");
     PROFILE_SCOPE_FMT("unzip_wait(%s)", name().c_str());
-    unzip_future_.get();
+    // Clear the member BEFORE get(): on a failed unzip get() rethrows,
+    // and a still-valid future would trip the destructor's
+    // "destroyed before unzip_wait completed" check -- turning a
+    // reportable error back into an abort.
+    auto fut = std::move(unzip_future_);
     unzip_future_ = std::future<void>();
+    fut.get();
 }
 
 bool Context::unzip_is_complete() {
