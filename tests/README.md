@@ -112,7 +112,6 @@ All optional except the model; defaults shown.
 | `GATE_STARTUP_TIMEOUT` | `600` | Seconds to wait for `/health` |
 | `GATE_GPU_FREE_TIMEOUT` | `60` | Seconds to wait for the previous engine to release the GPUs before starting the next one. Killing `vllm` does not reclaim anything immediately: the engine core and one worker per rank exit separately, and racing the next engine against them made a worker die mid-forward several gates into a suite run |
 | `GATE_GPU_FREE_MIB` | `1024` | GPU memory below which the card counts as free; a few hundred MiB of residue from other tenants is normal |
-| `KVSHRINK_METRICS_PORT` | `18801` | Port scraped by the metrics gate |
 
 ### Gates
 
@@ -122,7 +121,6 @@ All optional except the model; defaults shown.
 | `probe_cold_hot.sh` | After a restart, does a run that RESTORES KV and GDN state produce byte-identical output to the run that computed it? Also asserts the hot run really hit the cache (otherwise identical output would prove nothing) and that no fail-closed guard fired |
 | `probe_pure_attention.sh` | Does an attention-only model still take the original code path, with unchanged output and no hybrid initialisation? |
 | `probe_hit_benefit.sh` | Is the feature worth its cost? Interleaves recompute and restore in one process and reports median TTFT for each. Fails if restoring is not faster |
-| `probe_metrics.sh` | Are all documented metric series exposed, with non-zero transfer bytes and the synchronous-save contract gauges at zero? |
 
 ### Development loop
 

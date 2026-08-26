@@ -1,55 +1,280 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scheduler-side request state for the hybrid connector.
+"""Scheduler-side (EngineCore process) KV cache planning.
 
-For each request we:
-1. run the hit policy (find_longest_cache_hit) against the backend,
-2. after vLLM allocates blocks, record per-group block tables,
-3. build load metadata: for attention groups, every hit block in the
-   prefix; for mamba groups, the single state snapshot block at the
-   restore boundary (GDN loads piggyback on the preceding attention layer's
-   wait_for_layer_load; the leading GDN segment waits at
-   start_load_kv),
-4. build incremental save metadata and track resume/cursor
-   rollback lifecycle.
+Three responsibilities that all belong to "deciding what to transfer",
+kept together because they are only ever used as one unit:
+
+- the async-load policy, which decides whether a request waits for its
+  pages in ``WAITING_FOR_REMOTE_KVS`` (freeing the GPU to run other
+  requests) or blocks a forward step;
+- ``HybridHitPolicy``, the fixed-point search for the longest boundary
+  every KV cache group can serve;
+- ``HybridRequestScheduler``, which tracks per-request block tables and
+  emits the load/save plans the worker executes.
+
+Nothing here touches GPU memory or the storage engine: this process
+only produces plans. The worker is the sole executor, so every plan
+must be self-describing.
 """
-
 from __future__ import annotations
+
+# ======================================================================
+# async load policy
+# ======================================================================
+# Configuration policy for KVShrink asynchronous KV loading.
+
 
 import logging
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Optional
 
-from .hybrid_metadata import (
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestGroupState,
-    RequestState, make_boundary_key,
-)
-from .hybrid_policy import HybridHitPolicy, LookupResult, LookupStatus
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AsyncLoadLayerConfig:
+    """Select the number of leading KV layers required before prefill."""
+
+    enabled: bool
+    dynamic: bool = False
+    fixed_layers: int = -1
+    dynamic_rules: tuple[tuple[int, Optional[int], int], ...] = ()
+
+    def select(self, concurrency: int) -> int:
+        """Return the layer count selected for the request concurrency.
+
+        A return value of zero selects synchronous loading for the request.
+        """
+        if not self.enabled:
+            return 0
+        if not self.dynamic:
+            return self.fixed_layers
+        for start, end, layers in self.dynamic_rules:
+            if concurrency >= start and (end is None or concurrency <= end):
+                return layers
+        raise RuntimeError(f"No async load layer rule for concurrency {concurrency}")
+
+
+def _parse_dynamic_layer_map(
+    specification: str,
+    num_layers: int,
+) -> tuple[tuple[int, Optional[int], int], ...]:
+    rules: list[tuple[int, Optional[int], int]] = []
+    expected_start = 0
+    entries = [entry.strip() for entry in specification.split(",")]
+
+    if not entries or any(not entry for entry in entries):
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP must not be empty"
+        )
+
+    for index, entry in enumerate(entries):
+        parts = entry.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP entries must "
+                f"use START-END:LAYERS, got {entry!r}"
+            )
+        concurrency_range, layers_text = (part.strip() for part in parts)
+        try:
+            layers = int(layers_text)
+        except ValueError as error:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP layer values "
+                f"must be integers, got {layers_text!r}"
+            ) from error
+        if not 0 <= layers < num_layers:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP layer values "
+                f"must be in [0, {num_layers}), got {layers}"
+            )
+
+        range_parts = concurrency_range.split("-")
+        if len(range_parts) != 2:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP ranges must "
+                f"use START-END:LAYERS, got {entry!r}"
+            )
+        start_text, end_text = (part.strip() for part in range_parts)
+        try:
+            start = int(start_text)
+            end = int(end_text) if end_text else None
+        except ValueError as error:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP concurrency "
+                f"range bounds must be non-negative integers, got "
+                f"{concurrency_range!r}"
+            ) from error
+        if start < 0 or (end is not None and end < 0):
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP concurrency "
+                "range bounds must be non-negative"
+            )
+        if start != expected_start:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP ranges must "
+                f"start at 0 and be contiguous; expected start "
+                f"{expected_start}, got {start}"
+            )
+        if end is None:
+            if index != len(entries) - 1:
+                raise ValueError(
+                    "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP open "
+                    "range must be the final entry"
+                )
+        elif end < start:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP range end "
+                f"must be at least its start, got {concurrency_range!r}"
+            )
+        else:
+            expected_start = end + 1
+        rules.append((start, end, layers))
+
+    if rules[-1][1] is not None:
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP must end with an "
+            "open range such as '7-:8'"
+        )
+    return tuple(rules)
+
+
+def build_async_load_layer_config(
+    async_enabled: int,
+    fixed_layers: int,
+    dynamic_enabled: int,
+    dynamic_map: str,
+    num_layers: int,
+    dynamic_map_configured: bool = True,
+) -> AsyncLoadLayerConfig:
+    """Validate async-load layer settings and build the selection policy."""
+    if async_enabled not in (0, 1):
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED must be 0 or 1, got "
+            f"{async_enabled}"
+        )
+    if dynamic_enabled not in (0, 1):
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC must be 0 or 1, got "
+            f"{dynamic_enabled}"
+        )
+
+    if not async_enabled:
+        logger.warning(
+            "Ignoring async load layer configuration because "
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=0 disables async "
+            "loading"
+        )
+        return AsyncLoadLayerConfig(enabled=False)
+
+    if dynamic_enabled:
+        if fixed_layers != -1:
+            logger.warning(
+                "Ignoring KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=%d because "
+                "dynamic async load layers are enabled",
+                fixed_layers,
+            )
+        rules = _parse_dynamic_layer_map(
+            dynamic_map,
+            num_layers,
+        )
+        return AsyncLoadLayerConfig(
+            enabled=True,
+            dynamic=True,
+            dynamic_rules=rules,
+        )
+
+    if dynamic_map_configured:
+        logger.warning(
+            "Ignoring KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP=%s "
+            "because dynamic async load layers are disabled",
+            dynamic_map,
+        )
+    if fixed_layers != -1 and not 1 <= fixed_layers < num_layers:
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS must be -1 or in "
+            f"[1, {num_layers}), got {fixed_layers}"
+        )
+    return AsyncLoadLayerConfig(
+        enabled=True,
+        fixed_layers=fixed_layers,
+    )
+
+
+def load_async_load_layer_config_from_env(
+    num_layers: int,
+    environ: Mapping[str, str] | None = None,
+) -> AsyncLoadLayerConfig:
+    """Load async KV settings exported by ``setvars.sh``.
+
+    No defaults are supplied here. This keeps ``setvars.sh`` as the single
+    source of runtime defaults and makes missing configuration explicit.
+    """
+    source = os.environ if environ is None else environ
+
+    def required(name: str) -> str:
+        try:
+            value = source[name]
+        except KeyError as error:
+            raise ValueError(
+                f"{name} must be set; source setvars.sh before starting vLLM"
+            ) from error
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        return value
+
+    def required_int(name: str) -> int:
+        value = required(name)
+        try:
+            return int(value)
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from error
+
+    return build_async_load_layer_config(
+        async_enabled=required_int(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED"
+        ),
+        fixed_layers=required_int("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS"),
+        dynamic_enabled=required_int(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC"
+        ),
+        dynamic_map=required(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
+        ),
+        num_layers=num_layers,
+        dynamic_map_configured=True,
+    )
+
+# ======================================================================
+# request scheduler (EngineCore side)
+# ======================================================================
+# Scheduler-side request state for the hybrid connector.
+#
+# For each request we:
+# 1. run the hit policy (find_longest_cache_hit) against the backend,
+# 2. after vLLM allocates blocks, record per-group block tables,
+# 3. build load metadata: for attention groups, every hit block in the
+#    prefix; for mamba groups, the single state snapshot block at the
+#    restore boundary (every GDN load is waited at start_load_kv,
+#    before forward begins),
+# 4. build incremental save metadata and track resume/cursor
+#    rollback lifecycle.
+
+
+
+from iaxl import generate_block_hashs
+from .layout import CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestGroupState, RequestState, make_boundary_key
+from .layout import LookupResult, LookupStatus, align_down
 
 # Log under the vllm.* namespace: vLLM's init_logger attaches NO
 # handler and relies on propagation to the configured "vllm" parent
 # logger, so a bare __name__ logger silently drops every record in the
 # EngineCore process.
 logger = logging.getLogger("vllm." + __name__)
-
-# Guarded import + no-op fallbacks so a
-# metrics failure can NEVER affect the inference path.
-try:
-    from .hybrid_metrics import (  # noqa: E402
-        inc as _metric_inc,
-        set_gauge as _metric_set_gauge,
-    )
-except Exception:  # pragma: no cover - fail-open by design
-    def _metric_inc(*a, **k):
-        """Metrics no-op fallback (fail-open): a broken metrics stack
-        must never break serving."""
-        pass
-
-    def _metric_set_gauge(*a, **k):
-        """Metrics no-op fallback (fail-open): a broken metrics stack
-        must never break serving."""
-        pass
 
 
 class HybridRequestScheduler:
@@ -217,7 +442,7 @@ class HybridRequestScheduler:
       A save op pairs them: keys[k] <-> gpu_block_ids[k].
 
     Everything else in this file is internal plumbing for the above
-    (key builders, hash recompute, metrics glue).
+    (key builders, hash recompute).
     """
 
     def __init__(
@@ -228,7 +453,8 @@ class HybridRequestScheduler:
         namespace: str,
         tp_size: int,
         rank: int,
-        prefix_caching_hash_algo: str = "sha256",
+        async_load_config=None,
+        block_hash_source: str = "vllm",
     ):
         self._groups = groups
         self._backend = backend
@@ -236,12 +462,31 @@ class HybridRequestScheduler:
         self._namespace = namespace
         self._tp_size = tp_size
         self._rank = rank
-        # Engine-configured block-hash algorithm
-        # (cache_config.prefix_caching_hash_algo). Only used by the
-        # defensive _hashes_from_prompt path, which MUST reproduce
-        # vLLM's own hashes byte for byte.
-        self._prefix_caching_hash_algo = prefix_caching_hash_algo
+        # Async-load policy (AsyncLoadLayerConfig). None disables it, so
+        # every request keeps the old behaviour of occupying a forward
+        # step while its pages arrive.
+        self._async_load_config = async_load_config
+        # Where a block's cache identity comes from. This is a DATA
+        # COMPATIBILITY switch, not a behavioural one: the two sources
+        # produce different key values, so flipping it makes every
+        # previously written entry unreachable (a cold cache, not a
+        # corrupt one). Each layout therefore keeps the source it was
+        # written with unless an operator says otherwise.
+        if block_hash_source not in ("vllm", "legacy"):
+            raise ValueError(
+                f"unknown block hash source {block_hash_source!r}; "
+                "expected 'vllm' or 'legacy'")
+        self._block_hash_source = block_hash_source
+        # Attention layers in execution order, used to size the
+        # early-release prefix. Mamba layers are deliberately absent:
+        # they are never partially released (see _decide_async).
+        self._attention_layers: tuple[str, ...] = tuple(
+            ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
         self._req_states: dict[str, RequestState] = {}
+        # Async requests whose load plan has not been emitted yet. See
+        # update_state_after_alloc for why this cannot be derived from
+        # the scheduler output.
+        self._async_load_pending: set[str] = set()
         self.cursor_rollbacks = 0
         """Record the per-group layout, hit-policy backend and TP
         identity, and own the per-request RequestState table plus the
@@ -266,7 +511,7 @@ class HybridRequestScheduler:
     # ------------------------------------------------------------------
     def on_new_request(
         self, req_id: str, block_hashes: list[int],
-        num_computed_tokens: int,
+        num_computed_tokens: int, request_obj=None,
     ) -> None:
         """Register a fresh RequestState. Internal: called by us from
         get_num_new_matched_tokens / build_load_meta /
@@ -274,17 +519,105 @@ class HybridRequestScheduler:
         (vLLM has no dedicated "new request" connector hook)."""
         self._req_states[req_id] = RequestState(
             request=req_id,
+            request_obj=request_obj,
             block_hashes=list(block_hashes),
             num_locally_computed_tokens=num_computed_tokens,
             groups=tuple(
                 RequestGroupState() for _ in self._groups),
         )
 
+    def take_async_load_plans(self, already_emitted: set) -> list:
+        """Load plans for requests vLLM parked, drained exactly once.
+
+        Emitting twice would submit a second transfer for a request that
+        already has one in flight; the worker refuses that outright,
+        because the first submission's tasks would be left with nothing
+        to drain them.
+
+        ``already_emitted`` lets the caller skip requests whose plan was
+        produced by the normal path in this same step (a request can be
+        both newly scheduled and pending here if vLLM changed its mind
+        between passes).
+        """
+        plans = []
+        for req_id in sorted(self._async_load_pending - already_emitted):
+            state = self._req_states.get(req_id)
+            if state is None:
+                continue
+            meta = self._build_load_meta_from_state(
+                req_id, state, scheduled_tokens=0)
+            state.async_plan_emitted = True
+            # Downgrade to synchronous from here on. Once released, vLLM
+            # reschedules the request through the ordinary new-request
+            # path, which builds a plan again. Leaving is_async set would
+            # make the worker open a SECOND cross-step transfer and
+            # report the request finished a second time -- by which point
+            # it is RUNNING, and vLLM asserts that a finished-recving
+            # request is either parked or done.
+            state.is_async = False
+            if meta is not None and meta.group_ops:
+                plans.append(meta)
+            else:
+                logger.warning(
+                    "async req=%s has no restorable pages; dropping the "
+                    "plan so it is recomputed rather than left waiting",
+                    req_id)
+        self._async_load_pending -= (self._async_load_pending
+                                     - already_emitted)
+        return plans
+
+    def _request_block_hashes(self, request) -> list:
+        """This request's block identities, in block order.
+
+        ``legacy`` recomputes them from the token ids the way the
+        block-oriented path always has, so caches written by earlier
+        versions stay readable. ``vllm`` adopts the engine's own
+        prefix-cache hashes, which is what the boundary layout has
+        always used and what lets a hit line up with vLLM's local
+        prefix cache exactly.
+
+        Both exclude the final token, matching vLLM: a block is only
+        identified once its tokens are computed.
+        """
+        if self._block_hash_source == "vllm":
+            return list(getattr(request, "block_hashes", None) or ())
+        tokens = getattr(request, "all_token_ids", None)
+        if tokens is None:
+            # Some registration paths only carry prompt ids; fall back
+            # rather than register a request with no identity at all.
+            return list(getattr(request, "block_hashes", None) or ())
+        return [str(h) for h in generate_block_hashs(
+            tokens[:-1], self._hash_block_size)]
+
+    def _sync_block_hashes(self, state: RequestState) -> None:
+        """Adopt block hashes vLLM has added since we registered.
+
+        Without this, external caching stops at the prompt. vLLM appends
+        a hash every time a request completes a block -- during decode
+        as well as prefill -- but our copy was taken once, and the save
+        plan is bounded by len(state.block_hashes). Everything a request
+        GENERATES would therefore never be offloaded, which is exactly
+        the span the next turn of a conversation replays: the tokens
+        would be recomputed every turn despite a cache being present.
+
+        Only ever extends. A shorter live list is not a rollback we can
+        act on -- block hashes are content-addressed and append-only in
+        vLLM -- so it is treated as "nothing new" rather than as a
+        reason to drop hashes the save cursor may already have passed.
+        """
+        if state.request_obj is None:
+            return
+        live = self._request_block_hashes(state.request_obj)
+        if not live or len(live) <= len(state.block_hashes):
+            return
+        state.block_hashes.extend(live[len(state.block_hashes):])
+
     def on_request_finished(self, req_id: str) -> None:
         """vLLM trigger: core frees the request ->
         connector.request_finished -> here. Drop the RequestState;
         committed boundaries are content-addressed and stay."""
         self._req_states.pop(req_id, None)
+        self._async_load_pending.discard(req_id)
 
     def on_cached_request(
         self, req_id: str, new_block_ids, resumed: bool,
@@ -306,12 +639,13 @@ class HybridRequestScheduler:
         missing resumed flag -- fail-closed) every group's cursor rolls
         back to floor(N / block_size): boundaries emitted before a
         preemption but never provably persisted are re-emitted.
-        Re-emission is safe (idempotent overwrite + checksum re-commit);
+        Re-emission is safe (writing a block again is idempotent);
         NOT rolling back permanently skips un-persisted
         boundaries."""
         state = self._req_states.get(req_id)
         if state is None:
             return
+        self._sync_block_hashes(state)
         old_progress = max(state.num_locally_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
@@ -329,9 +663,6 @@ class HybridRequestScheduler:
                 safe = safe_n // group.block_size
                 if gstate.next_stored_chunk_idx > safe:
                     self.cursor_rollbacks += 1
-                    _metric_set_gauge(
-                        "kvshrink_cursor_rollbacks",
-                        value=float(self.cursor_rollbacks))
                     if os.getenv("KVSHRINK_DEBUG_LOG"):
                         logger.info(
                             "cursor rollback req=%s g%d: %d -> %d "
@@ -371,13 +702,13 @@ class HybridRequestScheduler:
         if num_computed_tokens >= request.num_tokens:
             return 0, False
         self.on_new_request(
-            request.request_id, list(request.block_hashes),
-            num_computed_tokens)
+            request.request_id, self._request_block_hashes(request),
+            num_computed_tokens, request_obj=request)
         policy = HybridHitPolicy(
             self._groups, self._backend, self._hash_block_size,
             num_computed_tokens, self._namespace, self._tp_size, self._rank)
         result, trace = policy.find_longest_cache_hit(
-            list(request.block_hashes), request.num_tokens)
+            self._request_block_hashes(request), request.num_tokens)
         if result.status == LookupStatus.HIT:
             # The policy HIT already gated on live chunk presence
             # (engine Record), so the boundary is complete by
@@ -396,22 +727,62 @@ class HybridRequestScheduler:
                 result.boundary_tokens, len(request.block_hashes), trace)
         # Metrics recorded on the FINAL completeness result (not the
         # raw policy trace).
-        try:
-            _metric_inc(
-                "kvshrink_lookup_boundary",
-                {"group": "all", "kind": "completeness",
-                 "result": result.status.value})
-        except Exception:  # pragma: no cover - fail-open
-            pass
         external = result.boundary_tokens - num_computed_tokens
         if external < 0:
             external = 0
-        if result.status == LookupStatus.HIT:
-            _metric_inc("kvshrink_external_hit_tokens", value=float(external))
+        use_async = self._decide_async(request.request_id, external)
         logger.debug(
-            "req=%s external_hit=%d boundary=%d trace=%s",
-            request.request_id, external, result.boundary_tokens, trace)
-        return external, False
+            "req=%s external_hit=%d boundary=%d async=%s trace=%s",
+            request.request_id, external, result.boundary_tokens,
+            use_async, trace)
+        return external, use_async
+
+    # ------------------------------------------------------------------
+    def _decide_async(self, req_id: str, external: int) -> bool:
+        """Should this request's pages stream in while the GPU runs
+        OTHER requests, instead of stalling a forward step on us?
+
+        Answering True hands vLLM ``load_kv_async=True``: it parks the
+        request in WAITING_FOR_REMOTE_KVS, allocates its blocks anyway
+        (so we have somewhere to write), and only reschedules it once
+        the worker names it in ``get_finished``. The alternative is what
+        we did before -- enter forward immediately and block a layer
+        hook until the bytes arrive, which idles the GPU for exactly as
+        long as the storage is slow. That cost grows with concurrency
+        and will grow again when the tier is remote rather than local
+        disk.
+
+        Concurrency is approximated by the number of live request
+        states, matching the block-path policy so one knob means one
+        thing everywhere.
+
+        Returns False (stay synchronous) when there is nothing to load,
+        when no policy is configured, or when the policy selects 0
+        layers -- 0 means "synchronous", NOT "release before any layer".
+        """
+        if external <= 0 or self._async_load_config is None:
+            return False
+        state = self._req_states.get(req_id)
+        if state is None:
+            return False
+        try:
+            selected = self._async_load_config.select(len(self._req_states))
+        except Exception:  # pragma: no cover - fail closed to sync
+            logger.exception(
+                "async load policy failed for req=%s; loading synchronously",
+                req_id)
+            return False
+        if selected == 0:
+            return False
+        state.is_async = True
+        # Clamp: asking for more leading layers than exist would never
+        # be satisfiable and would hang the request in
+        # WAITING_FOR_REMOTE_KVS forever.
+        if selected < 0 or selected > len(self._attention_layers):
+            state.async_load_layers = -1  # require every layer
+        else:
+            state.async_load_layers = selected
+        return True
 
     # ------------------------------------------------------------------
     def update_state_after_alloc(
@@ -457,7 +828,8 @@ class HybridRequestScheduler:
         state = self._req_states.get(req_id)
         if state is None:
             self.on_new_request(
-                req_id, list(request.block_hashes), 0)
+                req_id, self._request_block_hashes(request), 0,
+                request_obj=request)
             state = self._req_states[req_id]
         state.num_locally_computed_tokens = (
             state.num_locally_computed_tokens + num_external_tokens)
@@ -473,6 +845,18 @@ class HybridRequestScheduler:
                 continue
             ids = list(all_block_ids[g_idx])
             state.groups[g_idx].block_ids = ids
+        if (state.is_async and not state.async_plan_emitted
+                and num_external_tokens > 0):
+            # This is the ONLY moment we hear about an async request.
+            # vLLM allocates its blocks, calls us here, and then parks it
+            # in WAITING_FOR_REMOTE_KVS -- out of scheduled_new_reqs and
+            # out of scheduled_cached_reqs. A plan builder that walks
+            # those two lists would therefore never emit anything for
+            # it, the worker would have nothing to transfer, nothing to
+            # report finished, and the request would wait forever for a
+            # release that cannot come. Record it here and emit from the
+            # record instead.
+            self._async_load_pending.add(req_id)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
                 "update_state req=%s per-group block_ids: %s hashes=%d",
@@ -494,19 +878,13 @@ class HybridRequestScheduler:
         req_id = new_req.req_id
         state = self._req_states.get(req_id)
         if state is None:
-            self.on_new_request(
-                req_id, list(new_req.prompt_token_ids or []), 0)
-            state = self._req_states[req_id]
-            state.block_hashes = self._hashes_from_prompt(
-                new_req.prompt_token_ids or [])
-            state.num_locally_computed_tokens = new_req.num_computed_tokens
-            state.groups = tuple(
-                RequestGroupState() for _ in self._groups)
-            # populate block tables from NewRequestData
-            for g_idx in range(len(self._groups)):
-                if g_idx < len(new_req.block_ids):
-                    state.groups[g_idx].block_ids = list(
-                        new_req.block_ids[g_idx])
+            # A load plan is only ever asked for after we reported
+            # external tokens for this request, and that report is what
+            # creates the state. No state means the two disagree, and a
+            # plan built on a guess would address the wrong blocks.
+            raise RuntimeError(
+                f"kvshrink: load plan requested for unknown request "
+                f"{req_id}; get_num_new_matched_tokens never ran")
         return self._build_load_meta_from_state(
             req_id, state, scheduled_tokens,
             num_tokens=getattr(new_req, "num_tokens", "?"))
@@ -585,7 +963,7 @@ class HybridRequestScheduler:
                     blk_hash = state.block_hashes[i]
                     key = self._boundary_key(group, blk_hash)
                     if self._backend.lookup_boundary(
-                            key, group.layer_names) != LookupStatus.HIT:
+                            key) != LookupStatus.HIT:
                         break
                     # v0.21 hashes are per complete block: hash i == block i
                     if i < len(ids):
@@ -602,9 +980,9 @@ class HybridRequestScheduler:
                 # is no prev/curr distinction at execution time.
                 # preprocess_mamba's prev -> curr copy runs BEFORE
                 # start_load_kv (execute_model order), and our H2D write
-                # lands during forward (piggybacked on the preceding
-                # attention layer's wait_for_layer_load), i.e. after the
-                # copy and before the GDN layer executes, so CURR is the
+                # lands before forward (waited at start_load_kv), i.e.
+                # after the copy and before any GDN layer runs, so CURR
+                # is the
                 # one correct target. Writing PREV would be dead work:
                 # the kernel never reads it that step.
                 if state.block_hashes and boundary > 0:
@@ -616,8 +994,7 @@ class HybridRequestScheduler:
                         blk_hash = state.block_hashes[idx]
                         key = self._boundary_key(group, blk_hash)
                         if self._backend.lookup_boundary(
-                                key, group.layer_names,
-                                boundary) == LookupStatus.HIT:
+                                key) == LookupStatus.HIT:
                             bs = group.block_size
                             # CURR running-state index for this step
                             # (upstream align-mode formula):
@@ -654,7 +1031,28 @@ class HybridRequestScheduler:
                             # emit wrong tokens. Fail-stop (EngineCore
                             # fatal, same semantics as the TOCTOU gate)
                             # instead of producing a partial mamba load.
-                            if scheduled_tokens <= 0:
+                            if scheduled_tokens <= 0 and not state.is_async:
+                                # SYNCHRONOUS restore with no scheduled
+                                # tokens means no forward step, so
+                                # start_load_kv never runs and the slot
+                                # stays unrestored while the core has
+                                # already credited the tokens.
+                                #
+                                # An ASYNC restore is a different thing
+                                # and is correct here. vLLM gives a
+                                # parked request zero scheduled tokens,
+                                # so curr_idx collapses to
+                                # (boundary - 1) // bs -- which is
+                                # exactly the index preprocess_mamba
+                                # will read as prev_state_idx when the
+                                # request is finally scheduled
+                                # (num_computed_tokens == boundary by
+                                # then). Its own prev -> curr copy then
+                                # carries the snapshot into the slot
+                                # forward reads. No hook is needed
+                                # because no kernel runs until the
+                                # release gate has already waited for
+                                # the transfer.
                                 raise RuntimeError(
                                     "kvshrink mamba external HIT with "
                                     "scheduled_tokens=0 "
@@ -677,13 +1075,6 @@ class HybridRequestScheduler:
                                     keys.append(self._page_key(
                                         key, layer_name))
                                     gpu_ids.append(gpu_block)
-            if group.kind == "mamba" and keys:
-                # One state snapshot restored at a boundary.
-                # The SCHEDULER is the single
-                # authoritative counter -- the worker-side increment in
-                # connector.py is removed so a TP>1 restore is never
-                # multi-source added.
-                _metric_inc("kvshrink_state_snapshot_boundary", value=1.0)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids),
@@ -693,6 +1084,8 @@ class HybridRequestScheduler:
             req_id=req_id,
             external_hit_tokens=boundary - state.num_locally_computed_tokens,
             group_ops=tuple(group_ops),
+            is_async=state.is_async,
+            async_load_layers=state.async_load_layers,
         )
 
     def build_save_meta(
@@ -731,9 +1124,9 @@ class HybridRequestScheduler:
             wait_for_save    -> per (layer, block) in the plan:
                                 read GPU block -> compress -> stage
                                 chunks under the content-hash keys
-            commit           -> atomic schema-4 manifest write; ONLY
-                                now does the boundary become visible
-                                (is_committed -> HIT) to future lookups
+                                a block becomes visible to later
+                                lookups the moment its write lands,
+                                because that write is the commit
                     |
                     v
           [any later pass / any later request]
@@ -821,10 +1214,7 @@ class HybridRequestScheduler:
         )
 
     def _boundary_key(self, group: GroupInfo, block_hash) -> CacheKey:
-        """Content-addressed boundary key for one group (the
-        layer_name="" identity). Carries namespace, tp_size, rank,
-        group and block hash, so under TP each rank addresses its own
-        shard."""
+        """This rank's boundary key for one group at one block hash."""
         return make_boundary_key(self._namespace, self._tp_size,
                                  self._rank, group.group_idx, block_hash)
 
@@ -841,36 +1231,164 @@ class HybridRequestScheduler:
             group_idx=boundary_key.group_idx,
             layer_name=layer_name)
 
-    def _hashes_from_prompt(self, token_ids: list[int]) -> list:
-        """Recompute block hashes when RequestState was never created.
+# ======================================================================
+# longest-hit policy
+# ======================================================================
+class _StoreAsBlockPool:
+    """The one thing vLLM's matching code needs that we must supply.
 
-        Reproduces vLLM v0.23's ``request_block_hasher`` exactly: the
-        same ``hash_block_tokens`` chain over FULL blocks only, with the
-        engine-configured hash function and the process-global
-        ``NONE_HASH`` as the first parent (hashes are sha256 BYTES in
-        v0.23, not v0.21's ints). A divergent hash here would not be
-        wrong data -- keys simply would not match -- but it would make
-        every such request an unconditional MISS, so it is worth
-        deriving from vLLM's own primitives rather than reimplementing.
+    ``find_longest_cache_hit`` asks a block pool "is this hash cached,
+    for these groups?" and otherwise only compares the answers. Pointing
+    that question at the external store is the whole adaptation; the
+    matching rules stay upstream's.
 
-        Defensive path only: the production flow always creates the
-        RequestState in get_num_new_matched_tokens with the request's
-        own ``block_hashes``.
+    A hit returns a placeholder rather than a block: the callers only
+    count and position the results, and the blocks the request will
+    actually use are allocated by vLLM afterwards.
+    """
+
+    __slots__ = ("_backend", "_namespace", "_tp_size", "_rank")
+
+    # Stands in for a skipped block. vLLM inserts it as padding and only
+    # ever counts it, so it needs no identity beyond being a value.
+    null_block = object()
+
+    def __init__(self, backend, namespace: str, tp_size: int, rank: int):
+        self._backend = backend
+        self._namespace = namespace
+        self._tp_size = tp_size
+        self._rank = rank
+
+    def get_cached_block(self, block_hash, kv_cache_group_ids):
+        blocks = []
+        for group_id in kv_cache_group_ids:
+            key = make_boundary_key(self._namespace, self._tp_size,
+                                    self._rank, group_id, block_hash)
+            if self._backend.lookup_boundary(key) != LookupStatus.HIT:
+                return None
+            blocks.append(_StoreAsBlockPool.null_block)
+        return blocks
+
+
+class HybridHitPolicy:
+    """Fixed-point multi-group hit detection (pure function, testable)."""
+
+    def __init__(
+        self,
+        groups: list[GroupInfo],
+        backend,
+        hash_block_size: int,
+        num_computed_tokens: int,
+        namespace: str,
+        tp_size: int,
+        rank: int,
+    ):
+        """Configure the policy for one request: groups, backend, the
+        request's computed tokens and its namespace/tp/rank identity.
+        Orders groups attention-first (tighter initial bound) and takes
+        the global mamba alignment as the minimum across mamba groups."""
+        self._groups = groups
+        self._backend = backend
+        self._hash_block_size = hash_block_size
+        self._num_computed = num_computed_tokens
+        self._namespace = namespace
+        self._tp_size = tp_size
+        self._rank = rank
+        # full attention first (tighter initial bound)
+        self._ordered = sorted(
+            groups, key=lambda g: 0 if g.kind == "attention" else 1)
+        self._mamba_align = None
+        for g in groups:
+            if g.kind == "mamba":
+                a = g.mamba_align_size
+                self._mamba_align = a if self._mamba_align is None \
+                    else min(self._mamba_align, a)
+
+    # ------------------------------------------------------------------
+    def _boundary_key(self, group: GroupInfo, block_hash: int) -> CacheKey:
+        """This rank's boundary key for one group at one block hash."""
+        return make_boundary_key(self._namespace, self._tp_size,
+                                 self._rank, group.group_idx, block_hash)
+
+    def _lookup(self, group: GroupInfo, block_hashes,
+                candidate: int) -> int:
+        """How far this group alone is restorable, in tokens.
+
+        The matching rules are vLLM's, called here rather than copied:
+        full attention is a downward-closed prefix scan, a recurrent
+        group is a right-to-left search for the nearest snapshot that
+        also sits on an alignment boundary, and each has its own
+        handling of EAGLE and of a block size that differs from the hash
+        granularity. Reimplementing that would mean our hit length
+        silently drifting from vLLM's whenever upstream refines it.
+
+        The one substitution is where "cached" is looked up: vLLM asks
+        its GPU block pool, we ask the external store.
         """
-        from vllm.utils.hashing import get_hash_fn_by_name
-        from vllm.v1.core.kv_cache_utils import hash_block_tokens
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+        manager_cls = KVCacheSpecRegistry.get_manager_class(group.spec)
+        if manager_cls is None:
+            raise RuntimeError(
+                f"kvshrink: vLLM has no cache-hit rule for "
+                f"{type(group.spec).__name__} (group {group.group_idx})")
+        # vLLM indexes the hash list directly out to max_length, so the
+        # caller owes it a length its own hashes cover. Its scheduler
+        # gets this for free (the bound comes from the same request);
+        # ours can be a boundary the request has not reached.
+        max_length = min(candidate,
+                         len(block_hashes) * group.block_size)
+        blocks = manager_cls.find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[group.group_idx],
+            block_pool=_StoreAsBlockPool(
+                self._backend, self._namespace, self._tp_size, self._rank),
+            kv_cache_spec=group.spec,
+            drop_eagle_block=False,
+            alignment_tokens=(self._mamba_align or group.block_size),
+        )
+        return len(blocks[0]) * group.block_size
 
-        hash_fn = get_hash_fn_by_name(self._prefix_caching_hash_algo)
-        bs = self._hash_block_size
-        hashes: list = []
-        parent = None
-        for i in range(0, len(token_ids), bs):
-            tokens = token_ids[i:i + bs]
-            if len(tokens) < bs:
-                break  # only complete blocks are hashed
-            # extra_keys=None: the defensive path never carries MM/LoRA
-            # keys, matching generate_block_hash_extra_keys for plain
-            # text requests.
-            parent = hash_block_tokens(hash_fn, parent, tokens, None)
-            hashes.append(parent)
-        return hashes
+    # ------------------------------------------------------------------
+    def find_longest_cache_hit(
+        self, block_hashes: list[int], max_length: int
+    ) -> tuple[LookupResult, dict]:
+        """Fixed-point convergence over all groups.
+
+        Returns (LookupResult, trace) where trace records per-group
+        decisions for logging / differential testing.
+        """
+        candidate = max_length
+        if self._mamba_align is not None:
+            # the last prompt token is always recomputed (logprobs + state)
+            candidate = min(candidate - 1,
+                            align_down(candidate - 1, self._mamba_align))
+        trace = {"iterations": [], "final": candidate}
+
+        while True:
+            changed = False
+            iteration = {}
+            for group in self._ordered:
+                kind = group.kind
+                # Every group is looked up on its own: a hit on group
+                # A says nothing about group B, whose blocks live under
+                # a different label and may never have been written.
+                hit = self._lookup(group, block_hashes, candidate)
+                iteration[group.group_idx] = {"kind": kind, "hit": hit}
+                if hit < candidate:
+                    candidate = hit
+                    changed = True
+                if candidate <= self._num_computed:
+                    trace["iterations"].append(iteration)
+                    trace["final"] = 0
+                    return (LookupResult(LookupStatus.MISS, 0), trace)
+            trace["iterations"].append(iteration)
+            if not changed:
+                break
+
+        external = candidate - self._num_computed
+        trace["final"] = candidate
+        trace["external"] = external
+        if external <= 0:
+            return (LookupResult(LookupStatus.MISS, 0), trace)
+        return (LookupResult(LookupStatus.HIT, candidate), trace)

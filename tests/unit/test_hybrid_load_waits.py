@@ -1,23 +1,18 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Piggybacked GDN loading (the replacement for the old layer-hook patch).
+"""When each kind of layer is waited for.
 
 vLLM calls ``wait_for_layer_load`` only at ATTENTION layers, never at
-GDN/mamba layers. Instead of patching vLLM, HybridWorker rides the
-attention hooks:
+GDN/mamba ones. So the two are waited differently:
 
-- ``start_load`` submits every transfer, then host-blocks ONLY on the
-  LEADING GDN segment (GDN layers that execute before the first
-  attention layer, so no hook can cover them);
-- ``wait_layer_load(attn_i)`` waits attn_i's own pages plus the GDN
-  segment that executes AFTER attn_i and before the next attention
-  layer -- those layers run after this hook returns, so waiting here is
-  in time and their transfers overlapped the preceding compute.
+- attention pages stay pipelined -- each layer's hook waits its own
+  pages, right before that layer reads them;
+- every GDN page is waited in ``start_load``, in one barrier before
+  forward begins, because no hook will ever come for it.
 
-Every GDN layer must be covered exactly once, and anything left
-un-waited at the end of a step is a fail-stop: it would mean the
-forward read unrestored state.
+Anything left un-waited at the end of a step is a fail-stop: it would
+mean forward read unrestored state.
 
 Pure logic: fake backend and canonicalizer, no GPU, no disk, no model.
 """
@@ -26,10 +21,11 @@ from __future__ import annotations
 
 import pytest
 
-from kvshrink.hybrid_metadata import (
+from conftest import make_spec
+from kvshrink.layout import (
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
-from kvshrink.hybrid_policy import LookupStatus
-from kvshrink.hybrid_worker import HybridWorker
+from kvshrink.layout import LookupStatus
+from kvshrink.worker import HybridWorker
 
 PAGE = 4096
 
@@ -39,7 +35,8 @@ def _group(g_idx, kind, layers, block_size=16):
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
         block_size=block_size, page_size_bytes=PAGE,
         mamba_cache_mode="align" if kind == "mamba" else None,
-        mamba_align_size=block_size if kind == "mamba" else None)
+        mamba_align_size=block_size if kind == "mamba" else None,
+        spec=make_spec(kind, block_size))
 
 
 class _FakeBackend:
@@ -107,37 +104,23 @@ def _load_meta(layers, group_idx, boundary=None):
 
 
 # ------------------------------------------------------------------
-# map construction
+# registration
 # ------------------------------------------------------------------
 
-def test_leading_segment_and_trailing_segments():
+def test_recurrent_layers_are_recorded():
     w = _worker()
-    assert w._leading_gdn == ("m0",)
-    assert w._piggyback_map == {"a1": ("m2", "m3"), "a4": ()}
+    assert w._mamba_layers == frozenset(GDN)
 
 
-def test_every_gdn_layer_is_covered_exactly_once():
-    w = _worker()
-    covered = list(w._leading_gdn) + [ln for seg in
-                                      w._piggyback_map.values() for ln in seg]
-    assert sorted(covered) == sorted(GDN)
-    assert len(covered) == len(set(covered))
-
-
-def test_no_leading_segment_when_attention_runs_first():
-    w = _worker(order=["a1", "m2", "m3", "a4"])
-    assert w._leading_gdn == ()
-    assert w._piggyback_map == {"a1": ("m2", "m3"), "a4": ()}
-
-
-def test_gdn_layer_missing_from_execution_order_fails_closed():
-    """A GDN layer we never place could never be waited for."""
-    with pytest.raises(RuntimeError, match="missing from the execution order"):
-        _worker(order=["m0", "a1", "m2", "a4"], gdn=GDN)  # m3 unplaced
+def test_attention_execution_order_is_recorded():
+    """The async release gate holds a request until its first N layers
+    have landed, which is a statement about position."""
+    w = _worker(order=["m0", "a1", "m2", "m3", "a4"])
+    assert w._attn_order == ("a1", "a4")
 
 
 def test_model_without_attention_layers_fails_closed():
-    """With no attention hook there is nothing to ride on."""
+    """Nothing would ever wait for an attention page."""
     groups = [_group(0, "attention", []), _group(1, "mamba", GDN)]
     w = HybridWorker(groups, {ln: None for ln in GDN}, 64, _FakeBackend(),
                      _FakeCanon(), rank=0, tp_size=1)
@@ -149,29 +132,31 @@ def test_model_without_attention_layers_fails_closed():
 # load scheduling
 # ------------------------------------------------------------------
 
-def test_start_load_waits_only_the_leading_segment():
+def test_every_recurrent_layer_is_waited_before_forward():
+    """GDN gets no per-layer hook from vLLM, so the whole recurrent set
+    is waited in start_load. Nothing may be left pending: a GDN layer
+    that reaches forward unrestored is silent output corruption."""
     be = _FakeBackend()
     w = _worker(be)
     w.start_load(_load_meta(GDN, 1, boundary=16))
     assert sorted(be.submitted) == sorted(GDN), be.submitted
-    # only the leading GDN layer is host-blocked before forward
-    assert be.waited == ["m0"], be.waited
-    # the rest stay pending for their piggyback hooks
-    assert sorted(w._load_tasks) == ["m2", "m3"]
+    assert sorted(be.waited) == sorted(GDN), be.waited
+    assert w._load_tasks == {}
 
 
-def test_attention_hook_waits_its_own_pages_and_trailing_gdn():
+def test_attention_pages_stay_pipelined():
+    """Attention keeps its per-layer hook: its pages are waited when
+    the layer is about to read them, not up front."""
     be = _FakeBackend()
     w = _worker(be)
     meta = _load_meta(ATTN, 0)
     meta.requests.append(_load_meta(GDN, 1, boundary=16).requests[0])
     w.start_load(meta)
-    assert be.waited == ["m0"]
+    # GDN waited already; no attention layer has been waited yet
+    assert sorted(be.waited) == sorted(GDN), be.waited
 
     w.wait_layer_load("a1")
-    # a1's own page plus the GDN segment that runs before a4
-    assert sorted(be.waited[1:]) == ["a1", "m2", "m3"], be.waited
-
+    assert be.waited[-1] == "a1"
     w.wait_layer_load("a4")
     assert be.waited[-1] == "a4"
     w.loads_drained_check()  # nothing left un-waited
@@ -180,8 +165,8 @@ def test_attention_hook_waits_its_own_pages_and_trailing_gdn():
 def test_unwaited_layer_at_step_end_fails_stop():
     be = _FakeBackend()
     w = _worker(be)
-    w.start_load(_load_meta(GDN, 1, boundary=16))
-    # a1's hook never fired -> m2/m3 were never restored
+    w.start_load(_load_meta(ATTN, 0))
+    # a1's hook never fired -> its pages were never restored
     with pytest.raises(RuntimeError, match="never ran"):
         w.loads_drained_check()
 
@@ -219,14 +204,15 @@ def test_mamba_toctou_change_fails_stop():
     state the core credited."""
     be = _FakeBackend(committed=False)
     w = _worker(be)
-    with pytest.raises(RuntimeError, match="TOCTOU"):
+    with pytest.raises(RuntimeError, match="boundary vanished"):
         w.start_load(_load_meta(GDN, 1, boundary=16))
-    assert be.submitted == [], "no transfer may be submitted after TOCTOU"
+    assert be.submitted == [], \
+        "no transfer may be submitted once the boundary is gone"
 
 
 def test_attention_load_needs_no_boundary_check():
     """Attention pages are per-block and content-addressed: they carry no
-    snapshot boundary and are submitted without the mamba TOCTOU gate."""
+    snapshot boundary and are submitted without the mamba gate."""
     be = _FakeBackend(committed=False)  # would fail a boundary check
     w = _worker(be)
     w.start_load(_load_meta(ATTN, 0))

@@ -4,10 +4,10 @@ v0.21 verified semantics: request.block_hashes has ONE hash per COMPLETE
 block (block_size granularity), e.g. 2135-token prompt with block_size=544
 -> 3 hashes. Tests use this granularity.
 """
-from kvshrink.hybrid_metadata import GroupInfo, CacheKey
-from kvshrink.hybrid_policy import (
-    HybridHitPolicy, LookupResult, LookupStatus,
-    align_down)
+from conftest import make_spec
+from kvshrink.layout import GroupInfo, CacheKey
+from kvshrink.layout import LookupStatus, align_down
+from kvshrink.scheduler import HybridHitPolicy
 
 
 def _group(g_idx, kind, block_size, align=None, mode="align"):
@@ -16,7 +16,7 @@ def _group(g_idx, kind, block_size, align=None, mode="align"):
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
         block_size=block_size, page_size_bytes=1024,
         mamba_cache_mode=mode if kind == "mamba" else None,
-        mamba_align_size=align)
+        mamba_align_size=align, spec=make_spec(kind, block_size))
 
 
 def _hashes(committed: set[int], n_blocks: int):
@@ -40,7 +40,7 @@ def test_attention_prefix_only():
     """[H,H,M,H] at block granularity: only first 2 blocks exist."""
     groups = [_group(0, "attention", 32)]
     b, hashes = _hashes({0, 1, 3}, 4)  # 4 blocks = 128 tokens
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 0, "ns", 2, 0)
     result, trace = policy.find_longest_cache_hit(hashes, 128)
     assert result.status == LookupStatus.HIT
     assert result.boundary_tokens == 64  # stops at hash 2 (block index 2)
@@ -73,16 +73,15 @@ def test_gdn_walks_left_when_boundary_missing():
 
 
 def test_multi_group_convergence():
-    """Attention block 32 + GDN block 16 align 32; both fully present."""
-    groups = [_group(0, "attention", 32), _group(1, "mamba", 16, align=32)]
+    """Attention and GDN groups, both fully present."""
+    groups = [_group(0, "attention", 32), _group(1, "mamba", 32, align=32)]
     b, hashes = _hashes({0, 1, 2, 3}, 4)
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 0, "ns", 2, 0)
     result, trace = policy.find_longest_cache_hit(hashes, 128)
-    # attention: hashes 0,1,2,3 -> 128? candidate=127 -> 127//32=3 -> 96
-    # mamba: align_down(127,32)=96 -> idx=96//16=6 out of range -> walk left
-    # hash3 HIT -> 64; then attention re-check 64 -> 64//32=2 hashes 0,1 -> 64
+    # the last prompt token is always recomputed: 128 -> 127, aligned
+    # down to 96. Both groups reach 96, so the loop settles there.
     assert result.status == LookupStatus.HIT
-    assert result.boundary_tokens == 64, trace
+    assert result.boundary_tokens == 96, trace
 
 
 def test_align_down_and_minus_one():
@@ -99,7 +98,7 @@ def test_local_computed_tokens_reduce_external():
     """num_computed reduces the reported external hit."""
     groups = [_group(0, "attention", 32)]
     b, hashes = _hashes({0, 1}, 2)
-    policy = HybridHitPolicy(groups, b, 16, 32, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 32, "ns", 2, 0)
     result, trace = policy.find_longest_cache_hit(hashes, 64)
     assert result.status == LookupStatus.HIT
     assert result.boundary_tokens == 64
@@ -110,7 +109,7 @@ def test_local_computed_at_boundary_is_miss():
     """num_computed == candidate boundary -> no external hit."""
     groups = [_group(0, "attention", 32)]
     b, hashes = _hashes({0, 1}, 2)
-    policy = HybridHitPolicy(groups, b, 16, 64, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 64, "ns", 2, 0)
     result, trace = policy.find_longest_cache_hit(hashes, 64)
     assert result.status == LookupStatus.MISS
     assert result.boundary_tokens == 0
@@ -119,7 +118,7 @@ def test_local_computed_at_boundary_is_miss():
 def test_no_hit():
     groups = [_group(0, "attention", 32)]
     b, hashes = _hashes(set(), 2)
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 0, "ns", 2, 0)
     result, _ = policy.find_longest_cache_hit(hashes, 64)
     assert result.status == LookupStatus.MISS
     assert result.boundary_tokens == 0
@@ -141,19 +140,6 @@ def test_boundary_table():
             assert result.status == LookupStatus.HIT, length
             assert result.boundary_tokens == expected, (
                 f"len={length} got {result.boundary_tokens} want {expected}")
-
-
-def test_none_mode_mamba_never_hits():
-    """mamba_cache_mode none -> mamba contributes 0, no external hit."""
-    groups = [
-        _group(0, "attention", 32),
-        _group(1, "mamba", 32, align=32, mode="none"),
-    ]
-    b, hashes = _hashes({0, 1, 2, 3}, 4)
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
-    result, _ = policy.find_longest_cache_hit(hashes, 128)
-    assert result.status == LookupStatus.MISS
-    assert result.boundary_tokens == 0
 
 
 def test_mamba_lookup_starts_left_of_boundary():
@@ -250,7 +236,7 @@ def test_multiple_attention_groups_all_validated():
     groups = [_group(0, "attention", 32), _group(1, "attention", 32)]
     b, hashes = _group_aware(
         {(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)}, 4)
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 0, "ns", 2, 0)
     result, trace = policy.find_longest_cache_hit(hashes, 128)
     assert result.status == LookupStatus.HIT
     assert result.boundary_tokens == 64, trace
@@ -260,7 +246,7 @@ def test_multiple_attention_groups_converge_to_zero():
     """g1 has NO committed hashes at all -> MISS, not a g0-only hit."""
     groups = [_group(0, "attention", 32), _group(1, "attention", 32)]
     b, hashes = _group_aware({(0, 0), (0, 1)}, 4)
-    policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
+    policy = HybridHitPolicy(groups, b, 32, 0, "ns", 2, 0)
     result, _ = policy.find_longest_cache_hit(hashes, 128)
     assert result.status == LookupStatus.MISS
     assert result.boundary_tokens == 0

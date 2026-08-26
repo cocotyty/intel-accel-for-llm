@@ -3,7 +3,7 @@
 vLLM calls save_kv_layer on exit of every attention layer during
 forward. HybridWorker submits that layer's async put immediately
 (overlapping the remaining layers' compute); wait_save then only
-waits/harvests/commits. GDN groups always save in wait_save (their
+waits. GDN groups always save in wait_save (their
 state is final only post-forward). These tests use a fake backend and
 fake canonicalizer -- no GPU, no disk, no model.
 """
@@ -11,8 +11,9 @@ fake canonicalizer -- no GPU, no disk, no model.
 import os
 from types import SimpleNamespace
 
-from kvshrink.hybrid_worker import HybridWorker
-from kvshrink.hybrid_metadata import (
+from kvshrink.worker import HybridWorker
+from conftest import make_spec
+from kvshrink.layout import (
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
 
 
@@ -20,7 +21,8 @@ def _group(g_idx, kind, layers):
     return GroupInfo(group_idx=g_idx, kind=kind,
                      layer_names=tuple(layers), block_size=16,
                      page_size_bytes=1024,
-                     mamba_cache_mode=None, mamba_align_size=None)
+                     mamba_cache_mode=None, mamba_align_size=None,
+                     spec=make_spec(kind, 16))
 
 
 def _key(layer_name, blk_hash=777, g_idx=0):
@@ -30,59 +32,20 @@ def _key(layer_name, blk_hash=777, g_idx=0):
 
 
 class _FakeBackend:
-    """Records submit/wait/commit calls; checksums are fabricated."""
+    """Records submit/wait calls."""
 
     def __init__(self):
         self.submits = []   # (g_idx, sorted(layers), labels)
         self.waits = 0
-        self.commits = []   # (key, expected_layers)
-        self.persisted = 0
-        self.evicted = 0
-        # Durability the Record would report for a boundary's chunks.
-        self.durable = True
-        self.unpersisted = 0          # entries still memory-only
-        self.persist_checks = []      # (g_idx, labels) per boundary
-        self.commit_saw_persisted = []  # drain count at each commit
 
     def submit_group_stores(self, g_idx, views, indices, labels):
         self.submits.append((g_idx, sorted(views), list(labels)))
         return {ln: {"layer": ln, "labels": list(labels)}
-                for ln in views}, None
+                for ln in views}
 
     def wait_group_stores(self, tasks):
         self.waits += 1
-        return {ln: [f"ck-{h}" for h in td["labels"]]
-                for ln, td in tasks.items()}
-
-    def commit_chunks(self, key, expected_layers, checksums,
-                      chunk_labels, expected_boundary_tokens=None):
-        # Records the drain count seen at commit time so a test can pin
-        # the ordering: chunks must be flushed before a manifest that
-        # points at them becomes visible.
-        self.commits.append((key, sorted(expected_layers),
-                             dict(checksums)))
-        self.commit_saw_persisted.append(self.persisted)
         return True
-
-    def chunks_are_persisted(self, group_idx, chunk_labels):
-        self.persist_checks.append((group_idx, list(chunk_labels)))
-        return self.durable
-
-    def unpersisted_count(self):
-        return self.unpersisted
-
-    def persist_engine(self, max_count):
-        self.persisted += 1
-        # Model the real engine: max_count caps ENTRIES, while the
-        # reported figure counts deduplicated GROUPS -- so it is far
-        # below max_count even when plenty is still queued.
-        drained = min(self.unpersisted, max_count)
-        self.unpersisted -= drained
-        return {"persisted": (1 if drained else 0)}
-
-    def evict_over_watermark(self, *a, **k):
-        self.evicted += 1
-        return {}
 
 
 class _FakeCanon:
@@ -137,14 +100,9 @@ def test_pipelined_attention_submits_during_forward():
     submit_layers = [sorted(v) for _g, v, _l in c._backend.submits]
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
-    # both boundaries committed with checksums from all their layers
-    by_group = {k.group_idx: (exp, ck) for k, exp, ck in
-                c._backend.commits}
-    assert sorted(by_group[0][0]) == ["a0", "a1"]
-    assert by_group[0][1]["a0"] == "ck-777"
-    assert by_group[0][1]["a1"] == "ck-777"
-    assert by_group[1][0] == ["m0"]
-    assert c._backend.persisted >= 1 and c._backend.evicted == 1
+    # every group was written and waited for
+    assert {g for g, _l, _b in c._backend.submits} == {0, 1}
+    assert c._backend.waits > 0
 
 
 def test_fallback_when_hook_never_fired():
@@ -152,11 +110,11 @@ def test_fallback_when_hook_never_fired():
     commits still correct (idempotent full coverage)."""
     _env_off()
     c = _worker()
-    c.wait_save(_save_meta())  # no save_kv_layer calls beforehand
+    _pages, nbound = c.wait_save(_save_meta())  # no save_kv_layer first
     submit_layers = [sorted(v) for _g, v, _l in c._backend.submits]
     assert ["a0"] in submit_layers and ["a1"] in submit_layers
     assert ["m0"] in submit_layers
-    assert len(c._backend.commits) == 2
+    assert nbound == 2
 
 
 def test_pipelined_disabled_by_env():
@@ -166,8 +124,7 @@ def test_pipelined_disabled_by_env():
         c = _worker()
         c.save_kv_layer("a0", _save_meta())
         assert c._backend.submits == []  # nothing during forward
-        c.wait_save(_save_meta())
-        assert len(c._backend.commits) == 2
+        assert c.wait_save(_save_meta())[1] == 2
     finally:
         os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
 
@@ -178,51 +135,17 @@ def test_save_kv_layer_ignores_mamba_and_unknown_layers():
     c.save_kv_layer("m0", _save_meta())       # mamba layer: never served
     c.save_kv_layer("no.such.layer", _save_meta())
     assert c._backend.submits == []
-    c.wait_save(_save_meta())
-    assert len(c._backend.commits) == 2
+    assert c.wait_save(_save_meta())[1] == 2
 
 
-def test_manifest_is_not_published_before_chunks_are_durable():
-    """A manifest promises a LATER process can read the boundary, and
-    that process can only read what is on disk. So the persist drain
-    must happen before any commit, never after."""
+def test_write_is_the_commit():
+    """A block is finalized by its own write, with the group's whole
+    layer set in one call. There is no separate publish step, so there
+    is nothing that can become visible before the data it names -- the
+    failure this file used to guard against cannot be expressed.
+    """
     _env_off()
-    c = _worker()
-    c.wait_save(_save_meta())
-    assert c._backend.commits, "expected boundaries to be committed"
-    # Every commit must have observed a completed drain.
-    assert all(seen > 0 for seen in c._backend.commit_saw_persisted), (
-        "a manifest was published before the persist drain ran: "
-        f"{c._backend.commit_saw_persisted}")
-
-
-def test_boundary_is_not_published_when_chunks_are_not_durable():
-    """Fail closed: if the Record cannot confirm the chunks landed, the
-    boundary is dropped (it ages out as a MISS and is recomputed) rather
-    than published as a manifest no later process could read."""
-    _env_off()
-    c = _worker()
-    c._backend.durable = False
-    pages, bounds = c.wait_save(_save_meta())
-    assert c._backend.persist_checks, "durability was never checked"
-    assert c._backend.commits == [], (
-        "published a manifest whose chunks are not on disk")
-    assert bounds == 0
-
-
-def test_persist_drains_every_entry_not_just_one_batch():
-    """The drain must empty the queue. Sizing it by persist()'s return
-    value does not: that figure counts deduplicated GROUPS while the
-    argument caps ENTRIES, so it is far below the batch size even when
-    thousands of entries are still queued -- a loop keyed on it exits
-    after one batch and strands the rest in memory."""
-    _env_off()
-    c = _worker()
-    # More than one batch of 4096 entries outstanding.
-    c._backend.unpersisted = 10000
-    c.wait_save(_save_meta())
-    assert c._backend.unpersisted == 0, (
-        "left %d entries memory-only; manifests would point at data no "
-        "later process can read" % c._backend.unpersisted)
-    assert c._backend.persisted >= 3, (
-        "expected repeated drain calls, saw %d" % c._backend.persisted)
+    w = _worker()
+    pages, boundaries = w.wait_save(_save_meta())
+    assert pages > 0 and boundaries > 0
+    assert w._backend.waits > 0, "the write was never waited for"
