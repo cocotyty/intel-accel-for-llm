@@ -365,7 +365,7 @@ def test_connector_meta_includes_resumed_load():
             num_computed_tokens=[544]),
         num_scheduled_tokens={"r1": 64})
     meta = conn.build_connector_meta(scheduler_output)
-    loads = [r for r in meta.requests if r.req_id == "r1"]
+    loads = [r for r in meta.reqs_to_load if r.req_id == "r1"]
     assert loads, "resumed request must receive load metadata"
     attn = loads[0].group_ops[0]
     assert len(attn.keys) == 34, attn

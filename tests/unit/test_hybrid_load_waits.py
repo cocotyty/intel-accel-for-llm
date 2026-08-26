@@ -99,7 +99,7 @@ def _load_meta(layers, group_idx, boundary=None):
     op = GroupTransferMeta(group_idx=group_idx, keys=keys,
                            gpu_block_ids=(5,) * len(layers),
                            snapshot_boundary_tokens=boundary)
-    return type("M", (), {"requests": [ReqMeta(req_id="r1",
+    return type("M", (), {"reqs_to_load": [ReqMeta(req_id="r1",
                                                group_ops=(op,))]})
 
 
@@ -150,7 +150,7 @@ def test_attention_pages_stay_pipelined():
     be = _FakeBackend()
     w = _worker(be)
     meta = _load_meta(ATTN, 0)
-    meta.requests.append(_load_meta(GDN, 1, boundary=16).requests[0])
+    meta.reqs_to_load.append(_load_meta(GDN, 1, boundary=16).reqs_to_load[0])
     w.start_load(meta)
     # GDN waited already; no attention layer has been waited yet
     assert sorted(be.waited) == sorted(GDN), be.waited
