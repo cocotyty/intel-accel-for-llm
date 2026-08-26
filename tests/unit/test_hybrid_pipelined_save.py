@@ -64,7 +64,7 @@ def _save_meta():
         keys=(_key("m0", blk_hash=888, g_idx=1),),
         gpu_block_ids=(20,),
         snapshot_boundary_tokens=544)
-    return SimpleNamespace(save_requests=[ReqMeta(
+    return SimpleNamespace(reqs_to_save=[ReqMeta(
         req_id="r1", group_ops=(attn_ops, mamba_ops))])
 
 

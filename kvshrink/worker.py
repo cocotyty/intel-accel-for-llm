@@ -248,7 +248,7 @@ class HybridWorker:
         npages = 0
         _t0 = _now()
         try:
-            for req_meta in getattr(metadata, "requests", []):
+            for req_meta in metadata.reqs_to_load:
                 # Async requests get their OWN sink: their tasks must
                 # survive this step, and must not be host-blocked by
                 # the GDN barrier below (that barrier is for requests
@@ -487,7 +487,7 @@ class HybridWorker:
         Returns boundary_key -> {"group_idx", "pages": {layer_name:
         (key, gpu_block_id)}, "boundary_tokens"}."""
         candidates: dict[tuple, dict] = {}
-        for req_meta in getattr(metadata, "save_requests", []):
+        for req_meta in metadata.reqs_to_save:
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     key = self._worker_key(key)

@@ -98,7 +98,7 @@ def _meta(async_layers, req_id="r1"):
             snapshot_boundary_tokens=64 if gidx == 1 else None)
     req = ReqMeta(req_id=req_id, group_ops=(op(0, ATTN), op(1, GDN)),
                   is_async=True, async_load_layers=async_layers)
-    return type("M", (), {"requests": [req]})
+    return type("M", (), {"reqs_to_load": [req]})
 
 
 # ------------------------------------------------------------------

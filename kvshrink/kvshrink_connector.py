@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -38,19 +39,17 @@ logger = logging.getLogger(__name__)
 ReqId = str
 
 
+@dataclass
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
     """Scheduler -> worker transfer plan.
 
-    ``requests`` are LOAD plans (executed before forward),
-    ``save_requests`` are SAVE plans (executed after forward). Both are
+    ``reqs_to_load`` are LOAD plans (executed before forward),
+    ``reqs_to_save`` are SAVE plans (executed after forward). Both are
     lists of ``layout.ReqMeta``; the worker only ever sees this
     object, so each plan is fully self-describing.
     """
-
-    def __init__(self):
-        super().__init__()
-        self.requests: list = []
-        self.save_requests: list = []
+    reqs_to_load: list = field(default_factory=list)
+    reqs_to_save: list = field(default_factory=list)
 
 
 
@@ -419,12 +418,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         op.group_idx, self._groups[op.group_idx].kind,
                         len(op.keys), len(op.gpu_block_ids))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
-                meta.requests.append(req_meta)
+                meta.reqs_to_load.append(req_meta)
             if save_enabled:
                 save_meta = sched.build_save_meta(
                     new_req.req_id, num_sched.get(new_req.req_id, 0))
                 if save_meta.group_ops:
-                    meta.save_requests.append(save_meta)
+                    meta.reqs_to_save.append(save_meta)
 
         # ASYNC requests ride NEITHER list: vLLM parks them in
         # WAITING_FOR_REMOTE_KVS, so they are absent from
@@ -433,13 +432,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # without it the worker would have nothing to transfer and the
         # request would wait forever to be released.
         for req_meta in sched.take_async_load_plans(
-                {r.req_id for r in meta.requests}):
+                {r.req_id for r in meta.reqs_to_load}):
             if debug:
                 logger.info(
                     "LOADMETA(async) req=%s ops=%d layers=%s",
                     req_meta.req_id, len(req_meta.group_ops),
                     req_meta.async_load_layers)
-            meta.requests.append(req_meta)
+            meta.reqs_to_load.append(req_meta)
 
         # PREEMPTION-RESUMED requests ride scheduled_cached_reqs.
         # resumed_req_ids, NOT scheduled_new_reqs. Their external-hit
@@ -457,7 +456,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "LOADMETA(resumed) req=%s ops=%d",
                     req_id, len(req_meta.group_ops))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
-                meta.requests.append(req_meta)
+                meta.reqs_to_load.append(req_meta)
 
         # Running requests cross boundaries in later steps too (chunked
         # prefill tails, decode-time crossings): sync their tables first,
@@ -475,12 +474,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 save_meta = sched.build_save_meta(
                     req_id, num_sched.get(req_id, 0))
                 if save_meta.group_ops:
-                    meta.save_requests.append(save_meta)
+                    meta.reqs_to_save.append(save_meta)
 
         if debug:
             logger.info(
                 "build_connector_meta: %d load reqs, %d save reqs",
-                len(meta.requests), len(meta.save_requests))
+                len(meta.reqs_to_load), len(meta.reqs_to_save))
         return meta
 
     def lifecycle_stats(self) -> dict:
@@ -642,8 +641,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return
         metadata = self._metadata()
         if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info("wait_for_save worker: save_requests=%d",
-                        len(metadata.save_requests))
+            logger.info("wait_for_save worker: reqs_to_save=%d",
+                        len(metadata.reqs_to_save))
         pages, boundaries = hw.wait_save(metadata)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info("chunk_save: %d pages, %d boundaries",
