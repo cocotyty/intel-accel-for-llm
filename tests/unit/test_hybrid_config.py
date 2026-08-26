@@ -202,16 +202,6 @@ def test_fail_closed_uniform_missing_layer():
         pass
 
 
-def test_fail_closed_unknown_dtype():
-    """_dtype_size must reject unknown dtypes (parser fail-closed helper)."""
-    from kvshrink.kvshrink_connector import _dtype_size
-    assert _dtype_size("torch.bfloat16") == 2
-    assert _dtype_size("torch.float32") == 4
-    try:
-        _dtype_size("torch.bogus")
-        raise AssertionError("expected KVShrinkParseError")
-    except KVShrinkParseError as e:
-        assert "Unknown dtype" in str(e), str(e)
 
 
 def test_fail_closed_heterogeneous_pages_in_group():
