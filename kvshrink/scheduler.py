@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import Optional
 
 from iaxl import generate_block_hashs
@@ -139,12 +140,8 @@ class HybridRequestScheduler:
     def _request_block_hashes(self, request) -> list:
         """This request's block identities, in block order."""
         if self._block_hash_source == "vllm":
-            return list(getattr(request, "block_hashes", None) or ())
-        tokens = getattr(request, "all_token_ids", None)
-        if tokens is None:
-            # Some registration paths only carry prompt ids; fall back
-            # rather than register a request with no identity at all.
-            return list(getattr(request, "block_hashes", None) or ())
+            return list(request.block_hashes)
+        tokens = request.all_token_ids
         return [str(h) for h in generate_block_hashs(
             tokens[:-1], self._hash_block_size)]
 
@@ -198,17 +195,14 @@ class HybridRequestScheduler:
                             resumed)
                     gstate.next_stored_chunk_idx = safe
         if new_block_ids:
-            for g_idx in range(min(len(self._groups),
-                                   len(new_block_ids))):
-                ids = new_block_ids[g_idx]
+            for gstate, ids in zip(state.groups, new_block_ids):
                 if resumed:
                     # upstream semantics: for resumed requests
                     # new_block_ids IS the table (replace), per group --
                     # including an EMPTY list, which clears stale blocks
-                    state.groups[g_idx].block_ids = list(ids) if ids \
-                        else []
+                    gstate.block_ids = list(ids) if ids else []
                 elif ids:
-                    state.groups[g_idx].block_ids.extend(ids)
+                    gstate.block_ids.extend(ids)
 
     # ------------------------------------------------------------------
     def get_num_new_matched_tokens(
@@ -229,8 +223,8 @@ class HybridRequestScheduler:
         # boundary is complete by construction; only record it.
         boundary = policy.find_longest_cache_hit(
             block_hashes, request.num_tokens)
-        state = self._req_states.get(request.request_id)
-        if boundary and state is not None and state.block_hashes:
+        state = self._req_states[request.request_id]
+        if boundary and state.block_hashes:
             state.snapshot_boundary = boundary
         else:
             boundary = 0
@@ -285,12 +279,7 @@ class HybridRequestScheduler:
         state.num_computed_tokens = (
             state.num_computed_tokens + num_external_tokens)
         state.pending_load_tokens = num_external_tokens
-        if hasattr(blocks, "get_block_ids"):
-            all_block_ids = blocks.get_block_ids()
-        else:
-            all_block_ids = tuple(
-                [b.block_id for b in group_blocks] if group_blocks else []
-                for group_blocks in blocks)
+        all_block_ids = blocks.get_block_ids()
         for g_idx, group in enumerate(self._groups):
             if g_idx >= len(all_block_ids):
                 continue
@@ -328,8 +317,7 @@ class HybridRequestScheduler:
                 f"kvshrink: load plan requested for unknown request "
                 f"{req_id}; get_num_new_matched_tokens never ran")
         return self._build_load_meta_from_state(
-            req_id, state, scheduled_tokens,
-            num_tokens=getattr(new_req, "num_tokens", "?"))
+            req_id, state, scheduled_tokens)
 
     def build_resumed_load_meta(
         self, req_id: str, scheduled_tokens: int = 0
@@ -354,7 +342,6 @@ class HybridRequestScheduler:
 
     def _build_load_meta_from_state(
         self, req_id: str, state, scheduled_tokens: int,
-        num_tokens="?",
     ) -> ReqMeta:
         """The snapshot_boundary recorded by get_num_new_matched_tokens
         is the AUTHORITATIVE restore boundary for this alloc/load. NEVER recompute here: after
@@ -366,11 +353,10 @@ class HybridRequestScheduler:
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
                 "TAIL req=%s snapshot_boundary=%d computed_before_fwd=%d "
-                "external=%d num_tokens=%s",
+                "external=%d",
                 req_id, state.snapshot_boundary,
                 state.num_computed_tokens,
-                state.snapshot_boundary - state.num_computed_tokens,
-                num_tokens)
+                state.snapshot_boundary - state.num_computed_tokens)
         group_ops = []
         for g_idx, group in enumerate(self._groups):
             ids = state.groups[g_idx].block_ids
@@ -591,13 +577,7 @@ class HybridRequestScheduler:
         """Expand a boundary key to ONE layer's page key: same
         namespace/tp/rank/hash/group as the boundary, plus the layer
         name. This is the exact page address the worker must move."""
-        return CacheKey(
-            namespace=boundary_key.namespace,
-            tp_size=boundary_key.tp_size,
-            rank=boundary_key.rank,
-            block_hash=boundary_key.block_hash,
-            group_idx=boundary_key.group_idx,
-            layer_name=layer_name)
+        return replace(boundary_key, layer_name=layer_name)
 
 # ======================================================================
 # longest-hit policy
