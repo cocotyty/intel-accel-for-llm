@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 from iaxl import KVStore, setup_root_logger
 
-from .scheduler import load_async_load_layer_config_from_env
+from .async_load_config import load_async_load_layer_config_from_env
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
