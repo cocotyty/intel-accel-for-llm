@@ -53,6 +53,7 @@ import os
 from dataclasses import replace
 from typing import Optional
 
+from .backend import group_label, lookup_boundary
 from .kvshrink_connector import CacheKey, save_enabled
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
@@ -96,23 +97,31 @@ class _AsyncLoad:
 class HybridWorker:
     """Worker-role executor for the hybrid path (see module docstring)."""
 
-    def __init__(self, groups, layer_infos, backend,
+    def __init__(self, groups, layer_infos, namespace: str,
                  canonicalizer, rank: int, tp_size: int):
-        """Wire up the worker-role pieces: the group/layer layout, the
-        boundary backend and the canonical page-view builder for this
-        rank's block pool, plus this rank's TP identity (the worker
+        """Wire up the worker-role pieces: the group/layer layout, this
+        rank's store labels and the canonical page-view builder for
+        this rank's block pool, plus this rank's TP identity (the worker
         persists and loads its OWN shard).
 
         Initializes the per-step task bookkeeping (load tasks, stashed
         attention saves) and the sticky load-poison latch -- the
         worker is the EXECUTE side; it owns the writer lease, while
-        the scheduler only plans against a read-only backend."""
+        the scheduler only plans against a read-only store."""
         self._groups = groups
         self._layer_infos = layer_infos
-        self._backend = backend
+        self._namespace = namespace
         self._canon = canonicalizer
         self.rank = rank
         self.tp_size = tp_size
+        # Store namespace per group (see backend.py's module docstring
+        # for why group and rank must be part of it).
+        self._labels = [group_label(namespace, g.group_idx, rank)
+                        for g in groups]
+        # The store cannot exist until vLLM hands over kv_caches, long
+        # after the connector is built; the connector assigns this in
+        # register_kv_caches.
+        self.store = None
 
         self._kv_caches_ref = None
         # Per-step load tasks: layer_name -> list of per-call engine
@@ -205,12 +214,60 @@ class HybridWorker:
             return key
         return replace(key, rank=self.rank)
 
-    def _layer_views(self, layer_name: str):
-        """Canonical page views over the raw KV tensors of one layer:
-        part key -> (num_blocks, page_bytes) GPU view. The chunk
-        engine moves rows of these views, indexed by GPU block id."""
-        parts = self._canon.page_view_parts(layer_name)
-        return parts
+    # ------------------------------------------------------------------
+    # store transfers
+    # ------------------------------------------------------------------
+    # A layer contributes one page view, or two when its K and V are
+    # separate tensors. The engine takes one flat tensor dict, but the
+    # caller waits a LAYER at a time (vLLM's hook fires per layer), so
+    # part views are flattened under "layer::part" keys and the
+    # returned tasks are regrouped under the layer name.
+    def _submit_group_transfer(self, op, group_idx: int, layer_views,
+                               chunk_indices, chunk_labels) -> dict:
+        """One engine call covering every layer of the group, so the
+        block is finalized by this call alone; returns per-layer tasks
+        so the caller can wait a layer at a time."""
+        tensors = {f"{ln}::{part}": view
+                   for ln, parts in layer_views.items()
+                   for part, view in parts.items()}
+        tasks = op(block_indices=list(chunk_indices),
+                   block_hashs=[str(h) for h in chunk_labels],
+                   layer_names=list(tensors),
+                   tensors=tensors,
+                   label=self._labels[group_idx])
+        by_layer: dict = {}
+        for key, task in tasks.items():
+            by_layer.setdefault(key.rsplit("::", 1)[0], {})[key] = task
+        return by_layer
+
+    def _wait_load(self, layer_tasks, wait: bool = True) -> bool:
+        """Block until the reads land, or with ``wait=False`` report
+        whether they have without consuming them -- the poll used to
+        decide if an async request may be released, which must not stall
+        the step doing the asking.
+
+        Blocking and polling report failure differently on purpose. A
+        blocking call is made when forward is about to read these
+        blocks, so an incomplete transfer is fatal. A poll is a question
+        and "not yet" is a legitimate answer.
+        """
+        if not layer_tasks:
+            return True
+        if not wait:
+            return bool(
+                self.store.get_wait(get_results=layer_tasks, wait=False))
+        if not self.store.get_wait(get_results=layer_tasks, wait=True):
+            raise RuntimeError(
+                "kvshrink load failed: get_wait reported an incomplete "
+                "transfer; forward would read unrestored blocks")
+        return True
+
+    def _wait_store(self, tasks) -> bool:
+        if not tasks:
+            return True
+        flat = {k: t for per_layer in tasks.values()
+                for k, t in per_layer.items()}
+        return self.store.put_wait(put_results=flat, wait=True)
 
     # ------------------------------------------------------------------
     # load path
@@ -330,9 +387,9 @@ class HybridWorker:
                           for td in entry.layer_tasks.get(ln, ())]
             try:
                 # Poll each submission separately: a task entry is one
-                # engine call's task set, and the backend expects one
+                # engine call's task set, and get_wait expects one
                 # such set per call, not a flattened list of them.
-                if any(not self._backend.wait_layer_loads(td, wait=False)
+                if any(not self._wait_load(td, wait=False)
                        for td in gate_tasks):
                     continue  # not landed yet; ask again next step
                 # Landed: finalize the gate layers and hand the rest to
@@ -404,7 +461,7 @@ class HybridWorker:
             # The scheduler's HIT and this submit are not atomic.
             first = self._worker_key(op.keys[0])
             boundary_key = replace(first, layer_name="")
-            if not self._backend.lookup_boundary(boundary_key):
+            if not lookup_boundary(self.store, boundary_key):
                 err = RuntimeError(
                     "kvshrink mamba load: boundary vanished after HIT "
                     f"req={req_id} boundary="
@@ -430,7 +487,7 @@ class HybridWorker:
                     f"layer={layer_name}")
                 self._poison_load(err)
                 raise err
-        views = {ln: self._layer_views(ln) for ln in by_layer}
+        views = {ln: self._canon.page_view_parts(ln) for ln in by_layer}
         # Split into calls with unique chunk labels (one engine call
         # maps chunk_labels 1:1 to chunk_indices).
         calls: list[tuple[list, list]] = []
@@ -445,8 +502,8 @@ class HybridWorker:
             calls[c][1].append(h)
         npages = 0
         for indices, labels in calls:
-            tasks = self._backend.submit_group_loads(
-                op.group_idx, views, indices, labels)
+            tasks = self._submit_group_transfer(
+                self.store.get, op.group_idx, views, indices, labels)
             for layer_name, td in tasks.items():
                 sink.setdefault(layer_name, []).append(td)
                 npages += len(indices)
@@ -456,7 +513,7 @@ class HybridWorker:
         """Host-block until these engine tasks landed (fail-stop)."""
         try:
             for td in task_dicts:
-                self._backend.wait_layer_loads(td)
+                self._wait_load(td)
         except BaseException as e:
             self._poison_load(e)
             raise
@@ -497,9 +554,10 @@ class HybridWorker:
             raise RuntimeError(
                 "kvshrink chunk save: duplicate chunk labels in one "
                 f"engine call group={g_idx} (candidates dedup broken)")
-        views = {ln: self._layer_views(ln) for ln in layer_names}
-        tasks = self._backend.submit_group_stores(
-            g_idx, views, chunk_indices, chunk_labels)
+        views = {ln: self._canon.page_view_parts(ln)
+                 for ln in layer_names}
+        tasks = self._submit_group_transfer(
+            self.store.put, g_idx, views, chunk_indices, chunk_labels)
         return tasks
 
     def save_kv_layer(self, layer_name: str, metadata) -> None:
@@ -599,11 +657,11 @@ class HybridWorker:
                     tasks = (stashed[1] if stashed is not None
                              else self._submit_group_layers_save(
                                  g_idx, [layer_name], entries))
-                    self._backend.wait_group_stores(tasks)
+                    self._wait_store(tasks)
             else:
                 tasks = self._submit_group_layers_save(
                     g_idx, list(layers), entries)
-                self._backend.wait_group_stores(tasks)
+                self._wait_store(tasks)
             chunk_indices = [gpu for gpu, _ in entries]
             npages += len(chunk_indices) * len(layers)
             # A block is finalized by its own write, with every layer of
@@ -621,7 +679,7 @@ class HybridWorker:
                 "draining", len(self._step_attn_saves),
                 sorted(self._step_attn_saves))
             for _ln, (_g, tasks) in self._step_attn_saves.items():
-                self._backend.wait_group_stores(tasks)
+                self._wait_store(tasks)
             self._step_attn_saves.clear()
         if npages:
             # Counterpart of the start_load_kv line: without it a run

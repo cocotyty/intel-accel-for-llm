@@ -26,7 +26,7 @@ def _sched(block_size=16):
                         mamba_align_size=None,
                         spec=make_spec("attention", block_size))]
     return HybridRequestScheduler(
-        groups, backend=None, hash_block_size=block_size,
+        groups, store=None, hash_block_size=block_size,
         namespace="ns", tp_size=1, rank=0)
 
 

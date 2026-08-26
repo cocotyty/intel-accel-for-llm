@@ -26,6 +26,7 @@ from typing import Optional
 
 from iaxl import generate_block_hashs
 
+from .backend import lookup_boundary
 from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta,
                      ReqMeta, ReqGroupState, ReqState, make_boundary_key)
 
@@ -35,7 +36,7 @@ from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta,
 # Scheduler-side request state for the hybrid connector.
 #
 # For each request we:
-# 1. run the hit policy (find_longest_cache_hit) against the backend,
+# 1. run the hit policy (find_longest_cache_hit) against the store,
 # 2. after vLLM allocates blocks, record per-group block tables,
 # 3. build load metadata: for attention groups, every hit block in the
 #    prefix; for mamba groups, the single state snapshot block at the
@@ -223,7 +224,7 @@ class HybridRequestScheduler:
     def __init__(
         self,
         groups: list[GroupInfo],
-        backend,
+        store,
         hash_block_size: int,
         namespace: str,
         tp_size: int,
@@ -231,17 +232,17 @@ class HybridRequestScheduler:
         async_load_config=None,
         block_hash_source: str = "vllm",
     ):
-        """Record the per-group layout, hit-policy backend and TP
-        identity, and own the per-request ReqState table plus the
-        resume/cursor-rollback counter that spans a request's whole
+        """Record the per-group layout, the read-only presence store
+        and TP identity, and own the per-request ReqState table plus
+        the resume/cursor-rollback counter that spans a request's whole
         scheduling lifecycle.
 
         This is the DECISION side of the hybrid path: it only plans
-        (hit lookup, load/save ReqMeta) against a read-only backend;
+        (hit lookup, load/save ReqMeta) against a read-only store;
         the worker executes transfers and owns the page views and this
         rank's writer lease."""
         self._groups = groups
-        self._backend = backend
+        self._store = store
         self._hash_block_size = hash_block_size
         self._namespace = namespace
         self._tp_size = tp_size
@@ -452,8 +453,8 @@ class HybridRequestScheduler:
             request.request_id, block_hashes,
             num_computed_tokens, request=request)
         policy = HybridHitPolicy(
-            self._groups, self._backend, self._hash_block_size,
-            num_computed_tokens, self._namespace, self._tp_size, self._rank)
+            self._groups, self._present, self._hash_block_size,
+            num_computed_tokens)
         # Restorable boundary in tokens; 0 = miss. The policy already
         # gated on live chunk presence (engine Record), so a nonzero
         # boundary is complete by construction; only record it.
@@ -696,7 +697,7 @@ class HybridRequestScheduler:
                         break
                     blk_hash = state.block_hashes[i]
                     key = self._boundary_key(group, blk_hash)
-                    if not self._backend.lookup_boundary(key):
+                    if not lookup_boundary(self._store, key):
                         break
                     # v0.21 hashes are per complete block: hash i == block i
                     if i < len(ids):
@@ -726,7 +727,7 @@ class HybridRequestScheduler:
                     if 0 <= idx < len(state.block_hashes):
                         blk_hash = state.block_hashes[idx]
                         key = self._boundary_key(group, blk_hash)
-                        if self._backend.lookup_boundary(key):
+                        if lookup_boundary(self._store, key):
                             bs = group.block_size
                             # CURR running-state index for this step
                             # (upstream align-mode formula):
@@ -941,6 +942,14 @@ class HybridRequestScheduler:
         return make_boundary_key(self._namespace, self._tp_size,
                                  self._rank, group.group_idx, block_hash)
 
+    def _present(self, group_idx: int, block_hash) -> bool:
+        """Store-presence predicate handed to the hit policy, which
+        plans against boundary addresses without seeing store details."""
+        return lookup_boundary(
+            self._store,
+            make_boundary_key(self._namespace, self._tp_size, self._rank,
+                              group_idx, block_hash))
+
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
         """Expand a boundary key to ONE layer's page key: same
@@ -970,24 +979,19 @@ class _StoreAsBlockPool:
     actually use are allocated by vLLM afterwards.
     """
 
-    __slots__ = ("_backend", "_namespace", "_tp_size", "_rank")
+    __slots__ = ("_present",)
 
     # Stands in for a skipped block. vLLM inserts it as padding and only
     # ever counts it, so it needs no identity beyond being a value.
     null_block = object()
 
-    def __init__(self, backend, namespace: str, tp_size: int, rank: int):
-        self._backend = backend
-        self._namespace = namespace
-        self._tp_size = tp_size
-        self._rank = rank
+    def __init__(self, present):
+        self._present = present
 
     def get_cached_block(self, block_hash, kv_cache_group_ids):
         blocks = []
         for group_id in kv_cache_group_ids:
-            key = make_boundary_key(self._namespace, self._tp_size,
-                                    self._rank, group_id, block_hash)
-            if not self._backend.lookup_boundary(key):
+            if not self._present(group_id, block_hash):
                 return None
             blocks.append(_StoreAsBlockPool.null_block)
         return blocks
@@ -999,24 +1003,19 @@ class HybridHitPolicy:
     def __init__(
         self,
         groups: list[GroupInfo],
-        backend,
+        present,
         hash_block_size: int,
         num_computed_tokens: int,
-        namespace: str,
-        tp_size: int,
-        rank: int,
     ):
-        """Configure the policy for one request: groups, backend, the
-        request's computed tokens and its namespace/tp/rank identity.
-        Orders groups attention-first (tighter initial bound) and takes
-        the global mamba alignment as the minimum across mamba groups."""
+        """Configure the policy for one request: the groups, a
+        store-presence predicate ``present(group_idx, block_hash)`` and
+        the request's computed tokens. Orders groups attention-first
+        (tighter initial bound) and takes the global mamba alignment as
+        the minimum across mamba groups."""
         self._groups = groups
-        self._backend = backend
+        self._present = present
         self._hash_block_size = hash_block_size
         self._num_computed = num_computed_tokens
-        self._namespace = namespace
-        self._tp_size = tp_size
-        self._rank = rank
         # full attention first (tighter initial bound)
         self._ordered = sorted(
             groups, key=lambda g: 0 if g.kind == "attention" else 1)
@@ -1059,8 +1058,7 @@ class HybridHitPolicy:
             block_hashes=block_hashes,
             max_length=max_length,
             kv_cache_group_ids=[group.group_idx],
-            block_pool=_StoreAsBlockPool(
-                self._backend, self._namespace, self._tp_size, self._rank),
+            block_pool=_StoreAsBlockPool(self._present),
             kv_cache_spec=group.spec,
             drop_eagle_block=False,
             alignment_tokens=(self._mamba_align or group.block_size),

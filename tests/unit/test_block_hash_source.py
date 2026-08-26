@@ -81,7 +81,7 @@ def test_unknown_value_is_refused(monkeypatch):
 # ------------------------------------------------------------------
 def _sched(source):
     return HybridRequestScheduler(
-        [_group("attention")], backend=None, hash_block_size=16,
+        [_group("attention")], store=None, hash_block_size=16,
         namespace="ns", tp_size=1, rank=0, block_hash_source=source)
 
 
