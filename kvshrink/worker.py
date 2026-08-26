@@ -99,6 +99,15 @@ class HybridWorker:
 
     def __init__(self, groups, layer_infos, num_blocks, backend,
                  canonicalizer, rank: int, tp_size: int):
+        """Wire up the worker-role pieces: the group/layer layout, the
+        boundary backend and the canonical page-view builder for this
+        rank's block pool, plus this rank's TP identity (the worker
+        persists and loads its OWN shard).
+
+        Initializes the per-step task bookkeeping (load tasks, stashed
+        attention saves) and the sticky load-poison latch -- the
+        worker is the EXECUTE side; it owns the writer lease, while
+        the scheduler only plans against a read-only backend."""
         self._groups = groups
         self._layer_infos = layer_infos
         self._num_blocks = num_blocks
@@ -131,19 +140,9 @@ class HybridWorker:
         self._attn_layer_group = {
             ln: g.group_idx for g in groups if g.kind != "mamba"
             for ln in g.layer_names}
-        # Piggyback map (built in register): attention layer name ->
-        # tuple of GDN layer names that execute after it and before the
-        # next attention layer. Plus the leading GDN segment.
+        # All GDN layer names, waited as one barrier in start_load
+        # before any attention layer runs (populated in register).
         self._mamba_layers: frozenset[str] = frozenset()
-        """Wire up the worker-role pieces: the group/layer layout, the
-        boundary backend and the canonical page-view builder for this
-        rank's block pool, plus this rank's TP identity (the worker
-        persists and loads its OWN shard).
-
-        Initializes the per-step task bookkeeping (load tasks, stashed
-        attention saves) and the sticky load-poison latch -- the
-        worker is the EXECUTE side; it owns the writer lease, while
-        the scheduler only plans against a read-only backend."""
 
     # ------------------------------------------------------------------
     # registration
