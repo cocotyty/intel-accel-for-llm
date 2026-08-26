@@ -20,7 +20,6 @@ def _info(layer_name, spec_kind, group_idx):
     return LayerPageInfo(
         num_blocks=NUM_BLOCKS,
         page_size_bytes=PAGE,
-        block_stride_bytes=PAGE, storage_offset_bytes=0,
     )
 
 

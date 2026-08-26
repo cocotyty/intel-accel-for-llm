@@ -223,8 +223,8 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 #   mamba_align_size and the final boundary recomputes exactly 1 token.
 # - Multiple groups converge via fixed-point iteration (full attention
 #   first, then mamba groups).
-# - Backend lookups return a bool (chunk tier is Record-gated,
-#   request, never allocates).
+# - Store presence lookups return a bool; any error is a MISS
+#   (fail-closed, see backend.lookup_boundary).
 # ======================================================================
 # canonical page views
 # ======================================================================
@@ -232,13 +232,14 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 #
 # Layout verified on vLLM v0.23.0 + Qwen3.5-4B TP2:
 #
-# - Attention layer: single tensor; canonical view is built per the
-#   LayerPageInfo descriptor (block_stride_bytes / storage_offset_bytes).
+# - Attention layer: single tensor; canonical view is
+#   ``(num_blocks, page_size_bytes)`` int8 over its storage, contiguous
+#   (stride == page size, offset 0 -- KVCacheTensor carries no layout
+#   beyond size).
 # - Mamba layer: ``kv_caches[layer]`` is a LIST of tensors (conv, ssm) sharing
 #   one storage. The canonical page view is rebuilt from the first tensor's
 #   storage (same approach as vLLM's offloading worker).
-# - Physical page for block_id i = view[i]; with
-#   ``block_stride_bytes > page_size_bytes`` the layout is packed.
+# - Physical page for block_id i = view[i].
 # - The block pool is GLOBAL (HMA): block ids are shared across groups; each
 #   layer simply indexes its own canonical view by block id.
 #
@@ -320,12 +321,10 @@ class Canonicalizer:
                     layer_name, N, half)
                 continue
 
-            stride = info.block_stride_bytes
-            # last page end must fit in storage:
-            # offset + stride*(num_blocks-1) + page_size
-            needed = (info.storage_offset_bytes
-                      + stride * (info.num_blocks - 1)
-                      + info.page_size_bytes)
+            # Contiguous pages: last page end must fit in storage:
+            # stride*(num_blocks-1) + page_size
+            stride = info.page_size_bytes
+            needed = stride * (info.num_blocks - 1) + info.page_size_bytes
             if needed > storage_size_bytes(raw):
                 raise ValueError(
                     f"Layer {layer_name}: descriptor requires {needed} bytes "
@@ -334,7 +333,7 @@ class Canonicalizer:
                 tensor,
                 size=(info.num_blocks, info.page_size_bytes),
                 stride=(stride, 1),
-                storage_offset=info.storage_offset_bytes,
+                storage_offset=0,
             )
             self._views[layer_name] = view
         logger.info(
@@ -413,15 +412,11 @@ def storage_size_bytes(t: torch.Tensor) -> int:
 class LayerPageInfo:
     """Canonical page info for one layer (as seen by the connector).
 
-    ``block_stride_bytes`` is the byte distance between consecutive
-    blocks: equals ``page_size_bytes`` for contiguous layouts, larger
-    for packed layouts, and may differ per layer for heterogeneous
-    pages.
+    KVCacheTensor is (size, shared_by) only, so pages are always
+    contiguous: stride == page_size_bytes, storage offset 0.
     """
     num_blocks: int  # global block pool size for this layer's view
     page_size_bytes: int
-    block_stride_bytes: int
-    storage_offset_bytes: int
 
 
 @dataclass(frozen=True)
@@ -551,15 +546,14 @@ class GroupTransferMeta:
 #
 # Fail-closed rules (never guess):
 # - unknown spec types -> KVShrinkParseError
-# - unknown dtype -> KVShrinkParseError
-# - packed / restride / non-zero storage offset layouts are parsed into
-#   LayerPageInfo.block_stride_bytes / storage_offset_bytes; canonical views
-#   are built from these descriptors, not from contiguity assumptions.
-# - heterogeneous page sizes across layers are allowed (each layer carries
-#   its own page_size_bytes).
+# - layers of one group disagreeing on page size or block size ->
+#   KVShrinkParseError (one group is one engine call, which requires
+#   identically shaped views)
+# - KVCacheTensor is (size, shared_by) only, so every page view is
+#   contiguous from storage offset 0 with stride == page_size.
 class KVShrinkParseError(ValueError):
     """Raised when the vLLM cache config cannot be parsed safely
-    (unknown spec, dtype or inconsistent layout). The parse never
+    (unknown spec or inconsistent layout). The parse never
     guesses (fail closed)."""
     pass
 
@@ -669,11 +663,10 @@ def parse_kv_cache_config(
       labels embed group_idx), and policy (attention pages are sliceable
       per block, mamba groups only at boundaries).
     - per-layer specs + ``kv_cache_tensors`` -> ``layer_infos``
-      (dict[str, LayerPageInfo]): for every layer we record its group,
-      page size (padded/unpadded), block stride / storage offset in the
-      shared GPU tensor, and dtype. Consumed by the Canonicalizer (which
-      turns those into per-block page views) and by the save/load paths
-      (how many bytes to move per page).
+      (dict[str, LayerPageInfo]): for every layer we record its page
+      size and the block-pool size its view must cover. Consumed by the
+      Canonicalizer (which turns those into per-block page views) and by
+      the save/load paths (how many bytes to move per page).
     - ``num_blocks`` -> int: global block-pool size. Consumed by
       Canonicalizer as the valid block-id range.
 
@@ -759,14 +752,9 @@ def parse_kv_cache_config(
             if t_idx is None:
                 raise KVShrinkParseError(
                     f"Layer {name} not found in kv_cache_tensors")
-            tensor = kv_cache_config.kv_cache_tensors[t_idx]
-            # KVCacheTensor is (size, shared_by) only: pages are
-            # contiguous and start at storage offset 0.
             layer_infos[name] = LayerPageInfo(
                 num_blocks=num_blocks,
                 page_size_bytes=int(spec.page_size_bytes),
-                block_stride_bytes=int(spec.page_size_bytes),
-                storage_offset_bytes=0,
             )
 
     if not groups:
@@ -915,7 +903,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             model_revision=model_config.revision or "",
             tokenizer_revision=str(
                 model_config.tokenizer_revision or ""),
-            cache_dtype=str(getattr(cache_config, "cache_dtype", "auto")),
+            cache_dtype=cache_config.cache_dtype,
             kv_schema_version=SCHEMA_VERSION,
             tp_size=tp_size,
             pp_size=1,
@@ -1099,10 +1087,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         ``request_finished`` whenever the hybrid memory allocator is on,
         which is the default for every model).
 
-        Both paths keep their own contract: hybrid frees immediately,
-        pure attention keeps deferring to get_finished(). The pure path
-        only ever has one KV cache group, so its single block list is
-        forwarded unchanged.
+        Both paths share one contract: saves are synchronous within the
+        step, so the blocks are free to reuse immediately.
         """
         return self.request_finished(request, [])
     def build_connector_meta(
@@ -1185,10 +1171,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ncts = cr.num_computed_tokens
             for i, req_id in enumerate(cr.req_ids):
                 sched.on_cached_request(
-                    req_id,
-                    new_bids[i] if i < len(new_bids) else None,
-                    req_id in resumed,
-                    ncts[i] if i < len(ncts) else None)
+                    req_id, new_bids[i], req_id in resumed, ncts[i])
                 save_meta = sched.build_save_meta(
                     req_id, num_sched.get(req_id, 0))
                 if save_meta.group_ops:
@@ -1297,7 +1280,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # connector is built before distributed init. Two ranks
                 # claiming rank 0 collide on the management port and
                 # would overwrite each other's shards.
-                rank=self._rank if self._rank is not None else self.rank,
+                rank=self._rank,
                 tp_size=self.tp_size,
             )
             self._worker.store = self.kvstore

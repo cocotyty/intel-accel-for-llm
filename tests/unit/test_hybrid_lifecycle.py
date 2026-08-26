@@ -15,17 +15,12 @@ Rulings under test:
 
 import pytest
 
-from conftest import make_spec
+from conftest import FakeBlocks, make_spec
 from kvshrink.backend import lookup_boundary
 from kvshrink.kvshrink_connector import CacheKey, GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
 PAGE = 64 * 1024
-
-
-class _Block:
-    def __init__(self, block_id):
-        self.block_id = block_id
 
 
 def _attn(bs=16):
@@ -67,7 +62,7 @@ def _setup_attn_req(sched, hashes, ids, tokens=0):
                          num_computed_tokens=tokens)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
-        ([_Block(i) for i in ids],), 0)
+        FakeBlocks((ids,)), 0)
 
 
 # ------------------------------------------------------------------
@@ -94,11 +89,11 @@ def test_mamba_resume_reemits_boundary_snapshot():
     sched.on_new_request("r1", block_hashes=[0, 1],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
-        type("R", (), {"request_id": "r1"}), ([_Block(5)],), 0)
+        type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
     m1 = sched.build_save_meta("r1", scheduled_tokens=544)
     assert len(m1.group_ops[0].keys) == 1
     assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 1
-    sched.on_cached_request("r1", ([_Block(9).block_id],), resumed=True,
+    sched.on_cached_request("r1", ([9],), resumed=True,
                             num_computed_tokens=0)
     assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 0
     m2 = sched.build_save_meta("r1", scheduled_tokens=544)
@@ -240,7 +235,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         sched.on_new_request(rid, block_hashes=[0, 1, 2, 3], num_computed_tokens=0)
         sched.update_state_after_alloc(
             type("R", (), {"request_id": rid}),
-            ([_Block(10), _Block(11), _Block(12), _Block(13)],), 0)
+            FakeBlocks(([10, 11, 12, 13],)), 0)
         sched.build_save_meta(rid, scheduled_tokens=64)  # cursor -> 4
         # preempt + resume to zero
         sched.on_cached_request(rid, ([10, 11, 12, 13],), resumed=True,
@@ -286,8 +281,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     mamba_ids = [200, 201]            # CURR slot for this step = idx 1
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
-        tuple([_Block(i) for i in ids] for ids in (attn_ids, mamba_ids)),
-        ext)
+        FakeBlocks((attn_ids, mamba_ids)), ext)
     return sched
 
 

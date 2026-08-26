@@ -13,7 +13,7 @@ so they run in the container test runner).
 from __future__ import annotations
 
 
-from conftest import make_spec
+from conftest import FakeBlocks, make_spec
 from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
@@ -60,11 +60,6 @@ def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
             | {(mamba_g, h) for h in mamba_hashes})
 
 
-class _Block:
-    def __init__(self, block_id):
-        self.block_id = block_id
-
-
 def _make(groups, committed, block_ids_per_group):
     sched = HybridRequestScheduler(groups, _Store(committed), 16,
                                    "ns", 1, 0)
@@ -72,7 +67,7 @@ def _make(groups, committed, block_ids_per_group):
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),  # request-like
-        tuple([_Block(i) for i in ids] for ids in block_ids_per_group), 0)
+        FakeBlocks(block_ids_per_group), 0)
     return sched
 
 
@@ -286,7 +281,7 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
-        ((_Block(5),),), 0)
+        FakeBlocks(((5,),)), 0)
     sched._req_states["r1"].snapshot_boundary = 1632  # idx 1631//544 = 2
     raised = None
     try:
@@ -417,7 +412,7 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     assert ext == 544, ext
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
-        tuple([_Block(i) for i in ids] for ids in ([3, 4], [5, 8])), 544)
+        FakeBlocks(([3, 4], [5, 8])), 544)
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 1088,
                        "block_ids": ([3, 4], [5, 8])}),

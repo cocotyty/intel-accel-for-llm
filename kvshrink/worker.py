@@ -110,7 +110,6 @@ class HybridWorker:
         the scheduler only plans against a read-only store."""
         self._groups = groups
         self._layer_infos = layer_infos
-        self._namespace = namespace
         self._canon = canonicalizer
         self.rank = rank
         self.tp_size = tp_size
@@ -231,7 +230,7 @@ class HybridWorker:
                    for ln, parts in layer_views.items()
                    for part, view in parts.items()}
         tasks = op(block_indices=list(chunk_indices),
-                   block_hashs=[str(h) for h in chunk_labels],
+                   block_hashs=list(chunk_labels),
                    layer_names=list(tensors),
                    tensors=tensors,
                    label=self._labels[group_idx])
@@ -262,12 +261,19 @@ class HybridWorker:
                 "transfer; forward would read unrestored blocks")
         return True
 
-    def _wait_store(self, tasks) -> bool:
+    def _wait_store(self, tasks) -> None:
+        """Host-block until these writes land. An incomplete write is
+        fail-stop, same as an incomplete load: the scheduler's save
+        cursor has already advanced past these blocks, so losing them
+        silently would skip them for the rest of the process."""
         if not tasks:
-            return True
+            return
         flat = {k: t for per_layer in tasks.values()
                 for k, t in per_layer.items()}
-        return self.store.put_wait(put_results=flat, wait=True)
+        if not self.store.put_wait(put_results=flat, wait=True):
+            raise RuntimeError(
+                "kvshrink save failed: put_wait reported an incomplete "
+                "transfer; the save cursor has already advanced")
 
     # ------------------------------------------------------------------
     # load path
