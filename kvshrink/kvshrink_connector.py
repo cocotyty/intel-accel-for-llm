@@ -332,7 +332,7 @@ class GroupInfo:
     """One vLLM KV cache group: a frozen snapshot of its storage spec."""
 
     group_idx: int
-    kind: str  # "attention" | "mamba" | "sliding_window" | "mla"
+    kind: str  # "attention" | "mamba"
     layer_names: tuple[str, ...]
     block_size: int  # tokens per block for this group
     mamba_align_size: Optional[int]  # offload chunk alignment for mamba
@@ -447,35 +447,15 @@ def compute_namespace(
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _dtype_size(dtype) -> int:
-    """Byte size of a dtype. Fail closed on unknown dtypes."""
-    s = str(dtype)
-    if "bfloat16" in s or "float16" in s:
-        return 2
-    if "float32" in s or "float" in s:
-        return 4
-    if "float64" in s or "double" in s:
-        return 8
-    if "int8" in s or "uint8" in s:
-        return 1
-    if "int16" in s or "uint16" in s:
-        return 2
-    if "int32" in s or "uint32" in s or "int" in s:
-        return 4
-    if "int64" in s or "uint64" in s or "long" in s:
-        return 8
-    raise KVShrinkParseError(f"Unknown dtype: {dtype}")
-
-
 def _spec_kind(spec) -> str:
-    """Classify a vLLM cache spec as mamba / attention /
-    sliding_window; unknown spec types raise KVShrinkParseError (fail
-    closed)."""
+    """Mamba or attention; unknown spec types raise KVShrinkParseError
+    (fail closed). Sliding-window specs are AttentionSpec subclasses and
+    are intentionally NOT distinguished: their block layout is the
+    attention one, and the hit-rule difference lives in vLLM's spec
+    registry, which is consulted directly."""
     if isinstance(spec, MambaSpec):
         return "mamba"
     if isinstance(spec, AttentionSpec):
-        if getattr(spec, "sliding_window", None) is not None:
-            return "sliding_window"
         return "attention"
     raise KVShrinkParseError(
         f"Unsupported KV cache spec {type(spec).__name__}")
@@ -544,10 +524,9 @@ def parse_kv_cache_config(
                 raise KVShrinkParseError(
                     f"Group {g_idx} layers have differing block sizes")
 
+        mamba_align = None
         if kind == "mamba":
-            mamba_spec = per_layer_specs[0][1]
-            mamba_mode = mamba_spec.mamba_cache_mode
-            align = block_size
+            mamba_mode = per_layer_specs[0][1].mamba_cache_mode
             # Every GDN snapshot is addressed by an aligned boundary, and
             # the kernels only read the block-table column for the
             # current boundary in 'align' mode. In any other mode a
@@ -564,25 +543,15 @@ def parse_kv_cache_config(
                     "(vLLM forces the mode to 'none' when prefix caching "
                     "is disabled, and disables prefix caching by default "
                     "for hybrid models)")
-            group = GroupInfo(
-                group_idx=g_idx,
-                kind=kind,
-                layer_names=tuple(g.layer_names),
-                block_size=block_size,
-                mamba_align_size=align,
-                spec=per_layer_specs[0][1],
-            )
-        elif kind in ("attention", "sliding_window"):
-            group = GroupInfo(
-                group_idx=g_idx,
-                kind=kind,
-                layer_names=tuple(g.layer_names),
-                block_size=block_size,
-                mamba_align_size=None,
-                spec=per_layer_specs[0][1],
-            )
-        else:  # pragma: no cover - _spec_kind raises first
-            raise KVShrinkParseError(f"Unsupported kind {kind}")
+            mamba_align = block_size
+        group = GroupInfo(
+            group_idx=g_idx,
+            kind=kind,
+            layer_names=tuple(g.layer_names),
+            block_size=block_size,
+            mamba_align_size=mamba_align,
+            spec=per_layer_specs[0][1],
+        )
 
         groups.append(group)
         for name, spec in per_layer_specs:
@@ -591,15 +560,6 @@ def parse_kv_cache_config(
                 raise KVShrinkParseError(
                     f"Layer {name} not found in kv_cache_tensors")
             tensor = kv_cache_config.kv_cache_tensors[t_idx]
-            # MambaSpec carries dtypes (list); AttentionSpec carries dtype.
-            if isinstance(spec, MambaSpec):
-                if not spec.dtypes:
-                    raise KVShrinkParseError(
-                        f"Layer {name} MambaSpec has empty dtypes")
-                dtype = spec.dtypes[0]
-            else:
-                dtype = spec.dtype
-            _dtype_size(dtype)  # fail closed on unknown dtype
             # KVCacheTensor is (size, shared_by) only: pages are
             # contiguous and start at storage offset 0.
             layer_infos[name] = LayerPageInfo(
