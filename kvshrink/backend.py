@@ -139,7 +139,7 @@ class KVStoreBackend:
     # -- presence ----------------------------------------------------
     def lookup_boundary(self, key):
         """Is this boundary readable, on every rank?"""
-        from .layout import LookupStatus
+        from .kvshrink_connector import LookupStatus
 
         chunk_id = str(key.hash_str)
         try:

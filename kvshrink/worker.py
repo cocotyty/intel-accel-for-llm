@@ -10,8 +10,8 @@ import os
 from dataclasses import replace
 from typing import Optional
 
-from .layout import CacheKey
-from .layout import LookupStatus
+from .kvshrink_connector import CacheKey
+from .kvshrink_connector import LookupStatus
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
 # logger (handler+level); an unconfigured logger would drop INFO
