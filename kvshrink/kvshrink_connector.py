@@ -70,13 +70,20 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    # The live vLLM Request, when we were handed one. Held so the save
-    # path can read AUTHORITATIVE block hashes as they grow: vLLM
-    # appends to Request.block_hashes every time decode completes a
-    # block, and recomputing them here instead would have to reproduce
-    # vLLM's hashing byte for byte forever. Dropped in
+    # Live, append-only list giving the request's block identity as it
+    # GROWS: decode-completed blocks are hashed onto no scheduler
+    # structure (CachedRequestData carries tokens, not hashes, and no
+    # connector hook fires for running requests -- v0.23 calls the KV
+    # connector's update_state_after_alloc only from the waiting path),
+    # so the save path reads the live list itself. Which list depends on
+    # the hash source: vLLM's own ``block_hashes`` ("vllm") or
+    # ``all_token_ids`` ("legacy", re-hashed by us). v0.23 only ever
+    # appends to either (Request.update_block_hashes / append_tokens),
+    # never rebinds; same pattern as LMCache's
+    # ConstantList(request.all_token_ids). None for requests registered
+    # without a live Request (unit tests). Dropped in
     # on_request_finished together with the rest of the state.
-    request: Any = None
+    live_source: Any = None
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     snapshot_boundary: int = 0

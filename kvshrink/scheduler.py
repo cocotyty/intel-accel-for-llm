@@ -100,8 +100,13 @@ class HybridRequestScheduler:
         get_num_new_matched_tokens / build_load_meta /
         update_state_after_alloc when a request first becomes visible
         (vLLM has no dedicated "new request" connector hook)."""
+        live_source = None
+        if request is not None:
+            live_source = (request.block_hashes
+                           if self._block_hash_source == "vllm"
+                           else request.all_token_ids)
         self._req_states[req_id] = ReqState(
-            request=request,
+            live_source=live_source,
             block_hashes=list(block_hashes),
             num_computed_tokens=num_computed_tokens,
             groups=tuple(
@@ -166,8 +171,12 @@ class HybridRequestScheduler:
         # (decode completes blocks too; without this, generated tokens
         # are never offloaded). Only ever extends -- hashes are
         # content-addressed and append-only.
-        if state.request is not None:
-            live = self._request_block_hashes(state.request)
+        if state.live_source is not None:
+            if self._block_hash_source == "vllm":
+                live = state.live_source
+            else:
+                live = [str(h) for h in generate_block_hashs(
+                    state.live_source[:-1], self._hash_block_size)]
             if len(live) > len(state.block_hashes):
                 state.block_hashes.extend(live[len(state.block_hashes):])
         old_progress = max(state.num_computed_tokens,
