@@ -86,11 +86,6 @@ class KVStoreBackend:
         self._tp_size = int(tp_size)
         self._rank = int(rank)
 
-    def close(self) -> None:
-        """The connector owns the store's lifecycle (it also serves the
-        scheduler's presence-only role), so closing is not ours to do."""
-        return None
-
     # -- helpers -----------------------------------------------------
     @property
     def _bound(self):
@@ -136,7 +131,6 @@ class KVStoreBackend:
             block_hashs=self._ids(chunk_labels),
             layer_names=list(tensors),
             tensors=tensors,
-            chunk_dim=0,
             label=self._label(group_idx)))
 
     def wait_layer_loads(self, layer_tasks, wait: bool = True) -> bool:
@@ -172,7 +166,6 @@ class KVStoreBackend:
             block_hashs=self._ids(chunk_labels),
             layer_names=list(tensors),
             tensors=tensors,
-            chunk_dim=0,
             label=self._label(group_idx)))
 
     def wait_group_stores(self, tasks) -> bool:

@@ -160,12 +160,11 @@ class KVStoreLocal:
         layer_names: Optional[List[str]] = None,
         description: str = "",
         tensors: Optional[Dict[str, torch.Tensor]] = None,
-        chunk_dim: Optional[int] = None,
         label: Optional[str] = None,
     ) -> Dict[str, Task]:
         """Write blocks to the store.
 
-        The last three arguments exist for callers whose tensors are not
+        The last two arguments exist for callers whose tensors are not
         this store's own ``kv_caches``:
 
         - ``tensors``: write THESE instead of the bound caches. Needed
@@ -173,8 +172,6 @@ class KVStoreLocal:
           conv state plus an ssm state over one storage) and must be
           presented as one uniform page view, because the engine
           requires every tensor in a call to share shape and dtype.
-        - ``chunk_dim``: which axis indexes blocks. Fixed per layout, so
-          a caller supplying its own views supplies this too.
         - ``label``: the store-side namespace. Callers that keep several
           independent block spaces (one per KV cache group, per rank)
           pass their own; the default keeps every existing key byte for
@@ -206,7 +203,7 @@ class KVStoreLocal:
         result = self.tensorzip.put(
             label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim if chunk_dim is None else chunk_dim,
+            chunk_dim=self.block_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
@@ -244,11 +241,10 @@ class KVStoreLocal:
         layer_names: Optional[List[str]] = None,
         description: str = "",
         tensors: Optional[Dict[str, torch.Tensor]] = None,
-        chunk_dim: Optional[int] = None,
         label: Optional[str] = None,
     ) -> Dict[str, Task]:
         """Read blocks back into GPU memory; see ``put`` for the last
-        three arguments. Results are keyed by layer name so a caller can
+        two arguments. Results are keyed by layer name so a caller can
         wait one layer at a time and overlap the rest with compute."""
         if self.has_only_mode:
             raise RuntimeError(
@@ -264,7 +260,7 @@ class KVStoreLocal:
         return self.tensorzip.get(
             label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim if chunk_dim is None else chunk_dim,
+            chunk_dim=self.block_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,

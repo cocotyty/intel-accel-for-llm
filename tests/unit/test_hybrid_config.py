@@ -75,7 +75,7 @@ def test_fixture_shape():
 def test_parse_real_config():
     cfg = _real_config()
     groups, layer_infos, num_blocks = parse_kv_cache_config(
-        cfg, hash_block_size=16)
+        cfg)
     assert num_blocks == 1843
     assert len(groups) == 4
     kinds = [g.kind for g in groups]
@@ -99,7 +99,7 @@ def test_recurrent_page_holds_both_states():
     page is moved as opaque bytes rather than as tensors."""
     cfg = _real_config()
     _, layer_infos, _ = parse_kv_cache_config(
-        cfg, hash_block_size=16)
+        cfg)
     lin = layer_infos["language_model.model.layers.0.linear_attn"]
     conv_bytes = 3 * 4096 * 2              # bf16
     ssm_bytes = 16 * 128 * 128 * 4         # fp32
@@ -125,7 +125,7 @@ def test_fail_closed_unknown_spec():
         kv_cache_groups=bad_groups,
     )
     try:
-        parse_kv_cache_config(bad, hash_block_size=16)
+        parse_kv_cache_config(bad)
         raise AssertionError("expected KVShrinkParseError")
     except KVShrinkParseError:
         pass
@@ -145,7 +145,7 @@ def test_groups_must_share_one_block_size():
         kv_cache_spec=dataclasses.replace(
             g.kv_cache_spec, block_size=g.kv_cache_spec.block_size * 2))
     with pytest.raises(KVShrinkParseError, match="different block sizes"):
-        parse_kv_cache_config(cfg, hash_block_size=16)
+        parse_kv_cache_config(cfg)
 
 
 def test_fail_closed_mamba_cache_mode_not_align():
@@ -171,7 +171,7 @@ def test_fail_closed_mamba_cache_mode_not_align():
         kv_cache_groups=bad_groups,
     )
     try:
-        parse_kv_cache_config(bad, hash_block_size=16)
+        parse_kv_cache_config(bad)
         raise AssertionError("expected KVShrinkParseError")
     except KVShrinkParseError as e:
         assert "align" in str(e), e
@@ -196,7 +196,7 @@ def test_fail_closed_uniform_missing_layer():
         kv_cache_groups=bad_groups,
     )
     try:
-        parse_kv_cache_config(bad, hash_block_size=16)
+        parse_kv_cache_config(bad)
         raise AssertionError("expected KVShrinkParseError")
     except KVShrinkParseError:
         pass
@@ -241,7 +241,7 @@ def test_fail_closed_heterogeneous_pages_in_group():
         kv_cache_groups=bad_groups,
     )
     try:
-        parse_kv_cache_config(bad, hash_block_size=16)
+        parse_kv_cache_config(bad)
         raise AssertionError("expected KVShrinkParseError")
     except KVShrinkParseError as e:
         assert "differing page sizes" in str(e), str(e)
@@ -251,7 +251,7 @@ def test_parse_real_config_layout_descriptors():
     """Real 4B TP2 config: contiguous pages, zero offsets (v0.21 semantics)."""
     cfg = _real_config()
     _, layer_infos, _ = parse_kv_cache_config(
-        cfg, hash_block_size=16)
+        cfg)
     info = layer_infos["language_model.model.layers.0.linear_attn"]
     assert info.block_stride_bytes == info.page_size_bytes == 1081344
     assert info.storage_offset_bytes == 0
