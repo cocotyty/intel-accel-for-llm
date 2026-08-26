@@ -31,8 +31,8 @@ def _sched(block_size=16):
 
 
 class _LiveRequest:
-    """Stands in for vLLM's Request, whose block_hashes list grows in
-    place as the request produces tokens."""
+    """Stands in for the live list vLLM's Request grows in place as the
+    request produces tokens."""
 
     def __init__(self, hashes):
         self.block_hashes = list(hashes)
@@ -40,7 +40,8 @@ class _LiveRequest:
 
 def _state(sched, live, hashes):
     st = ReqState(
-        request=live, block_hashes=list(hashes),
+        live_source=live.block_hashes if live is not None else None,
+        block_hashes=list(hashes),
         groups=tuple(ReqGroupState() for _ in sched._groups))
     sched._req_states["r1"] = st
     return st
