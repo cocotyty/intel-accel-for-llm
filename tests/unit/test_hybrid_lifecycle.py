@@ -30,14 +30,14 @@ class _Block:
 def _attn(bs=16):
     return GroupInfo(
         group_idx=0, kind="attention", layer_names=("attn.0",),
-        block_size=bs, page_size_bytes=PAGE, mamba_cache_mode=None,
+        block_size=bs,
         mamba_align_size=None, spec=make_spec("attention", bs))
 
 
 def _mamba():
     return GroupInfo(
         group_idx=0, kind="mamba", layer_names=("m.0",),
-        block_size=544, page_size_bytes=PAGE, mamba_cache_mode="align",
+        block_size=544,
         mamba_align_size=544, spec=make_spec("mamba", 544))
 
 
@@ -278,8 +278,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     groups = [
         _attn(),
         GroupInfo(group_idx=1, kind="mamba", layer_names=("m.0",),
-                  block_size=544, page_size_bytes=PAGE,
-                  mamba_cache_mode="align",
+                  block_size=544,
                   mamba_align_size=544, spec=make_spec("mamba", 544)),
     ]
     sched = HybridRequestScheduler(groups, _HitBackend(committed),

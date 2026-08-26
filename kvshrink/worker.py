@@ -97,7 +97,7 @@ class _AsyncLoad:
 class HybridWorker:
     """Worker-role executor for the hybrid path (see module docstring)."""
 
-    def __init__(self, groups, layer_infos, num_blocks, backend,
+    def __init__(self, groups, layer_infos, backend,
                  canonicalizer, rank: int, tp_size: int):
         """Wire up the worker-role pieces: the group/layer layout, the
         boundary backend and the canonical page-view builder for this
@@ -110,7 +110,6 @@ class HybridWorker:
         the scheduler only plans against a read-only backend."""
         self._groups = groups
         self._layer_infos = layer_infos
-        self._num_blocks = num_blocks
         self._backend = backend
         self._canon = canonicalizer
         self.rank = rank
