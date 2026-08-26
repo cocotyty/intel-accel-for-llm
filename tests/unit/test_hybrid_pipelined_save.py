@@ -4,7 +4,7 @@ vLLM calls save_kv_layer on exit of every attention layer during
 forward. HybridWorker submits that layer's async put immediately
 (overlapping the remaining layers' compute); wait_save then only
 waits. GDN groups always save in wait_save (their
-state is final only post-forward). These tests use a fake backend and
+state is final only post-forward). These tests use a fake store and
 fake canonicalizer -- no GPU, no disk, no model.
 """
 
@@ -30,26 +30,27 @@ def _key(layer_name, blk_hash=777, g_idx=0):
                     layer_name=layer_name)
 
 
-class _FakeBackend:
+class _FakeStore:
     """Records submit/wait calls."""
 
     def __init__(self):
-        self.submits = []   # (g_idx, sorted(layers), labels)
+        self.submits = []   # (label, sorted(layers), block_hashs)
         self.waits = 0
 
-    def submit_group_stores(self, g_idx, views, indices, labels):
-        self.submits.append((g_idx, sorted(views), list(labels)))
-        return {ln: {"layer": ln, "labels": list(labels)}
-                for ln in views}
+    def put(self, block_indices, block_hashs, layer_names, tensors,
+            label=None):
+        layers = sorted(k.rsplit("::", 1)[0] for k in tensors)
+        self.submits.append((label, layers, list(block_hashs)))
+        return {k: f"task:{k}" for k in tensors}
 
-    def wait_group_stores(self, tasks):
+    def put_wait(self, put_results, wait=True):
         self.waits += 1
         return True
 
 
 class _FakeCanon:
     def page_view_parts(self, layer_name):
-        return [layer_name], 0
+        return {"page": layer_name}
 
 
 def _save_meta():
@@ -72,8 +73,8 @@ def _worker():
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"])]
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
-                     backend=_FakeBackend(),
-                     canonicalizer=_FakeCanon(), rank=0, tp_size=1)
+                     "ns", _FakeCanon(), rank=0, tp_size=1)
+    w.store = _FakeStore()
     w._kv_caches_ref = object()  # truthy: kv caches registered
     return w
 
@@ -90,19 +91,20 @@ def test_pipelined_attention_submits_during_forward():
     # forward: vLLM calls save_kv_layer on exit of each attention layer
     c.save_kv_layer("a0", _save_meta())
     c.save_kv_layer("a1", _save_meta())
-    submits_during_fwd = list(c._backend.submits)
+    submits_during_fwd = list(c.store.submits)
     assert len(submits_during_fwd) == 2
     assert submits_during_fwd[0][1] == ["a0"]  # one layer per call
     assert submits_during_fwd[1][1] == ["a1"]
 
     c.wait_save(_save_meta())
     # attention layers were NOT re-submitted; mamba submitted at wait
-    submit_layers = [sorted(v) for _g, v, _l in c._backend.submits]
+    submit_layers = [sorted(v) for _g, v, _l in c.store.submits]
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
     # every group was written and waited for
-    assert {g for g, _l, _b in c._backend.submits} == {0, 1}
-    assert c._backend.waits > 0
+    assert {l for l, _ls, _b in c.store.submits} == {
+        "ns_g0_r0", "ns_g1_r0"}
+    assert c.store.waits > 0
 
 
 def test_fallback_when_hook_never_fired():
@@ -111,7 +113,7 @@ def test_fallback_when_hook_never_fired():
     _env_off()
     c = _worker()
     _pages, nbound = c.wait_save(_save_meta())  # no save_kv_layer first
-    submit_layers = [sorted(v) for _g, v, _l in c._backend.submits]
+    submit_layers = [sorted(v) for _g, v, _l in c.store.submits]
     assert ["a0"] in submit_layers and ["a1"] in submit_layers
     assert ["m0"] in submit_layers
     assert nbound == 2
@@ -123,7 +125,7 @@ def test_pipelined_disabled_by_env():
     try:
         c = _worker()
         c.save_kv_layer("a0", _save_meta())
-        assert c._backend.submits == []  # nothing during forward
+        assert c.store.submits == []  # nothing during forward
         assert c.wait_save(_save_meta())[1] == 2
     finally:
         os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
@@ -134,7 +136,7 @@ def test_save_kv_layer_ignores_mamba_and_unknown_layers():
     c = _worker()
     c.save_kv_layer("m0", _save_meta())       # mamba layer: never served
     c.save_kv_layer("no.such.layer", _save_meta())
-    assert c._backend.submits == []
+    assert c.store.submits == []
     assert c.wait_save(_save_meta())[1] == 2
 
 
@@ -148,4 +150,4 @@ def test_write_is_the_commit():
     w = _worker()
     pages, boundaries = w.wait_save(_save_meta())
     assert pages > 0 and boundaries > 0
-    assert w._backend.waits > 0, "the write was never waited for"
+    assert w.store.waits > 0, "the write was never waited for"

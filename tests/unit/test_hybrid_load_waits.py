@@ -14,7 +14,7 @@ GDN/mamba ones. So the two are waited differently:
 Anything left un-waited at the end of a step is a fail-stop: it would
 mean forward read unrestored state.
 
-Pure logic: fake backend and canonicalizer, no GPU, no disk, no model.
+Pure logic: fake store and canonicalizer, no GPU, no disk, no model.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _group(g_idx, kind, layers, block_size=16):
         spec=make_spec(kind, block_size))
 
 
-class _FakeBackend:
+class _FakeStore:
     """Records submits and the ORDER in which tasks are waited."""
 
     def __init__(self, committed=True):
@@ -46,19 +46,19 @@ class _FakeBackend:
         self.waited = []             # layer names, in wait order
         self.committed = committed
 
-    def submit_group_loads(self, g_idx, views, indices, labels):
-        tasks = {}
-        for ln in views:
-            self.submitted.append(ln)
-            tasks[ln] = {"layer": ln}
-        return tasks
+    def get(self, block_indices, block_hashs, layer_names, tensors,
+            label=None):
+        for k in tensors:
+            self.submitted.append(k.rsplit("::", 1)[0])
+        return {k: f"task:{k}" for k in tensors}
 
-    def wait_layer_loads(self, task):
-        self.waited.append(task["layer"])
+    def get_wait(self, get_results, wait=True):
+        for k in get_results:
+            self.waited.append(k.rsplit("::", 1)[0])
+        return True
 
-    def lookup_boundary(self, key, expected_layers=None,
-                        expected_boundary_tokens=None):
-        return True if self.committed else False
+    def has(self, chunk_labels, label=None):
+        return [self.committed]
 
 
 class _FakeCanon:
@@ -66,7 +66,7 @@ class _FakeCanon:
         pass
 
     def page_view_parts(self, layer_name):
-        return {"page": layer_name}, 0
+        return {"page": layer_name}
 
 
 # Execution order: a leading GDN layer, then attention, more GDN, and a
@@ -76,7 +76,7 @@ ATTN = ["a1", "a4"]
 GDN = ["m0", "m2", "m3"]
 
 
-def _worker(backend=None, order=ORDER, gdn=None):
+def _worker(store=None, order=ORDER, gdn=None):
     """Worker whose groups match ``order`` unless ``gdn`` overrides the
     mamba membership (used to test an unplaceable GDN layer)."""
     attn = [ln for ln in order if ln in ATTN]
@@ -84,8 +84,9 @@ def _worker(backend=None, order=ORDER, gdn=None):
               _group(1, "mamba", gdn if gdn is not None
                      else [ln for ln in order if ln in GDN])]
     layer_infos = {ln: None for ln in order}
-    w = HybridWorker(groups, layer_infos, backend or _FakeBackend(),
+    w = HybridWorker(groups, layer_infos, "ns",
                      _FakeCanon(), rank=0, tp_size=1)
+    w.store = store or _FakeStore()
     w.register({ln: None for ln in order}, order)
     return w
 
@@ -122,7 +123,7 @@ def test_attention_execution_order_is_recorded():
 def test_model_without_attention_layers_fails_closed():
     """Nothing would ever wait for an attention page."""
     groups = [_group(0, "attention", []), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in GDN}, _FakeBackend(),
+    w = HybridWorker(groups, {ln: None for ln in GDN}, _FakeStore(),
                      _FakeCanon(), rank=0, tp_size=1)
     with pytest.raises(RuntimeError, match="no attention layers"):
         w.register({ln: None for ln in GDN}, GDN)
@@ -136,7 +137,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
     """GDN gets no per-layer hook from vLLM, so the whole recurrent set
     is waited in start_load. Nothing may be left pending: a GDN layer
     that reaches forward unrestored is silent output corruption."""
-    be = _FakeBackend()
+    be = _FakeStore()
     w = _worker(be)
     w.start_load(_load_meta(GDN, 1, boundary=16))
     assert sorted(be.submitted) == sorted(GDN), be.submitted
@@ -147,7 +148,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
 def test_attention_pages_stay_pipelined():
     """Attention keeps its per-layer hook: its pages are waited when
     the layer is about to read them, not up front."""
-    be = _FakeBackend()
+    be = _FakeStore()
     w = _worker(be)
     meta = _load_meta(ATTN, 0)
     meta.reqs_to_load.requests.update(
@@ -164,7 +165,7 @@ def test_attention_pages_stay_pipelined():
 
 
 def test_unwaited_layer_at_step_end_fails_stop():
-    be = _FakeBackend()
+    be = _FakeStore()
     w = _worker(be)
     w.start_load(_load_meta(ATTN, 0))
     # a1's hook never fired -> its pages were never restored
@@ -173,7 +174,7 @@ def test_unwaited_layer_at_step_end_fails_stop():
 
 
 def test_stale_residue_from_previous_step_fails_stop():
-    be = _FakeBackend()
+    be = _FakeStore()
     w = _worker(be)
     w._load_tasks = {"m2": [{"layer": "m2"}]}
     with pytest.raises(RuntimeError, match="stale step residue"):
@@ -183,12 +184,12 @@ def test_stale_residue_from_previous_step_fails_stop():
 def test_load_poison_is_sticky_across_hooks():
     """A failed load must fail every later hook of the step, never
     degrade into a silent recompute."""
-    be = _FakeBackend()
+    be = _FakeStore()
 
-    def _boom(task):
+    def _boom(get_results, wait=True):
         raise RuntimeError("h2d failed")
 
-    be.wait_layer_loads = _boom
+    be.get_wait = _boom
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
         w.start_load(_load_meta(GDN, 1, boundary=16))
@@ -203,7 +204,7 @@ def test_mamba_toctou_change_fails_stop():
     """The committed boundary must still match the scheduler's HIT when
     the worker executes; otherwise the state we would restore is not the
     state the core credited."""
-    be = _FakeBackend(committed=False)
+    be = _FakeStore(committed=False)
     w = _worker(be)
     with pytest.raises(RuntimeError, match="boundary vanished"):
         w.start_load(_load_meta(GDN, 1, boundary=16))
@@ -214,7 +215,7 @@ def test_mamba_toctou_change_fails_stop():
 def test_attention_load_needs_no_boundary_check():
     """Attention pages are per-block and content-addressed: they carry no
     snapshot boundary and are submitted without the mamba gate."""
-    be = _FakeBackend(committed=False)  # would fail a boundary check
+    be = _FakeStore(committed=False)  # would fail a boundary check
     w = _worker(be)
     w.start_load(_load_meta(ATTN, 0))
     assert sorted(be.submitted) == sorted(ATTN)

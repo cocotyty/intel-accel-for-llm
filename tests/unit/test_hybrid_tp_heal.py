@@ -18,12 +18,12 @@ Pure logic: fake store, no GPU, no disk.
 
 from __future__ import annotations
 
-from kvshrink.backend import KVStoreBackend, group_label
+from kvshrink.backend import group_label, lookup_boundary
 from kvshrink.kvshrink_connector import CacheKey
 
 
-def _key(group_idx=0):
-    return CacheKey(namespace="ns", tp_size=2, rank=0,
+def _key(group_idx=0, tp_size=2):
+    return CacheKey(namespace="ns", tp_size=tp_size, rank=0,
                     block_hash=12345, group_idx=group_idx, layer_name="")
 
 
@@ -43,46 +43,39 @@ class _FakeStore:
         return [label in self.present]
 
 
-def _backend(present_labels, tp_size=2, blow_up=False):
-    b = KVStoreBackend(_FakeStore(present_labels, blow_up))
-    b.register_layout(namespace="ns", tp_size=tp_size, rank=0)
-    return b
-
-
 ALL = [group_label("ns", 0, 0), group_label("ns", 0, 1)]
 
 
 def test_all_ranks_present_hit():
-    assert _backend(ALL).lookup_boundary(_key()) is True
+    assert lookup_boundary(_FakeStore(ALL), _key()) is True
 
 
 def test_other_rank_missing_is_miss():
-    b = _backend([group_label("ns", 0, 0)])
-    assert b.lookup_boundary(_key()) is False
+    assert lookup_boundary(_FakeStore([group_label("ns", 0, 0)]),
+                           _key()) is False
 
 
 def test_own_rank_missing_is_miss():
-    b = _backend([group_label("ns", 0, 1)])
-    assert b.lookup_boundary(_key()) is False
+    assert lookup_boundary(_FakeStore([group_label("ns", 0, 1)]),
+                           _key()) is False
 
 
 def test_single_rank_skips_cross_rank_check():
-    b = _backend([group_label("ns", 0, 0)], tp_size=1)
-    assert b.lookup_boundary(_key()) is True
-    assert b._store.asked == [group_label("ns", 0, 0)]
+    store = _FakeStore([group_label("ns", 0, 0)])
+    assert lookup_boundary(store, _key(tp_size=1)) is True
+    assert store.asked == [group_label("ns", 0, 0)]
 
 
-def test_backend_error_fails_closed_to_miss():
+def test_store_error_fails_closed_to_miss():
     """A wrong hit silently corrupts output; a wrong miss costs one
     recompute. Errors resolve to the cheap mistake."""
-    b = _backend(ALL, blow_up=True)
-    assert b.lookup_boundary(_key()) is False
+    assert lookup_boundary(_FakeStore(ALL, blow_up=True), _key()) is False
 
 
 def test_groups_do_not_alias_each_other():
     """The same prefix hash exists in every group, so the group must be
     part of the namespace or one group's data would answer for another.
     """
-    b = _backend([group_label("ns", 0, 0), group_label("ns", 0, 1)])
-    assert b.lookup_boundary(_key(group_idx=0)) is True
-    assert b.lookup_boundary(_key(group_idx=1)) is False
+    store = _FakeStore([group_label("ns", 0, 0), group_label("ns", 0, 1)])
+    assert lookup_boundary(store, _key(group_idx=0)) is True
+    assert lookup_boundary(store, _key(group_idx=1)) is False

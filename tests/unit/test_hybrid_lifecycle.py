@@ -16,6 +16,7 @@ Rulings under test:
 import pytest
 
 from conftest import make_spec
+from kvshrink.backend import lookup_boundary
 from kvshrink.kvshrink_connector import CacheKey, GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
@@ -41,26 +42,23 @@ def _mamba():
         mamba_align_size=544, spec=make_spec("mamba", 544))
 
 
-class _MissBackend:
-    def lookup_boundary(self, key, expected_layers=None,
-                        expected_boundary_tokens=None):
-        return False
+class _MissStore:
+    def has(self, chunk_labels, label=None):
+        return [False]
 
 
-class _HitBackend:
+class _HitStore:
     """Committed boundary hashes are HIT (content-addressed)."""
 
     def __init__(self, committed):
         self.committed = committed
 
-    def lookup_boundary(self, key, expected_layers=None,
-                        expected_boundary_tokens=None):
-        return (True if key.block_hash in self.committed
-                else False)
+    def has(self, chunk_labels, label=None):
+        return [int(chunk_labels[0]) in self.committed]
 
 
-def _sched(groups, backend=None):
-    return HybridRequestScheduler(groups, backend or _MissBackend(),
+def _sched(groups, store=None):
+    return HybridRequestScheduler(groups, store or _MissStore(),
                                   16, "ns", 1, 0)
 
 
@@ -174,7 +172,6 @@ def _sched_side_connector(sched):
     conn = object.__new__(KVShrinkConnector)
     conn._sched = sched
     conn._worker = None
-    conn._backend = None
     conn._groups = list(sched._groups)
     return conn
 
@@ -209,13 +206,13 @@ def test_request_finished_pending_async_job_returns_false_none():
 def test_abort_keeps_committed_boundary_hittable():
     """Content-addressed cache: after abort, a NEW request with the
     same hashes still HITs the committed boundary."""
-    backend = _HitBackend(committed={0, 1})
-    sched = _sched([_attn()], backend)
+    store = _HitStore(committed={0, 1})
+    sched = _sched([_attn()], store)
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.on_request_finished("r1")  # abort
     # a fresh lookup for the same hashes still hits
-    assert backend.lookup_boundary(
-        CacheKey("ns", 1, 0, 0, 0, "")) == True
+    assert lookup_boundary(
+        store, CacheKey("ns", 1, 0, 0, 0, "")) == True
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():
@@ -236,8 +233,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
     """1000 rounds of new/save/resume/finish. Every round the cursor
     rolls back and re-emits; at the end no request state is left behind,
     the rollback counter is exact and nothing raised."""
-    backend = _MissBackend()
-    sched = _sched([_attn()], backend)
+    sched = _sched([_attn()], _MissStore())
     conn = _sched_side_connector(sched)
     for i in range(1000):
         rid = f"r{i}"
@@ -281,7 +277,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
                   block_size=544,
                   mamba_align_size=544, spec=make_spec("mamba", 544)),
     ]
-    sched = HybridRequestScheduler(groups, _HitBackend(committed),
+    sched = HybridRequestScheduler(groups, _HitStore(committed),
                                    16, "ns", 1, 0)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
     sched.on_new_request("r1", block_hashes=hashes, num_computed_tokens=0)
@@ -313,7 +309,7 @@ def test_resumed_load_meta_restores_credited_pages():
 
 def test_resumed_load_meta_fail_closed_when_pages_unrestorable():
     """Fail-closed: the core credited 544 external tokens but
-    the backend can no longer restore ANY page -> raise instead of
+    the store can no longer restore ANY page -> raise instead of
     letting forward read unrestored KV."""
     sched = _hybrid_resumed_setup(set())  # nothing committed anymore
     raised = None

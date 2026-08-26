@@ -18,13 +18,11 @@ from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
 
-class _Backend:
-    """BoundaryBackend stub: hash value N is HIT iff N in committed.
-    Pages live in `pages` {(hash, layer): bytes}; sizes default 1024.
-    Checksums computed on demand.
+class _Store:
+    """Store stub: hash value N is HIT iff N in committed.
 
     committed_pairs (optional): set of (group_idx, hash) for group-aware
-    manifests. Real backends commit a MAMBA group's manifest ONLY at the
+    manifests. Real stores commit a MAMBA group's manifest ONLY at the
     final progress boundary (debug_save stores hash[progress//bs-1]), so
     mixed-group tests must use pairs that reflect that -- a bare
     `committed` set would pretend mamba snapshots exist at every block.
@@ -34,16 +32,16 @@ class _Backend:
         self.committed = committed
         self.committed_pairs = committed_pairs
 
-    def lookup_boundary(self, key):
+    def has(self, chunk_labels, label=None):
         """Presence is per (group, block hash): a group's layers are all
         written in one call and recorded as one unit, so a single layer
         can never be the odd one out. What CAN differ is one group
         against another, which is what committed_pairs expresses."""
+        h = int(chunk_labels[0])
         if self.committed_pairs is not None:
-            hit = (key.group_idx, key.block_hash) in self.committed_pairs
-        else:
-            hit = key.block_hash in self.committed
-        return True if hit else False
+            g = int(label.split("_g")[1].split("_r")[0])
+            return [(g, h) in self.committed_pairs]
+        return [h in self.committed]
 
 
 def _group(g_idx, kind, block_size, align=None):
@@ -68,7 +66,7 @@ class _Block:
 
 
 def _make(groups, committed, block_ids_per_group):
-    sched = HybridRequestScheduler(groups, _Backend(committed), 16,
+    sched = HybridRequestScheduler(groups, _Store(committed), 16,
                                    "ns", 1, 0)
     sched.on_new_request("r1", block_hashes=[0, 1],
                          num_computed_tokens=0)
@@ -283,7 +281,7 @@ def test_load_meta_table_idx_null_fail_closed():
 def test_load_meta_table_idx_out_of_range_fail_closed():
     """Gathered table index beyond the table length -> FAIL-STOP."""
     groups = [_group(0, "mamba", 544, align=544)]
-    sched = HybridRequestScheduler(groups, _Backend({2}), 16, "ns", 1, 0)
+    sched = HybridRequestScheduler(groups, _Store({2}), 16, "ns", 1, 0)
     sched.on_new_request("r1", block_hashes=[0, 1, 2],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
@@ -361,7 +359,7 @@ def test_load_meta_hit_sched_zero_fail_stop():
 def test_completeness_intact_boundary_unchanged():
     """Lookup: all pages present -> boundary unchanged (1088)."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
-    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0, 1], [1]))
+    backend = _Store(set(), committed_pairs=_hybrid_pairs([0, 1], [1]))
     sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
@@ -378,7 +376,7 @@ def test_mamba_align_granularity():
         _group(0, "attention", 16),
         _group(1, "mamba", 16, align=32),
     ]
-    backend = _Backend(
+    backend = _Store(
         set(),
         committed_pairs=_hybrid_pairs([0, 1, 3, 4, 5], [5]))
     sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
@@ -396,7 +394,7 @@ def test_mamba_partial_recovery_with_earlier_snapshot():
     snapshot -> restore 544."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
     # attention has hash0 only; mamba has snapshots at both
-    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
+    backend = _Store(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
@@ -411,7 +409,7 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     ((544 + 544 - 1) // 544 = 1), attention loads only hash0's pages."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
     # attention has hash0 only, so 1088 is not reachable
-    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
+    backend = _Store(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {"request_id": "r1", "block_hashes": [0, 1],
                          "num_tokens": 1088})

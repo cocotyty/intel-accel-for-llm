@@ -14,7 +14,7 @@ pin down without a GPU:
   it in get_finished, so a request that is never reported hangs
   forever. That must hold even when its transfer FAILS.
 
-Pure logic: fake backend, no GPU, no disk, no model.
+Pure logic: fake store, no GPU, no disk, no model.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ def _group(g_idx, kind, layers):
         spec=make_spec(kind, 16))
 
 
-class _FakeBackend:
-    """Backend whose per-layer completion is driven by the test.
+class _FakeStore:
+    """Store whose per-layer completion is driven by the test.
 
     ``landed`` is the set of layers whose transfers have completed; a
     poll for anything outside it answers "not yet".
@@ -52,11 +52,12 @@ class _FakeBackend:
         self.waited: list[str] = []      # layers finalized, in order
         self.fail_on: set[str] = set()
 
-    def submit_group_loads(self, g_idx, views, indices, labels):
-        return {ln: [{"layer": ln}] for ln in views}
+    def get(self, block_indices, block_hashs, layer_names, tensors,
+            label=None):
+        return {ln: f"task:{ln}" for ln in layer_names}
 
-    def wait_layer_loads(self, task, wait=True):
-        (layer,) = {t["layer"] for t in task}
+    def get_wait(self, get_results, wait=True):
+        (layer,) = {k.rsplit("::", 1)[0] for k in get_results}
         if layer in self.fail_on:
             raise RuntimeError(f"transfer failed: {layer}")
         if not wait:
@@ -64,9 +65,8 @@ class _FakeBackend:
         self.waited.append(layer)
         return True
 
-    def lookup_boundary(self, key, expected_layers=None,
-                        expected_boundary_tokens=None):
-        return True
+    def has(self, chunk_labels, label=None):
+        return [True]
 
 
 class _FakeCanon:
@@ -74,13 +74,14 @@ class _FakeCanon:
         pass
 
     def page_view_parts(self, layer_name):
-        return {"page": layer_name}, 0
+        return {"page": layer_name}
 
 
-def _worker(backend):
+def _worker(store):
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in ORDER}, backend,
+    w = HybridWorker(groups, {ln: None for ln in ORDER}, "ns",
                      _FakeCanon(), rank=0, tp_size=1)
+    w.store = store
     w.register({ln: None for ln in ORDER}, ORDER)
     return w
 
@@ -106,7 +107,7 @@ def _meta(async_layers, req_id="r1"):
 def test_gate_covers_every_recurrent_layer_despite_short_prefix():
     """Asking to release after ONE attention layer must still wait for
     all GDN state: it is consumed whole at the start of forward."""
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
 
@@ -118,7 +119,7 @@ def test_gate_covers_every_recurrent_layer_despite_short_prefix():
 
 
 def test_not_released_until_recurrent_state_has_landed():
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
 
@@ -130,7 +131,7 @@ def test_not_released_until_recurrent_state_has_landed():
 
 
 def test_negative_layer_count_gates_on_every_layer():
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=-1))
     assert w._async_loads["r1"].gate_layers == set(ORDER)
@@ -142,7 +143,7 @@ def test_negative_layer_count_gates_on_every_layer():
 def test_async_tasks_are_not_part_of_the_step_residue_check():
     """The residue check guards the per-step plan. Async tasks outlive
     the step by design and must not trip it."""
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     assert w._load_tasks == {}
@@ -150,7 +151,7 @@ def test_async_tasks_are_not_part_of_the_step_residue_check():
 
 
 def test_remaining_layers_are_drained_by_the_layer_hooks():
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     b.landed = set(ORDER)
@@ -166,7 +167,7 @@ def test_remaining_layers_are_drained_by_the_layer_hooks():
 def test_second_plan_for_an_inflight_request_is_refused():
     """Two live plans for one request would strand the first one's
     tasks with nothing left to drain them."""
-    b = _FakeBackend()
+    b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     with pytest.raises(RuntimeError, match="already has an in-flight"):
@@ -177,7 +178,7 @@ def test_second_plan_for_an_inflight_request_is_refused():
 # failure must not hang the request
 # ------------------------------------------------------------------
 def test_failed_transfer_is_reported_finished_and_poisons():
-    b = _FakeBackend()
+    b = _FakeStore()
     b.fail_on = {"m0"}
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
@@ -210,7 +211,7 @@ def test_parked_request_still_gets_a_load_plan():
 
     groups = [_group(0, "attention", ATTN)]
     sched = HybridRequestScheduler(
-        groups, _FakeBackend(), hash_block_size=16, namespace="ns",
+        groups, _FakeStore(), hash_block_size=16, namespace="ns",
         tp_size=1, rank=0)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
@@ -233,7 +234,7 @@ def test_async_plan_is_emitted_only_once():
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeBackend(),
+        [_group(0, "attention", ATTN)], _FakeStore(),
         hash_block_size=16, namespace="ns", tp_size=1, rank=0)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
@@ -262,7 +263,7 @@ def test_recurrent_models_can_go_async():
 
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
-        _FakeBackend(), hash_block_size=16, namespace="ns", tp_size=1,
+        _FakeStore(), hash_block_size=16, namespace="ns", tp_size=1,
         rank=0, async_load_config=_Cfg())
     hybrid._req_states["r1"] = ReqState()
     assert hybrid._decide_async("r1", external=64) is True
@@ -302,7 +303,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     sched = HybridRequestScheduler(
-        groups, _FakeBackend(), hash_block_size=16, namespace="ns",
+        groups, _FakeStore(), hash_block_size=16, namespace="ns",
         tp_size=1, rank=0)
     st = ReqState(
         block_hashes=[1, 2, 3, 4], snapshot_boundary=64,
@@ -327,7 +328,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeBackend(), hash_block_size=16,
+        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,
         namespace="ns", tp_size=1, rank=0)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
@@ -366,7 +367,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeBackend(), hash_block_size=16,
+        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,
         namespace="ns", tp_size=1, rank=0)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
