@@ -19,7 +19,7 @@ Pure logic: fake store, no GPU, no disk.
 from __future__ import annotations
 
 from kvshrink.backend import KVStoreBackend, group_label
-from kvshrink.layout import CacheKey, LookupStatus
+from kvshrink.kvshrink_connector import CacheKey, LookupStatus
 
 
 def _key(group_idx=0):

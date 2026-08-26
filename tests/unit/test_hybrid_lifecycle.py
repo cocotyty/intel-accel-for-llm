@@ -16,7 +16,7 @@ Rulings under test:
 import pytest
 
 from conftest import make_spec
-from kvshrink.layout import CacheKey, GroupInfo, LookupStatus
+from kvshrink.kvshrink_connector import CacheKey, GroupInfo, LookupStatus
 from kvshrink.scheduler import HybridRequestScheduler
 
 PAGE = 64 * 1024

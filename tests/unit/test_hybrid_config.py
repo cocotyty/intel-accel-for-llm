@@ -11,9 +11,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec, FullAttentionSpec, MambaAttentionBackendEnum,
 )
 
-from kvshrink.layout import (
+from kvshrink.kvshrink_connector import (
     parse_kv_cache_config, compute_namespace, KVShrinkParseError)
-from kvshrink.layout import SCHEMA_VERSION
+from kvshrink.kvshrink_connector import SCHEMA_VERSION
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixture_kvconfig_4b_tp2.json")
@@ -204,7 +204,7 @@ def test_fail_closed_uniform_missing_layer():
 
 def test_fail_closed_unknown_dtype():
     """_dtype_size must reject unknown dtypes (parser fail-closed helper)."""
-    from kvshrink.layout import _dtype_size
+    from kvshrink.kvshrink_connector import _dtype_size
     assert _dtype_size("torch.bfloat16") == 2
     assert _dtype_size("torch.float32") == 4
     try:
@@ -280,7 +280,7 @@ def test_fail_closed_lossy_truncation_rejected(monkeypatch):
     is fed back into the next step and yields wrong tokens with no
     error, so startup must refuse.
     """
-    from kvshrink.layout import validate_codec_env
+    from kvshrink.kvshrink_connector import validate_codec_env
 
     for value in ("1", "4", "8", "auto"):
         monkeypatch.setenv("IAXL_KV_LOSSY_TRUNC", value)
@@ -299,7 +299,7 @@ def test_lossless_settings_are_allowed(monkeypatch):
     correctness requires and push operators to disable the connector to
     keep a feature they are entitled to.
     """
-    from kvshrink.layout import validate_codec_env
+    from kvshrink.kvshrink_connector import validate_codec_env
 
     monkeypatch.delenv("IAXL_KV_LOSSY_TRUNC", raising=False)
     validate_codec_env()

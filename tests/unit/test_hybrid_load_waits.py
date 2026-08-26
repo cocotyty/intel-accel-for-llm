@@ -22,10 +22,10 @@ from __future__ import annotations
 import pytest
 
 from conftest import make_spec
-from kvshrink.layout import (
+from kvshrink.kvshrink_connector import (
     RequestMetadata,
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
-from kvshrink.layout import LookupStatus
+from kvshrink.kvshrink_connector import LookupStatus
 from kvshrink.worker import HybridWorker
 
 PAGE = 4096

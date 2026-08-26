@@ -22,7 +22,7 @@ import pytest
 
 from kvshrink.kvshrink_connector import KVShrinkConnector
 from conftest import make_spec
-from kvshrink.layout import GroupInfo
+from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
 _pick = KVShrinkConnector._block_hash_source

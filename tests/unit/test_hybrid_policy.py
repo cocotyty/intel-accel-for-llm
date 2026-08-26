@@ -5,8 +5,8 @@ block (block_size granularity), e.g. 2135-token prompt with block_size=544
 -> 3 hashes. Tests use this granularity.
 """
 from conftest import make_spec
-from kvshrink.layout import GroupInfo, CacheKey
-from kvshrink.layout import LookupStatus, align_down
+from kvshrink.kvshrink_connector import GroupInfo, CacheKey
+from kvshrink.kvshrink_connector import LookupStatus, align_down
 from kvshrink.scheduler import HybridHitPolicy
 
 
