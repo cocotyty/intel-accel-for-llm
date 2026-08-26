@@ -14,6 +14,8 @@ from .layout import CacheKey
 from .layout import LookupStatus
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
+# logger (handler+level); an unconfigured logger would drop INFO
+# evidence lines that the GPU probes grep for.
 logger = logging.getLogger("vllm." + __name__)
 
 
@@ -50,6 +52,9 @@ class HybridWorker:
 
         self._kv_caches_ref = None
         # Per-step load tasks: layer_name -> list of per-call engine
+        # task dicts. Populated by start_load, popped by the per-layer
+        # waits. A leftover at step end means a wait never ran ->
+        # fail-stop (residue check in wait_save).
         self._load_tasks: dict[str, list] = {}
         # Pipelined attention saves: layer_name -> (group_idx, tasks).
         self._step_attn_saves: dict = {}
@@ -57,6 +62,12 @@ class HybridWorker:
         # fail-stop every later worker hook, never degrade to recompute).
         self._load_poison: Optional[BaseException] = None
         # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
+        # _load_tasks these deliberately OUTLIVE the step that submitted
+        # them -- the whole point is that the request is not occupying a
+        # forward step while its pages arrive. Entries leave in two
+        # stages: released (reported through get_finished, so vLLM may
+        # schedule the request again) and then drained (its remaining
+        # layers waited by the per-layer hooks during that forward).
         self._async_loads: dict[str, "_AsyncLoad"] = {}
 
         # attention layer_name -> group idx (mamba layers map out).
@@ -64,6 +75,8 @@ class HybridWorker:
             ln: g.group_idx for g in groups if g.kind != "mamba"
             for ln in g.layer_names}
         # Piggyback map (built in register): attention layer name ->
+        # tuple of GDN layer names that execute after it and before the
+        # next attention layer. Plus the leading GDN segment.
         self._mamba_layers: frozenset[str] = frozenset()
         """Wire up the worker-role pieces: the group/layer layout, the
         boundary backend and the canonical page-view builder for this
@@ -75,6 +88,8 @@ class HybridWorker:
         worker is the EXECUTE side; it owns the writer lease, while
         the scheduler only plans against a read-only backend."""
 
+    # ------------------------------------------------------------------
+    # registration
     # ------------------------------------------------------------------
     def register(self, kv_caches, execution_order: list[str]) -> None:
         """Bind canonical page views and record which layers recur."""
@@ -97,6 +112,8 @@ class HybridWorker:
             len(self._layer_infos), len(attn_order),
             len(self._mamba_layers), self.tp_size, self.rank)
 
+    # ------------------------------------------------------------------
+    # poison (sticky fail-stop)
     # ------------------------------------------------------------------
     def raise_load_poison(self) -> None:
         """Re-raise the sticky load failure so no later hook proceeds
@@ -131,6 +148,8 @@ class HybridWorker:
         return parts
 
     # ------------------------------------------------------------------
+    # load path
+    # ------------------------------------------------------------------
     def start_load(self, metadata) -> int:
         """Submit ALL of this step's loads, then host-block on the GDN
         ones. Attention layers stay pipelined: vLLM calls a hook on
@@ -140,6 +159,8 @@ class HybridWorker:
         self.raise_load_poison()
         if self._load_tasks:
             # A previous step's submit aborted midway and its residue
+            # was never drained -- refuse to silently drop in-flight
+            # engine tasks (fail-stop).
             err = RuntimeError(
                 "kvshrink chunk load: stale step residue "
                 f"{sorted(self._load_tasks)}: the previous step's load "
@@ -151,8 +172,11 @@ class HybridWorker:
         npages = 0
         _t0 = _now()
         try:
-            for req_meta in getattr(metadata, "requests", []):
+            for req_meta in metadata.reqs_to_load:
                 # Async requests get their OWN sink: their tasks must
+                # survive this step, and must not be host-blocked by
+                # the GDN barrier below (that barrier is for requests
+                # about to enter forward; an async one is not).
                 is_async = bool(getattr(req_meta, "is_async", False))
                 sink = {} if is_async else self._load_tasks
                 for op in getattr(req_meta, "group_ops", []):
@@ -161,6 +185,8 @@ class HybridWorker:
                     self._register_async_load(req_meta, sink)
         except BaseException as e:
             # Submit-stage failures (pool budget, engine errors) must
+            # poison like wait-stage failures: a partially submitted
+            # step can never enter forward.
             self._poison_load(e)
             raise
         # Every GDN layer, waited before forward begins.
@@ -176,7 +202,9 @@ class HybridWorker:
         return npages
 
     def _register_async_load(self, req_meta, sink: dict) -> None:
-        """Track one request's cross-step load and compute its release gate."""
+        """Track one request's cross-step load and compute its release
+        gate.
+        """
         if not sink:
             return
         req_id = req_meta.req_id
@@ -210,6 +238,8 @@ class HybridWorker:
                           for td in entry.layer_tasks.get(ln, ())]
             try:
                 # Poll each submission separately: a task entry is one
+                # engine call's task set, and the backend expects one
+                # such set per call, not a flattened list of them.
                 if any(not self._backend.wait_layer_loads(td, wait=False)
                        for td in gate_tasks):
                     continue  # not landed yet; ask again next step
@@ -331,6 +361,8 @@ class HybridWorker:
             raise
 
     # ------------------------------------------------------------------
+    # save path
+    # ------------------------------------------------------------------
     def save_enabled(self) -> bool:
         """Reflects the KVSHRINK_SAVE switch: ON by default; "0"
         disables production saving and KVSHRINK_DEBUG_AUTOSAVE=1
@@ -343,7 +375,7 @@ class HybridWorker:
         Returns boundary_key -> {"group_idx", "pages": {layer_name:
         (key, gpu_block_id)}, "boundary_tokens"}."""
         candidates: dict[tuple, dict] = {}
-        for req_meta in getattr(metadata, "save_requests", []):
+        for req_meta in metadata.reqs_to_save:
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     key = self._worker_key(key)
@@ -422,6 +454,9 @@ class HybridWorker:
             expected = sorted(self._groups[g_idx].layer_names)
             if sorted(cand["pages"]) != expected:
                 # A partial boundary is skipped (the scheduler's
+                # incremental cursor has advanced, so it ages out as a
+                # MISS, never wrong data). Log unconditionally: this is
+                # the one save-side anomaly that does not fail-stop.
                 logger.warning(
                     "chunk_save skip commit g%d h=%s: expected %d "
                     "layers, stored %d (%s)", g_idx, blk_hash,
@@ -448,6 +483,9 @@ class HybridWorker:
                         f"group={g_idx} layer={layer_name}")
             if self._groups[g_idx].kind != "mamba" and pipelined:
                 # Attention: save_kv_layer submitted each layer during
+                # forward; wait for them here. A layer the
+                # decorator never fired for is submitted now -- the
+                # plan must be fully covered either way.
                 for layer_name in layers:
                     stashed = self._step_attn_saves.pop(layer_name, None)
                     tasks = (stashed[1] if stashed is not None
@@ -461,9 +499,15 @@ class HybridWorker:
             chunk_indices = [gpu for gpu, _ in entries]
             npages += len(chunk_indices) * len(layers)
             # A block is finalized by its own write, with every layer of
+            # the group in one call, so it is committed the moment the
+            # write lands. There is no second phase to publish and
+            # therefore nothing that can outlive its data.
             nbound += len(gslot["bnds"])
         if self._step_attn_saves:
             # Layers whose submit was never consumed by a group above
+            # (plan changed mid-step): wait them so pinned staging is
+            # released, then drop. Their data is identical to what the
+            # group path stored (same labels), so nothing is lost.
             logger.warning(
                 "chunk_save: %d stashed layer saves unconsumed (%s); "
                 "draining", len(self._step_attn_saves),
@@ -480,6 +524,8 @@ class HybridWorker:
                 (_now() - _t0) * 1e3, self.rank, self.tp_size)
         return npages, nbound
 
+    # ------------------------------------------------------------------
+    # debug dump
     # ------------------------------------------------------------------
     def debug_dump_state(self) -> None:
         """KVSHRINK_DEBUG_DUMP=1: log sha256 of the first layer page of

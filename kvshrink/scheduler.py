@@ -15,9 +15,25 @@ from .layout import (CacheKey, GroupInfo, GroupTransferMeta, LookupResult,
                      align_down, make_boundary_key)
 
 # ======================================================================
+# request scheduler (EngineCore side)
+# ======================================================================
+# Scheduler-side request state for the hybrid connector.
+#
+# For each request we:
+# 1. run the hit policy (find_longest_cache_hit) against the backend,
+# 2. after vLLM allocates blocks, record per-group block tables,
+# 3. build load metadata: for attention groups, every hit block in the
+#    prefix; for mamba groups, the single state snapshot block at the
+#    restore boundary (every GDN load is waited at start_load_kv,
+#    before forward begins),
+# 4. build incremental save metadata and track resume/cursor
+#    rollback lifecycle.
 
 
 # Log under the vllm.* namespace: vLLM's init_logger attaches NO
+# handler and relies on propagation to the configured "vllm" parent
+# logger, so a bare __name__ logger silently drops every record in the
+# EngineCore process.
 logger = logging.getLogger("vllm." + __name__)
 
 
@@ -44,18 +60,29 @@ class HybridRequestScheduler:
         self._tp_size = tp_size
         self._rank = rank
         # Async-load policy (AsyncLoadLayerConfig). None disables it, so
+        # every request keeps the old behaviour of occupying a forward
+        # step while its pages arrive.
         self._async_load_config = async_load_config
         # Where a block's cache identity comes from. This is a DATA
+        # COMPATIBILITY switch, not a behavioural one: the two sources
+        # produce different key values, so flipping it makes every
+        # previously written entry unreachable (a cold cache, not a
+        # corrupt one). Each layout therefore keeps the source it was
+        # written with unless an operator says otherwise.
         if block_hash_source not in ("vllm", "legacy"):
             raise ValueError(
                 f"unknown block hash source {block_hash_source!r}; "
                 "expected 'vllm' or 'legacy'")
         self._block_hash_source = block_hash_source
         # Attention layers in execution order, used to size the
+        # early-release prefix. Mamba layers are deliberately absent:
+        # they are never partially released (see _decide_async).
         self._attention_layers: tuple[str, ...] = tuple(
             ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
         self._req_states: dict[str, RequestState] = {}
         # Async requests whose load plan has not been emitted yet. See
+        # update_state_after_alloc for why this cannot be derived from
+        # the scheduler output.
         self._async_load_pending: set[str] = set()
         self.cursor_rollbacks = 0
         """Record the per-group layout, hit-policy backend and TP
@@ -107,6 +134,12 @@ class HybridRequestScheduler:
                 req_id, state, scheduled_tokens=0)
             state.async_plan_emitted = True
             # Downgrade to synchronous from here on. Once released, vLLM
+            # reschedules the request through the ordinary new-request
+            # path, which builds a plan again. Leaving is_async set would
+            # make the worker open a SECOND cross-step transfer and
+            # report the request finished a second time -- by which point
+            # it is RUNNING, and vLLM asserts that a finished-recving
+            # request is either parked or done.
             state.is_async = False
             if meta is not None and meta.group_ops:
                 plans.append(meta)
@@ -167,6 +200,8 @@ class HybridRequestScheduler:
             state.last_known_progress = num_computed_tokens
         if resumed or regression:
             # fail-closed: a missing progress on resume is treated as
+            # N=0 (roll everything back) rather than skipping the
+            # rollback.
             safe_n = num_computed_tokens or 0
             for g_idx, group in enumerate(self._groups):
                 gstate = state.groups[g_idx]
@@ -187,6 +222,8 @@ class HybridRequestScheduler:
                 ids = new_block_ids[g_idx]
                 if resumed:
                     # upstream semantics: for resumed requests
+                    # new_block_ids IS the table (replace), per group --
+                    # including an EMPTY list, which clears stale blocks
                     state.groups[g_idx].block_ids = list(ids) if ids \
                         else []
                 elif ids:
@@ -209,6 +246,8 @@ class HybridRequestScheduler:
             self._request_block_hashes(request), request.num_tokens)
         if result.status == LookupStatus.HIT:
             # The policy HIT already gated on live chunk presence
+            # (engine Record), so the boundary is complete by
+            # construction; only record the snapshot point.
             state = self._req_states.get(request.request_id)
             if state is not None:
                 if state.block_hashes:
@@ -254,6 +293,8 @@ class HybridRequestScheduler:
             return False
         state.is_async = True
         # Clamp: asking for more leading layers than exist would never
+        # be satisfiable and would hang the request in
+        # WAITING_FOR_REMOTE_KVS forever.
         if selected < 0 or selected > len(self._attention_layers):
             state.async_load_layers = -1  # require every layer
         else:
@@ -289,6 +330,14 @@ class HybridRequestScheduler:
         if (state.is_async and not state.async_plan_emitted
                 and num_external_tokens > 0):
             # This is the ONLY moment we hear about an async request.
+            # vLLM allocates its blocks, calls us here, and then parks it
+            # in WAITING_FOR_REMOTE_KVS -- out of scheduled_new_reqs and
+            # out of scheduled_cached_reqs. A plan builder that walks
+            # those two lists would therefore never emit anything for
+            # it, the worker would have nothing to transfer, nothing to
+            # report finished, and the request would wait forever for a
+            # release that cannot come. Record it here and emit from the
+            # record instead.
             self._async_load_pending.add(req_id)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
@@ -303,6 +352,9 @@ class HybridRequestScheduler:
         state = self._req_states.get(req_id)
         if state is None:
             # A load plan is only ever asked for after we reported
+            # external tokens for this request, and that report is what
+            # creates the state. No state means the two disagree, and a
+            # plan built on a guess would address the wrong blocks.
             raise RuntimeError(
                 f"kvshrink: load plan requested for unknown request "
                 f"{req_id}; get_num_new_matched_tokens never ran")
@@ -376,8 +428,22 @@ class HybridRequestScheduler:
                             gpu_ids.append(ids[i])
             elif group.kind == "mamba":
                 # Load the snapshot into the CURR state block ONLY
+                # (v0.23.0 semantics, verified upstream): the align-mode
+                # block table pins the GDN execution metadata to column 0
+                # = the block holding this step's last scheduled token,
+                # for BOTH the chunked-prefill and decode paths -- there
+                # is no prev/curr distinction at execution time.
+                # preprocess_mamba's prev -> curr copy runs BEFORE
+                # start_load_kv (execute_model order), and our H2D write
+                # lands before forward (waited at start_load_kv), i.e.
+                # after the copy and before any GDN layer runs, so CURR
+                # is the
+                # one correct target. Writing PREV would be dead work:
+                # the kernel never reads it that step.
                 if state.block_hashes and boundary > 0:
                     # hash index of the snapshot AT boundary:
+                    # hash[i] covers [i*bs, (i+1)*bs) -> snapshot at
+                    # boundary lives at hash[boundary//bs - 1]
                     idx = boundary // group.block_size - 1
                     if 0 <= idx < len(state.block_hashes):
                         blk_hash = state.block_hashes[idx]
@@ -386,6 +452,26 @@ class HybridRequestScheduler:
                                 key) == LookupStatus.HIT:
                             bs = group.block_size
                             # CURR running-state index for this step
+                            # (upstream align-mode formula):
+                            # (num_computed + num_scheduled - 1) // bs
+                            # with num_computed == boundary here.
+                            #
+                            # Why exactly one slot, and why this one:
+                            # in align mode the kernels do not scan the
+                            # table, they gather a single column --
+                            # mamba_get_block_table_tensor computes
+                            # start = (seq_lens - 1) // block_size and
+                            # mamba_attn then takes column 0 of the
+                            # gathered result. So this index is the only
+                            # location forward will ever read for this
+                            # step. The previous generation wrote both a
+                            # prev and a curr slot because the timing of
+                            # vLLM's prev->curr copy was unclear; the
+                            # v0.23 source settles it, making the second
+                            # write dead weight. The flip side is that
+                            # there is no fallback slot, so an invalid
+                            # index below must fail-stop rather than
+                            # degrade.
                             curr_idx = (boundary + scheduled_tokens -
                                         1) // bs
 
@@ -393,8 +479,35 @@ class HybridRequestScheduler:
                                 return 0 <= t < len(ids) and ids[t] != 0
 
                             # Fail-closed contract: an external HIT has already
+                            # committed num_computed_tokens=boundary via
+                            # get_num_new_matched_tokens; silently skipping a
+                            # required slot
+                            # would let forward read unrestored state and
+                            # emit wrong tokens. Fail-stop (EngineCore
+                            # fatal, same semantics as the TOCTOU gate)
+                            # instead of producing a partial mamba load.
                             if scheduled_tokens <= 0 and not state.is_async:
                                 # SYNCHRONOUS restore with no scheduled
+                                # tokens means no forward step, so
+                                # start_load_kv never runs and the slot
+                                # stays unrestored while the core has
+                                # already credited the tokens.
+                                #
+                                # An ASYNC restore is a different thing
+                                # and is correct here. vLLM gives a
+                                # parked request zero scheduled tokens,
+                                # so curr_idx collapses to
+                                # (boundary - 1) // bs -- which is
+                                # exactly the index preprocess_mamba
+                                # will read as prev_state_idx when the
+                                # request is finally scheduled
+                                # (num_computed_tokens == boundary by
+                                # then). Its own prev -> curr copy then
+                                # carries the snapshot into the slot
+                                # forward reads. No hook is needed
+                                # because no kernel runs until the
+                                # release gate has already waited for
+                                # the transfer.
                                 raise RuntimeError(
                                     "kvshrink mamba external HIT with "
                                     "scheduled_tokens=0 "
@@ -464,6 +577,10 @@ class HybridRequestScheduler:
                     gstate.next_stored_chunk_idx = num_hash
             elif group.kind == "mamba":
                 # Save the running state block: the last NON-NULL block in
+                # the group's table. Block tables vary by token count:
+                # single-element [X] (545-token req), null-prefixed
+                # [0,0,X], or [null, X] -- block 0 is the reserved null
+                # block. Do NOT assume len(ids) > 1.
                 if state.block_hashes:
                     block_pos = None
                     for pos in range(len(ids) - 1, -1, -1):
@@ -516,6 +633,8 @@ class HybridRequestScheduler:
             group_idx=boundary_key.group_idx,
             layer_name=layer_name)
 
+# ======================================================================
+# longest-hit policy
 # ======================================================================
 class _StoreAsBlockPool:
     """The one thing vLLM's matching code needs that we must supply."""
@@ -593,6 +712,9 @@ class HybridHitPolicy:
                 f"kvshrink: vLLM has no cache-hit rule for "
                 f"{type(group.spec).__name__} (group {group.group_idx})")
         # vLLM indexes the hash list directly out to max_length, so the
+        # caller owes it a length its own hashes cover. Its scheduler
+        # gets this for free (the bound comes from the same request);
+        # ours can be a boundary the request has not reached.
         max_length = min(candidate,
                          len(block_hashes) * group.block_size)
         blocks = manager_cls.find_longest_cache_hit(
@@ -625,6 +747,8 @@ class HybridHitPolicy:
             for group in self._ordered:
                 kind = group.kind
                 # Every group is looked up on its own: a hit on group
+                # A says nothing about group B, whose blocks live under
+                # a different label and may never have been written.
                 hit = self._lookup(group, block_hashes, candidate)
                 iteration[group.group_idx] = {"kind": kind, "hit": hit}
                 if hit < candidate:

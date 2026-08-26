@@ -20,6 +20,8 @@ class KVStoreBackend:
 
     def __init__(self, kvstore: Any = None) -> None:
         # May be None at construction: on the worker the store cannot
+        # exist until vLLM hands over kv_caches, which happens long
+        # after the connector is built. bind_store closes that gap.
         self._store = kvstore
         self._namespace = ""
         self._tp_size = 1
@@ -66,6 +68,10 @@ class KVStoreBackend:
         return [str(label) for label in chunk_labels]
 
     # -- transfers ---------------------------------------------------
+    # A layer contributes one page view, or two when its K and V are
+    # separate tensors. The engine takes one flat tensor dict, but the
+    # caller waits a LAYER at a time (vLLM's hook fires per layer), so
+    # tasks are handed back regrouped under the layer name.
     @staticmethod
     def _flatten(layer_views) -> Dict[str, Any]:
         return {f"{ln}::{part}": view

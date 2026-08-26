@@ -92,8 +92,16 @@ class ReqMeta:
     external_hit_tokens: int = 0
     group_ops: tuple[GroupTransferMeta, ...] = ()
     # LOAD plans only. When set, vLLM parked this request in
+    # WAITING_FOR_REMOTE_KVS rather than giving it a forward step: the
+    # worker must keep the transfer alive ACROSS steps and name the
+    # request in get_finished() once enough of it has landed, otherwise
+    # the request never becomes runnable again.
     is_async: bool = False
     # How many LEADING ATTENTION layers must land before the request is
+    # released; -1 means every layer. Counted in attention layers only:
+    # recurrent state is never partially released, because the whole
+    # snapshot is read at the very start of forward. The worker adds
+    # every mamba op to the release gate regardless of this number.
     async_load_layers: int = -1
 
 
@@ -108,22 +116,66 @@ class RequestGroupState:
 class RequestState:
     request: Any = None
     # The live vLLM Request, when we were handed one. Held so the save
+    # path can read AUTHORITATIVE block hashes as they grow: vLLM
+    # appends to Request.block_hashes every time decode completes a
+    # block, and recomputing them here instead would have to reproduce
+    # vLLM's hashing byte for byte forever. Dropped in
+    # on_request_finished together with the rest of the state.
     request_obj: Any = None
     block_hashes: list[int] = field(default_factory=list)
     num_locally_computed_tokens: int = 0
     snapshot_boundary: int = 0
     groups: tuple[RequestGroupState, ...] = ()
     # External tokens accepted by the core in the CURRENT scheduling
+    # pass (recorded by update_state_after_alloc): tokens the core will
+    # skip recompute for, so the worker MUST restore them before
+    # forward. Consumed by build_resumed_load_meta's fail-closed guard:
+    # a resumed request with pending external tokens but no restorable
+    # pages must fail-stop, never enter forward reading unrestored KV.
     pending_load_tokens: int = 0
     # Last authoritative progress seen by the save path
+    # (num_computed + scheduled of the last save plan). Used for
+    # fail-closed regression detection: any drop below this value rolls
+    # save cursors back even if the resumed flag is missing.
     last_known_progress: int = 0
     # Async load bookkeeping. When is_async is set, this request was
+    # admitted with load_kv_async=True: vLLM parked it in
+    # WAITING_FOR_REMOTE_KVS and runs OTHER requests while its pages
+    # stream in, instead of stalling a forward step on us. The request
+    # only becomes runnable again once the worker names it in
+    # get_finished(); until then it consumes blocks but no compute.
+    #
+    # async_load_layers is how many LEADING attention layers must land
+    # before we release it -- the rest are waited layer by layer during
+    # forward. -1 means "every layer", i.e. no early release.
     is_async: bool = False
     async_load_layers: int = -1
     # Whether the async load plan was already handed to the worker.
+    # vLLM calls update_state_after_alloc TWICE for an async request --
+    # once when it allocates, once after the load completes -- so
+    # without this the second call queues a SECOND transfer for a
+    # request that is running by then, and reporting that one finished
+    # trips vLLM's own assert (a finished-recving request must be
+    # parked or done, never running).
     async_plan_emitted: bool = False
 
 # ======================================================================
+# lookup vocabulary (shared by scheduler, worker and backends)
+# ======================================================================
+# Cache hit policy for hybrid (Full Attention + GDN) models.
+#
+# Implements the hit-detection algorithm, verified against vLLM v0.21.0's
+# HybridKVCacheCoordinator semantics:
+#
+# - Attention groups: left-to-right prefix scan; the prefix must exist
+#   contiguously (downward-closed).
+# - Mamba/GDN groups: right-to-left scan for the NEAREST committed snapshot;
+#   earlier snapshots need not exist. Candidates are aligned down to
+#   mamba_align_size and the final boundary recomputes exactly 1 token.
+# - Multiple groups converge via fixed-point iteration (full attention
+#   first, then mamba groups).
+# - Backend lookups return HIT / MISS (chunk tier is Record-gated,
+#   request, never allocates.
 
 
 
@@ -154,6 +206,25 @@ def align_down(tokens: int, align: int) -> int:
     return (tokens // align) * align
 
 # ======================================================================
+# canonical page views
+# ======================================================================
+# Canonical page views over the vLLM GPU KV blocks.
+#
+# Layout verified on vLLM v0.23.0 + Qwen3.5-4B TP2:
+#
+# - Attention layer: single tensor; canonical view is built per the
+#   LayerPageInfo descriptor (block_stride_bytes / storage_offset_bytes).
+# - Mamba layer: ``kv_caches[layer]`` is a LIST of tensors (conv, ssm) sharing
+#   one storage. The canonical page view is rebuilt from the first tensor's
+#   storage (same approach as vLLM's offloading worker).
+# - Physical page for block_id i = view[i]; with
+#   ``block_stride_bytes > page_size_bytes`` the layout is packed.
+# - The block pool is GLOBAL (HMA): block ids are shared across groups; each
+#   layer simply indexes its own canonical view by block id.
+#
+# The worker connector exposes these views to the KVFlow chunk engine
+# (GPU-direct put/get). Durability lives in iaxl.kvstore.KVStore,
+# not here.
 
 
 
@@ -162,6 +233,8 @@ import logging
 import torch
 
 # log under the vllm.* namespace: vLLM only configures the
+# "vllm" logger (handler+level); an unconfigured logger would drop
+# INFO evidence lines that the GPU probes grep for.
 logger = logging.getLogger("vllm." + __name__)
 
 
@@ -202,6 +275,15 @@ class Canonicalizer:
                 ).set_(raw.untyped_storage())
 
             # FlashAttention split-K/V layout fix: a pure
+            # attention kv_cache is shaped [2, N, block_size, H, D] whose
+            # physical storage is [K block0..N-1][V block0..N-1]. A logical
+            # block's K and V are NOT contiguous, so a single flat
+            # (num_blocks, page_size) view with stride=page_size strides
+            # over TWO ADJACENT K blocks instead of block b's K+V. Detect
+            # the physical dim that holds num_blocks (same algorithm as
+            # vLLM's offloading worker) and, when K and V are split, keep a
+            # (k_view, v_view) pair of (num_blocks, half_page) views; each
+            # logical page is then K||V.
             if (not isinstance(raw, (list, tuple))
                     and self._is_split_kv_layout(raw, info)):
                 N = info.num_blocks
@@ -292,6 +374,28 @@ def storage_size_bytes(t: torch.Tensor) -> int:
     return t.untyped_storage().size()
 
 # ======================================================================
+# KVCacheConfig parsing
+# ======================================================================
+# Parse the real vLLM KVCacheConfig into KVShrink hybrid structures.
+#
+# Verified against vLLM v0.23.0 + Qwen3.5-4B TP2 (layout unchanged
+# since v0.21:
+#
+# - 4 kv_cache_groups: 3 x MambaSpec(GDN) + 1 x FullAttentionSpec
+# - 8 kv_cache_tensors, each shared by 4 consecutive layers (3 linear + 1 full)
+# - vLLM pads the attention block size so ALL groups share one page size
+# - layer names like "language_model.model.layers.0.linear_attn"
+# - Mamba layers: kv_caches[layer] is a LIST [conv_tensor, ssm_tensor]
+#   sharing one storage; page layout = conv bytes then ssm bytes.
+#
+# Fail-closed rules (never guess):
+# - unknown spec types -> KVShrinkParseError
+# - unknown dtype -> KVShrinkParseError
+# - packed / restride / non-zero storage offset layouts are parsed into
+#   LayerPageInfo.block_stride_bytes / storage_offset_bytes; canonical views
+#   are built from these descriptors, not from contiguity assumptions.
+# - heterogeneous page sizes across layers are allowed (each layer carries
+#   its own page_size_bytes).
 
 
 
@@ -429,6 +533,11 @@ def parse_kv_cache_config(
                 page_size = page
             elif page != page_size:
                 # Unsatisfiable, not merely awkward: one group is
+                # transferred in one engine call, and the engine
+                # requires every tensor in a call to share shape and
+                # dtype. Canonical views of differing page size cannot
+                # satisfy that, so fail closed here rather than at the
+                # first transfer.
                 raise KVShrinkParseError(
                     f"Group {g_idx} layers have differing page sizes "
                     f"({page} vs {page_size}); unsupported within a group")
@@ -444,6 +553,13 @@ def parse_kv_cache_config(
             mamba_mode = mamba_spec.mamba_cache_mode
             align = block_size
             # Every GDN snapshot is addressed by an aligned boundary, and
+            # the kernels only read the block-table column for the
+            # current boundary in 'align' mode. In any other mode a
+            # request keeps one max_model_len-sized block that is never
+            # boundary-addressable, so there is nothing we could key a
+            # snapshot on. vLLM silently rewrites the mode to 'none' when
+            # prefix caching is off, and it defaults prefix caching off
+            # for hybrid models, so this is the common misconfiguration.
             if mamba_mode != "align":
                 raise KVShrinkParseError(
                     f"Group {g_idx} has mamba_cache_mode={mamba_mode!r}, "
@@ -497,6 +613,8 @@ def parse_kv_cache_config(
             _dtype_size(dtype)  # fail closed on unknown dtype
             dtype_str = str(dtype)
             # KVCacheTensor is (size, shared_by) only; packed layouts
+            # (block_stride/offset) are not expressible and are rejected
+            # here rather than guessed.
             t_block_stride = int(getattr(tensor, "block_stride", None) or 0)
             if t_block_stride > 0:
                 block_stride_bytes = t_block_stride
@@ -521,6 +639,12 @@ def parse_kv_cache_config(
         raise KVShrinkParseError("No kv cache groups parsed")
 
     # One block size for the whole model. vLLM aligns its groups onto a
+    # common block size (a GDN model's attention groups take the mamba
+    # size), and the request's block hashes are computed at exactly that
+    # size -- so hash i names block i in EVERY group, which is what lets
+    # one hash address a boundary across groups. If a model ever arrived
+    # with mixed sizes, that correspondence would be silently wrong for
+    # all but one group, so refuse it instead.
     sizes = {g.block_size for g in groups}
     if len(sizes) != 1:
         raise KVShrinkParseError(
