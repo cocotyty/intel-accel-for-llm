@@ -14,9 +14,9 @@ from __future__ import annotations
 
 
 from conftest import make_spec
-from kvshrink.layout import GroupInfo
+from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
-from kvshrink.layout import LookupStatus
+from kvshrink.kvshrink_connector import LookupStatus
 
 
 class _Backend:

@@ -22,9 +22,9 @@ from __future__ import annotations
 import pytest
 
 from conftest import make_spec
-from kvshrink.layout import (
+from kvshrink.kvshrink_connector import (
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestMetadata)
-from kvshrink.layout import LookupStatus
+from kvshrink.kvshrink_connector import LookupStatus
 from kvshrink.worker import HybridWorker
 
 PAGE = 4096
@@ -207,7 +207,7 @@ def test_parked_request_still_gets_a_load_plan():
     waits for a release that can never arrive. Observed as a live hang:
     "Running: 0 reqs, Waiting: 3, Deferred: 3" with throughput at zero.
     """
-    from kvshrink.layout import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN)]
@@ -231,7 +231,7 @@ def test_parked_request_still_gets_a_load_plan():
 def test_async_plan_is_emitted_only_once():
     """A second plan would submit a second transfer for a request that
     already has one in flight, stranding the first."""
-    from kvshrink.layout import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
@@ -255,7 +255,7 @@ def test_recurrent_models_can_go_async():
     land in the slot vLLM will read, which it does -- see
     test_async_mamba_targets_the_slot_vllm_reads_as_prev.
     """
-    from kvshrink.layout import ReqState
+    from kvshrink.kvshrink_connector import ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     class _Cfg:
@@ -299,7 +299,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
     lands in start_load_kv, and with no scheduled tokens no forward
     runs at all, so the slot would be left unrestored while the core
     has already credited the tokens."""
-    from kvshrink.layout import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
@@ -325,7 +325,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     assertion (scheduler.py:2243: a finished-recving request must be
     parked or finished, never running) and killed EngineCore.
     """
-    from kvshrink.layout import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
@@ -364,7 +364,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     parked or done. Observed as EngineDeadError with 6/6 requests
     returning 500.
     """
-    from kvshrink.layout import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(

@@ -26,7 +26,7 @@ from typing import Optional
 
 from iaxl import generate_block_hashs
 
-from .layout import (CacheKey, GroupInfo, GroupTransferMeta, LookupResult,
+from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta, LookupResult,
                      LookupStatus, ReqMeta, ReqGroupState, ReqState,
                      align_down, make_boundary_key)
 

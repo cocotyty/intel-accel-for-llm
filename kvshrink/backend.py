@@ -195,7 +195,7 @@ class KVStoreBackend:
         Any error is a MISS. A wrong hit silently corrupts output; a
         wrong miss costs one recompute.
         """
-        from .layout import LookupStatus
+        from .kvshrink_connector import LookupStatus
 
         chunk_id = str(key.hash_str)
         try:

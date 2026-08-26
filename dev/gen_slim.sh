@@ -40,7 +40,6 @@ git -C "$FULL" show main:doc/design/kvshrink.md > doc/design/kvshrink.md
 python3 "$FULL/dev/trim_docstrings.py" \
     kvshrink/backend.py \
     kvshrink/kvshrink_connector.py \
-    kvshrink/layout.py \
     kvshrink/scheduler.py \
     kvshrink/worker.py
 

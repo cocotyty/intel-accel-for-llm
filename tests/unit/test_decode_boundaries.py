@@ -16,7 +16,7 @@ Pure logic: no GPU, no disk, no model.
 from __future__ import annotations
 
 from conftest import make_spec
-from kvshrink.layout import GroupInfo, ReqGroupState, ReqState
+from kvshrink.kvshrink_connector import GroupInfo, ReqGroupState, ReqState
 from kvshrink.scheduler import HybridRequestScheduler
 
 

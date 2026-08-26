@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from kvshrink.worker import HybridWorker
 from conftest import make_spec
-from kvshrink.layout import (
+from kvshrink.kvshrink_connector import (
     RequestMetadata,
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
 
