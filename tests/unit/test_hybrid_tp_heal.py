@@ -1,90 +1,88 @@
-"""TP partial-commit guard in boundary_backend.lookup_boundary.
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
-Under TP>1 each rank commits its own shard independently (no cross-rank
-transaction). A boundary visible on the scheduler's own rank but missing
-on any other rank must look up as MISS, so the request recomputes and
-its save re-commits every rank's shard (hit-path heal). These tests
-exercise the guard with stubbed per-rank backends -- no GPU, no disk.
+"""TP partial-commit guard.
+
+Each rank writes its own shard under its own store namespace, and there
+is no cross-rank transaction. A boundary present on one rank but missing
+on another must therefore read as a MISS: restoring half of a
+tensor-parallel state is worse than restoring none, because the output
+is wrong rather than absent.
+
+Nothing repairs the gap in the background. The request recomputes and
+its own save writes every rank's shard again, which is safe because
+writing a block twice is idempotent.
+
+Pure logic: fake store, no GPU, no disk.
 """
 
-from dataclasses import dataclass, replace
-from types import SimpleNamespace
+from __future__ import annotations
 
-import pytest
-
-from kvshrink import hybrid_backend
-from kvshrink.hybrid_backend import KVShrinkHybridBackendAdapter
-from kvshrink.hybrid_metadata import CacheKey
-from kvshrink.hybrid_policy import LookupStatus
+from kvshrink.backend import KVStoreBackend, group_label
+from kvshrink.layout import CacheKey, LookupStatus
 
 
-def _key():
+def _key(group_idx=0):
     return CacheKey(namespace="ns", tp_size=2, rank=0,
-                    block_hash=12345, group_idx=0, layer_name="")
+                    block_hash=12345, group_idx=group_idx, layer_name="")
 
 
-@dataclass(frozen=True)
-class _StubBoundary:
-    """Stands in for iaxl's CacheBoundary so the guard is testable
-    without the compiled extension (the adapter only needs a
-    dataclass it can ``replace(rank=...)`` and log)."""
-    namespace: str
-    tp_size: int
-    rank: int
-    block_hash: object
-    group_idx: int
+class _FakeStore:
+    """Answers presence per namespace, so a test can make one rank
+    disagree with another."""
 
-    @property
-    def hash_str(self) -> str:
-        return str(self.block_hash)
+    def __init__(self, present_labels, blow_up=False):
+        self.present = set(present_labels)
+        self.blow_up = blow_up
+        self.asked: list[str] = []
 
-
-@pytest.fixture(autouse=True)
-def _stub_cache_boundary(monkeypatch):
-    monkeypatch.setattr(
-        hybrid_backend, "_cache_boundary_from_key",
-        lambda key: _StubBoundary(
-            namespace=key.namespace, tp_size=key.tp_size, rank=key.rank,
-            block_hash=key.block_hash, group_idx=key.group_idx))
+    def has(self, chunk_labels, label=None):
+        if self.blow_up:
+            raise RuntimeError("store is unwell")
+        self.asked.append(label)
+        return [label in self.present]
 
 
-def _adapter(rank0_hit=True, rank1_hit=True, tp_size=2):
-    """Adapter with stubbed backends; never touches __init__ I/O."""
-    a = object.__new__(KVShrinkHybridBackendAdapter)
-    a._tp_size = tp_size
-    a._own_rank = 0
-    a._backend = SimpleNamespace(
-        is_committed=lambda *a_, **k: rank0_hit)
-    a._rank_backends = {1: SimpleNamespace(
-        is_committed=lambda *a_, **k: rank1_hit)}
-    return a
+def _backend(present_labels, tp_size=2, blow_up=False):
+    b = KVStoreBackend(_FakeStore(present_labels, blow_up))
+    b.register_layout(namespace="ns", tp_size=tp_size, rank=0)
+    return b
+
+
+ALL = [group_label("ns", 0, 0), group_label("ns", 0, 1)]
 
 
 def test_all_ranks_present_hit():
-    a = _adapter(rank0_hit=True, rank1_hit=True)
-    assert a.lookup_boundary(_key()) == LookupStatus.HIT
+    assert _backend(ALL).lookup_boundary(_key()) is LookupStatus.HIT
 
 
 def test_other_rank_missing_is_miss():
-    """Partial commit: rank 0 committed, rank 1 did not -> MISS."""
-    a = _adapter(rank0_hit=True, rank1_hit=False)
-    assert a.lookup_boundary(_key()) == LookupStatus.MISS
+    b = _backend([group_label("ns", 0, 0)])
+    assert b.lookup_boundary(_key()) is LookupStatus.MISS
 
 
 def test_own_rank_missing_is_miss():
-    a = _adapter(rank0_hit=False, rank1_hit=True)
-    assert a.lookup_boundary(_key()) == LookupStatus.MISS
+    b = _backend([group_label("ns", 0, 1)])
+    assert b.lookup_boundary(_key()) is LookupStatus.MISS
 
 
 def test_single_rank_skips_cross_rank_check():
-    """tp_size=1: no cross-rank validation, own rank decides."""
-    a = _adapter(rank0_hit=True, rank1_hit=False, tp_size=1)
-    assert a.lookup_boundary(_key()) == LookupStatus.HIT
+    b = _backend([group_label("ns", 0, 0)], tp_size=1)
+    assert b.lookup_boundary(_key()) is LookupStatus.HIT
+    assert b._store.asked == [group_label("ns", 0, 0)]
 
 
 def test_backend_error_fails_closed_to_miss():
-    def _boom(*a_, **k):
-        raise RuntimeError("record unavailable")
-    a = _adapter()
-    a._backend = SimpleNamespace(is_committed=_boom)
-    assert a.lookup_boundary(_key()) == LookupStatus.MISS
+    """A wrong hit silently corrupts output; a wrong miss costs one
+    recompute. Errors resolve to the cheap mistake."""
+    b = _backend(ALL, blow_up=True)
+    assert b.lookup_boundary(_key()) is LookupStatus.MISS
+
+
+def test_groups_do_not_alias_each_other():
+    """The same prefix hash exists in every group, so the group must be
+    part of the namespace or one group's data would answer for another.
+    """
+    b = _backend([group_label("ns", 0, 0), group_label("ns", 0, 1)])
+    assert b.lookup_boundary(_key(group_idx=0)) is LookupStatus.HIT
+    assert b.lookup_boundary(_key(group_idx=1)) is LookupStatus.MISS

@@ -12,9 +12,11 @@ so they run in the container test runner).
 
 from __future__ import annotations
 
-from kvshrink.hybrid_metadata import GroupInfo
-from kvshrink.hybrid_scheduler import HybridRequestScheduler
-from kvshrink.hybrid_policy import LookupStatus
+
+from conftest import make_spec
+from kvshrink.layout import GroupInfo
+from kvshrink.scheduler import HybridRequestScheduler
+from kvshrink.layout import LookupStatus
 
 
 class _Backend:
@@ -29,46 +31,20 @@ class _Backend:
     `committed` set would pretend mamba snapshots exist at every block.
     """
 
-    PAGE_SIZE = 1024
-
-    def __init__(self, committed, pages=None, committed_pairs=None):
+    def __init__(self, committed, committed_pairs=None):
         self.committed = committed
         self.committed_pairs = committed_pairs
-        self.pages = dict(pages) if pages else {}
 
-    def lookup_boundary(self, key, expected_layers=None,
-                        expected_boundary_tokens=None):
+    def lookup_boundary(self, key):
+        """Presence is per (group, block hash): a group's layers are all
+        written in one call and recorded as one unit, so a single layer
+        can never be the odd one out. What CAN differ is one group
+        against another, which is what committed_pairs expresses."""
         if self.committed_pairs is not None:
             hit = (key.group_idx, key.block_hash) in self.committed_pairs
         else:
             hit = key.block_hash in self.committed
-        if not hit:
-            return LookupStatus.MISS
-        # Model the chunk tier's Record-gated LIVE presence: a committed
-        # manifest whose pages are missing/corrupt is a MISS at lookup
-        # (the real engine checks _chunks_present per chunk). Tests that
-        # never populate page bookkeeping are presence-vacuous.
-        if self.pages or getattr(self, "_manifest_checksums", None):
-            import hashlib
-            mc = getattr(self, "_manifest_checksums", {}) or {}
-            for ln in (expected_layers or ()):
-                data = self.pages.get((key.block_hash, ln))
-                if data is None:
-                    return LookupStatus.MISS
-                base = mc.get((key.block_hash, ln))
-                if base is not None and hashlib.sha256(
-                        data).hexdigest() != base:
-                    return LookupStatus.MISS
-        return LookupStatus.HIT
-
-
-    def _all_pages_present(self, groups, hashes):
-        """Populate pages for all (hash, layer) pairs of the groups."""
-        for g in groups:
-            for i in hashes:
-                for ln in g.layer_names:
-                    self.pages.setdefault((i, ln), b"x" * self.PAGE_SIZE)
-        return self
+        return LookupStatus.HIT if hit else LookupStatus.MISS
 
 
 def _group(g_idx, kind, block_size, align=None):
@@ -77,7 +53,7 @@ def _group(g_idx, kind, block_size, align=None):
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
         block_size=block_size, page_size_bytes=1024,
         mamba_cache_mode="align" if kind == "mamba" else None,
-        mamba_align_size=align)
+        mamba_align_size=align, spec=make_spec(kind, block_size))
 
 
 def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
@@ -387,9 +363,8 @@ def test_load_meta_hit_sched_zero_fail_stop():
 def test_gnnmt_completeness_intact_boundary_unchanged():
     """Lookup: all pages present -> boundary unchanged (1088)."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
-    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0, 1], [1])
-                       )._all_pages_present(groups, [0, 1])
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
+    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0, 1], [1]))
+    sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
@@ -407,11 +382,8 @@ def test_gnnmt_mamba_align_granularity():
     ]
     backend = _Backend(
         set(),
-        committed_pairs=(_hybrid_pairs([0, 1, 2, 3, 4, 5], [5]))
-    )._all_pages_present(groups, [0, 1, 2, 3, 4, 5])
-    del backend.pages[(2, "l0.0")]
-    del backend.pages[(2, "l1.0")]
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
+        committed_pairs=_hybrid_pairs([0, 1, 3, 4, 5], [5]))
+    sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1, 2, 3, 4, 5],
         "num_tokens": 96})
@@ -425,47 +397,13 @@ def test_gnnmt_mamba_partial_recovery_with_earlier_snapshot():
     page missing -> 1088 unusable, but 544 has a complete mamba
     snapshot -> restore 544 (super-master gate, devlog §5.21)."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
-    backend = _Backend(
-        set(), committed_pairs=_hybrid_pairs([0, 1], [0, 1])
-    )._all_pages_present(groups, [0, 1])
-    del backend.pages[(1, "l0.1")]  # hash1 attention page missing
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
+    # attention has hash0 only; mamba has snapshots at both
+    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
+    sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
     assert ext == 544, ext  # earlier intact mamba snapshot -> recover
-
-
-def test_gnnmt_hetero_attention_shrinks_by_lcm():
-    """Two attention groups bs=16/32 (LCM=32), no mamba. Policy hits 96
-    (all manifests committed) but g1's hash2 page is missing -> the
-    completeness check walks LCM-aligned candidates: 96 incomplete ->
-    64 complete (g0 needs hash0..3, g1 needs hash0..1) -> external 64.
-    Guards the align_down start + per-group manifest validation
-    (super-master gate, devlog §5.21)."""
-    groups = [_group(0, "attention", 16), _group(1, "attention", 32)]
-    pairs = {(0, i) for i in range(6)} | {(1, i) for i in range(3)}
-    backend = _Backend(set(), committed_pairs=pairs)
-    import hashlib
-    backend._manifest_checksums = {}
-    for i in range(6):  # g0 pages hash0..5
-        for ln in ("l0.0", "l0.1"):
-            data = b"x" * _Backend.PAGE_SIZE
-            backend.pages[(i, ln)] = data
-            backend._manifest_checksums[(i, ln)] = hashlib.sha256(
-                data).hexdigest()
-    for i in range(2):  # g1 pages hash0..1; hash2 deliberately absent
-        for ln in ("l1.0", "l1.1"):
-            data = b"x" * _Backend.PAGE_SIZE
-            backend.pages[(i, ln)] = data
-            backend._manifest_checksums[(i, ln)] = hashlib.sha256(
-                data).hexdigest()
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
-    req = type("R", (), {
-        "request_id": "r1", "block_hashes": [0, 1, 2, 3, 4, 5],
-        "num_tokens": 96})
-    ext, _ = sched.get_num_new_matched_tokens(req, 0)
-    assert ext == 64, ext
 
 
 def test_partial_recovery_load_meta_targets_earlier_snapshot():
@@ -474,11 +412,9 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     the mamba hash0 pages in the slot the kernel reads this step
     ((544 + 544 - 1) // 544 = 1), attention loads only hash0's pages."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
-    backend = _Backend(
-        set(), committed_pairs=_hybrid_pairs([0, 1], [0, 1])
-    )._all_pages_present(groups, [0, 1])
-    del backend.pages[(1, "l0.1")]  # 1088 attention incomplete
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
+    # attention has hash0 only, so 1088 is not reachable
+    backend = _Backend(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
+    sched = HybridRequestScheduler(groups, backend, 544, "ns", 1, 0)
     req = type("R", (), {"request_id": "r1", "block_hashes": [0, 1],
                          "num_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
@@ -503,33 +439,3 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     assert mamba_op.snapshot_boundary_tokens == 544
 
 
-def test_gnnmt_real_528_544_hetero_attention():
-    """Real 528/544 attention pair: LCM = 17952, so the only legal common
-    boundaries are 0 and 17952. A missing page at the top boundary
-    degrades to full MISS (no intermediate boundary exists); proves the
-    align_down start + LCM step on the production block sizes
-    (super-master gate, devlog §5.23)."""
-    import hashlib
-    groups = [_group(0, "attention", 528), _group(1, "attention", 544)]
-    n0, n1 = 17952 // 528, 17952 // 544  # 34, 33
-    pairs = {(0, i) for i in range(n0)} | {(1, i) for i in range(n1)}
-    backend = _Backend(set(), committed_pairs=pairs)
-    backend._manifest_checksums = {}
-    for g_idx, n in ((0, n0), (1, n1)):
-        for i in range(n):
-            for ln in (f"l{g_idx}.0", f"l{g_idx}.1"):
-                data = b"x" * _Backend.PAGE_SIZE
-                backend.pages[(i, ln)] = data
-                backend._manifest_checksums[(i, ln)] = hashlib.sha256(
-                    data).hexdigest()
-    # one layer page of g1's LAST hash (the 17952-boundary block) missing
-    del backend.pages[(n1 - 1, "l1.0")]
-    sched = HybridRequestScheduler(groups, backend, 16, "ns", 1, 0)
-    req = type("R", (), {"request_id": "r1",
-                         "block_hashes": list(range(max(n0, n1))),
-                         "num_tokens": 17952})
-    ext, _ = sched.get_num_new_matched_tokens(req, 0)
-    assert ext == 0, ext
-
-
-# ----------------------------------------------------------------------

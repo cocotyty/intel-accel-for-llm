@@ -87,7 +87,6 @@ export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYE
 export KVSHRINK_SAVE=${KVSHRINK_SAVE:-1}                     # Persist newly computed KV/state (0/1)
 export KVSHRINK_SAVE_PIPELINED=${KVSHRINK_SAVE_PIPELINED:-1} # Submit attention saves per layer during forward (0 = all after forward)
 # export KVSHRINK_PERSIST_DIR=...          # Commit-manifest root (unset = $IAXL_CACHE_DIR/kv4-manifests)
-export KVSHRINK_METRICS_PORT=${KVSHRINK_METRICS_PORT:-18801} # Metrics exporter base port, +rank per worker (0 = disabled)
 # export KVSHRINK_DEBUG_LOG=1              # Verbose per-request plan logging
 # export KVSHRINK_DEBUG_DUMP=1             # Log GDN state page digests after each forward
 # Cross-restart cache reuse requires reproducible block hashes: vLLM

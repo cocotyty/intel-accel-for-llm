@@ -28,7 +28,6 @@ _KVSHRINK_ENV = (
     "KVSHRINK_DEBUG_LOG",
     "KVSHRINK_DEBUG_DUMP",
     "KVSHRINK_PERSIST_DIR",
-    "KVSHRINK_METRICS_PORT",
 )
 
 
@@ -37,4 +36,28 @@ def _clean_kvshrink_env(monkeypatch):
     for name in _KVSHRINK_ENV:
         monkeypatch.delenv(name, raising=False)
     # The exporter binds a port; unit tests never need it.
-    monkeypatch.setenv("KVSHRINK_METRICS_PORT", "0")
+
+
+def make_spec(kind: str, block_size: int):
+    """A real vLLM KVCacheSpec for one group.
+
+    The hit policy hands the spec back to vLLM's own matching code, so a
+    stand-in would not exercise the path the engine takes. These are the
+    genuine spec classes with the smallest shape that is still valid.
+    """
+    import torch
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    if kind == "mamba":
+        return MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+    return FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.bfloat16,
+    )

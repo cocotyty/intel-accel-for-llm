@@ -39,7 +39,6 @@ if [[ -n "$HYBRID_MODEL" ]]; then
     run_gate "$HYBRID_MODEL" probe_warm_reuse.sh
     run_gate "$HYBRID_MODEL" probe_cold_hot.sh
     run_gate "$HYBRID_MODEL" probe_batch_hybrid.sh
-    run_gate "$HYBRID_MODEL" probe_metrics.sh
     # Perf, not correctness: fails only if restoring is no faster
     # than recomputing, i.e. the feature is not paying for itself.
     run_gate "$HYBRID_MODEL" probe_hit_benefit.sh

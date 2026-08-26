@@ -1,6 +1,9 @@
 """Config parser tests against the real Qwen3.5-4B TP2 KVCacheConfig dump."""
+import dataclasses
 import json
 import os
+
+import pytest
 
 
 from vllm.v1.kv_cache_interface import (
@@ -8,9 +11,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec, FullAttentionSpec, MambaAttentionBackendEnum,
 )
 
-from kvshrink.hybrid_config import (
+from kvshrink.layout import (
     parse_kv_cache_config, compute_namespace, KVShrinkParseError)
-from kvshrink.hybrid_metadata import SCHEMA_VERSION
+from kvshrink.layout import SCHEMA_VERSION
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixture_kvconfig_4b_tp2.json")
@@ -90,19 +93,20 @@ def test_parse_real_config():
     assert "language_model.model.layers.0.linear_attn" in layer_infos
 
 
-def test_state_regions():
+def test_recurrent_page_holds_both_states():
+    """A GDN page is the conv state and the ssm state back to back, and
+    the two have different shapes AND different dtypes. That is why the
+    page is moved as opaque bytes rather than as tensors."""
     cfg = _real_config()
     _, layer_infos, _ = parse_kv_cache_config(
         cfg, hash_block_size=16)
     lin = layer_infos["language_model.model.layers.0.linear_attn"]
-    assert len(lin.state_regions) == 2
-    conv, ssm = lin.state_regions
-    assert conv.name == "conv"
-    assert conv.nbytes == 3 * 4096 * 2  # bf16
-    assert ssm.name == "ssm"
-    assert ssm.nbytes == 16 * 128 * 128 * 4  # fp32
-    assert conv.offset == 0
-    assert ssm.offset == conv.nbytes
+    conv_bytes = 3 * 4096 * 2              # bf16
+    ssm_bytes = 16 * 128 * 128 * 4         # fp32
+    # vLLM pads the page, so the size is not the bare sum; what matters
+    # is that one page holds both states, which is why it is moved as
+    # opaque bytes rather than as tensors.
+    assert lin.unpadded_page_size_bytes >= conv_bytes + ssm_bytes
 
 
 def test_fail_closed_unknown_spec():
@@ -125,6 +129,23 @@ def test_fail_closed_unknown_spec():
         raise AssertionError("expected KVShrinkParseError")
     except KVShrinkParseError:
         pass
+
+
+def test_groups_must_share_one_block_size():
+    """vLLM aligns every group onto a common block size -- a GDN model's
+    attention groups take the mamba size -- and a request's block hashes
+    are computed at that size, so hash i names block i in EVERY group.
+    That correspondence is what lets one hash address a boundary across
+    groups; mixed sizes would make it wrong for all but one of them.
+    """
+    cfg = _real_config()
+    g = cfg.kv_cache_groups[0]
+    cfg.kv_cache_groups[0] = KVCacheGroupSpec(
+        layer_names=g.layer_names,
+        kv_cache_spec=dataclasses.replace(
+            g.kv_cache_spec, block_size=g.kv_cache_spec.block_size * 2))
+    with pytest.raises(KVShrinkParseError, match="different block sizes"):
+        parse_kv_cache_config(cfg, hash_block_size=16)
 
 
 def test_fail_closed_mamba_cache_mode_not_align():
@@ -183,7 +204,7 @@ def test_fail_closed_uniform_missing_layer():
 
 def test_fail_closed_unknown_dtype():
     """_dtype_size must reject unknown dtypes (parser fail-closed helper)."""
-    from kvshrink.hybrid_config import _dtype_size
+    from kvshrink.layout import _dtype_size
     assert _dtype_size("torch.bfloat16") == 2
     assert _dtype_size("torch.float32") == 4
     try:
@@ -259,7 +280,7 @@ def test_fail_closed_lossy_truncation_rejected(monkeypatch):
     is fed back into the next step and yields wrong tokens with no
     error, so startup must refuse.
     """
-    from kvshrink.hybrid_config import validate_codec_env
+    from kvshrink.layout import validate_codec_env
 
     for value in ("1", "4", "8", "auto"):
         monkeypatch.setenv("IAXL_KV_LOSSY_TRUNC", value)
@@ -278,7 +299,7 @@ def test_lossless_settings_are_allowed(monkeypatch):
     correctness requires and push operators to disable the connector to
     keep a feature they are entitled to.
     """
-    from kvshrink.hybrid_config import validate_codec_env
+    from kvshrink.layout import validate_codec_env
 
     monkeypatch.delenv("IAXL_KV_LOSSY_TRUNC", raising=False)
     validate_codec_env()

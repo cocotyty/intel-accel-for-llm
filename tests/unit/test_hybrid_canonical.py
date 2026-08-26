@@ -7,7 +7,7 @@ Mirrors the verified vLLM v0.21.0 layout:
 """
 import torch
 
-from kvshrink.hybrid_canonical import Canonicalizer
+from kvshrink.layout import Canonicalizer
 
 NUM_BLOCKS = 1843
 PAGE = 1081344
@@ -16,7 +16,7 @@ SSM_BYTES = 16 * 128 * 128 * 4  # fp32
 
 
 def _info(layer_name, spec_kind, group_idx):
-    from kvshrink.hybrid_metadata import LayerPageInfo
+    from kvshrink.layout import LayerPageInfo
     return LayerPageInfo(
         layer_name=layer_name, group_idx=group_idx, spec_kind=spec_kind,
         num_blocks=NUM_BLOCKS,

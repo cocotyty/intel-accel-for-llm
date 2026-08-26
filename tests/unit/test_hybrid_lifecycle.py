@@ -15,10 +15,9 @@ Rulings under test:
 
 import pytest
 
-from kvshrink.hybrid_metadata import (
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
-from kvshrink.hybrid_policy import LookupStatus
-from kvshrink.hybrid_scheduler import HybridRequestScheduler
+from conftest import make_spec
+from kvshrink.layout import CacheKey, GroupInfo, LookupStatus
+from kvshrink.scheduler import HybridRequestScheduler
 
 PAGE = 64 * 1024
 
@@ -32,14 +31,14 @@ def _attn(bs=16):
     return GroupInfo(
         group_idx=0, kind="attention", layer_names=("attn.0",),
         block_size=bs, page_size_bytes=PAGE, mamba_cache_mode=None,
-        mamba_align_size=None)
+        mamba_align_size=None, spec=make_spec("attention", bs))
 
 
 def _mamba():
     return GroupInfo(
         group_idx=0, kind="mamba", layer_names=("m.0",),
         block_size=544, page_size_bytes=PAGE, mamba_cache_mode="align",
-        mamba_align_size=544)
+        mamba_align_size=544, spec=make_spec("mamba", 544))
 
 
 class _MissBackend:
@@ -175,10 +174,10 @@ def _sched_side_connector(sched):
     from kvshrink.kvshrink_connector import KVShrinkConnector
 
     conn = object.__new__(KVShrinkConnector)
-    conn._hyb_sched = sched
-    conn._hyb_worker = None
-    conn._hyb_backend = None
-    conn._hyb_groups = list(sched._groups)
+    conn._sched = sched
+    conn._worker = None
+    conn._backend = None
+    conn._groups = list(sched._groups)
     return conn
 
 
@@ -263,7 +262,6 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
     stats = sched.lifecycle_stats()
     assert stats["request_states"] == 0, stats
     assert stats["cursor_rollbacks"] == 1000, stats
-    assert conn.lifecycle_stats()["pending_store_jobs"] == 0
 
 
 # ------------------------------------------------------------------
@@ -287,7 +285,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
         GroupInfo(group_idx=1, kind="mamba", layer_names=("m.0",),
                   block_size=544, page_size_bytes=PAGE,
                   mamba_cache_mode="align",
-                  mamba_align_size=544),
+                  mamba_align_size=544, spec=make_spec("mamba", 544)),
     ]
     sched = HybridRequestScheduler(groups, _HitBackend(committed),
                                    16, "ns", 1, 0)

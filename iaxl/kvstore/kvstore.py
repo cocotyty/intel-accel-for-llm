@@ -158,8 +158,32 @@ class KVStore:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        tensors: Optional[Dict[str, torch.Tensor]] = None,
+        chunk_dim: Optional[int] = None,
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
+        """Write blocks to the store.
 
+        The last three arguments exist for callers whose tensors are not
+        this store's own ``kv_caches``:
+
+        - ``tensors``: write THESE instead of the bound caches. Needed
+          when a layer is not a single tensor (a recurrent layer is a
+          conv state plus an ssm state over one storage) and must be
+          presented as one uniform page view, because the engine
+          requires every tensor in a call to share shape and dtype.
+        - ``chunk_dim``: which axis indexes blocks. Fixed per layout, so
+          a caller supplying its own views supplies this too.
+        - ``label``: the store-side namespace. Callers that keep several
+          independent block spaces (one per KV cache group, per rank)
+          pass their own; the default keeps every existing key byte for
+          byte.
+
+        A call carrying an explicit ``label`` is treated as complete on
+        its own -- the caller passes that namespace's whole layer set in
+        one call -- so the block is finalized here rather than waiting
+        for a "last layer" that this namespace defines differently.
+        """
         if self.has_only_mode:
             raise RuntimeError(
                 "put() not available in has-only mode (kv_caches not provided)"
@@ -168,20 +192,21 @@ class KVStore:
         if layer_names is None:
             layer_names = self.layer_names
 
-        tensors = {name: self.kv_caches[name] for name in layer_names}
+        if tensors is None:
+            tensors = {name: self.kv_caches[name] for name in layer_names}
 
         result = self.tensorzip.put(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim,
+            chunk_dim=self.block_dim if chunk_dim is None else chunk_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
             skip_compression_count=self.skip_compression_count,
         )
 
-        if self.layer_names[-1] in layer_names:
-            self.tensorzip.put_finish(self.LABEL, block_hashs)
+        if label is not None or self.layer_names[-1] in layer_names:
+            self.tensorzip.put_finish(label or self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
         return result
@@ -210,8 +235,13 @@ class KVStore:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        tensors: Optional[Dict[str, torch.Tensor]] = None,
+        chunk_dim: Optional[int] = None,
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
-
+        """Read blocks back into GPU memory; see ``put`` for the last
+        three arguments. Results are keyed by layer name so a caller can
+        wait one layer at a time and overlap the rest with compute."""
         if self.has_only_mode:
             raise RuntimeError(
                 "get() not available in has-only mode (kv_caches not provided)"
@@ -220,12 +250,13 @@ class KVStore:
         if layer_names is None:
             layer_names = self.layer_names
 
-        tensors = {name: self.kv_caches[name] for name in layer_names}
+        if tensors is None:
+            tensors = {name: self.kv_caches[name] for name in layer_names}
 
         return self.tensorzip.get(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim,
+            chunk_dim=self.block_dim if chunk_dim is None else chunk_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
@@ -249,13 +280,20 @@ class KVStore:
             wait=wait,
         )
 
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None) -> List[bool]:
+        """Presence, truncated at the first miss.
+
+        The truncation is prefix semantics: a cached prefix is only
+        usable up to its first hole, so nothing past one is worth
+        reporting. ``label`` selects the namespace, as in ``put``.
+        """
         if not block_hashs:
             self.tensorzip.record_flush()
             return []
 
         results = self.tensorzip.has(
-            label=self.LABEL,
+            label=label or self.LABEL,
             chunk_labels=block_hashs,
         )
 
