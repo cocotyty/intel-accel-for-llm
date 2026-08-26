@@ -10,7 +10,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 import torch
 from vllm.config import VllmConfig
@@ -34,10 +34,15 @@ from vllm.v1.kv_cache_interface import (
 )
 
 if TYPE_CHECKING:
+    from .async_load_config import AsyncLoadLayerConfig
+    from vllm.config import ModelConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
+
+    from .scheduler import HybridRequestScheduler
+    from .worker import HybridWorker
 
 from iaxl import KVStore, setup_root_logger
 
@@ -190,11 +195,11 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 class Canonicalizer:
     """Builds canonical (num_blocks, page_size_bytes) int8 views per layer."""
 
-    def __init__(self, layer_infos: dict, num_blocks: int):
+    def __init__(self, layer_infos: dict[str, LayerPageInfo], num_blocks: int):
         """Record per-layer descriptors and the GLOBAL block-pool size
         (shared across groups); views are built by ``register``."""
-        self._layer_infos = layer_infos
-        self._num_blocks = num_blocks
+        self._layer_infos: dict[str, LayerPageInfo] = layer_infos
+        self._num_blocks: int = num_blocks
         self._views: dict[str, torch.Tensor] = {}
 
     def register(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -269,7 +274,9 @@ class Canonicalizer:
             next(iter(self._layer_infos.values())).page_size_bytes)
 
     @staticmethod
-    def _is_split_kv_layout(raw: torch.Tensor, info) -> bool:
+    def _is_split_kv_layout(
+        raw: torch.Tensor, info: LayerPageInfo
+    ) -> bool:
         """True when num_blocks lives in a non-leading physical dim, i.e.
         the K/V-split [2, N, ...] FlashAttention layout. Mirrors the
         physical-to-logical stride mapping in vLLM's offloading worker."""
@@ -287,7 +294,9 @@ class Canonicalizer:
         physical_pos = physical_to_logical.index(logical_nb_dim)
         return physical_pos != 0
 
-    def _page_parts(self, layer_name: str, block_id: int):
+    def _page_parts(
+        self, layer_name: str, block_id: int
+    ) -> tuple[torch.Tensor, ...]:
         """Physical tensor(s) holding logical block ``block_id``: a single
         view for contiguous layouts, or (K, V) halves for split layouts."""
         v = self._views[layer_name]
@@ -295,7 +304,7 @@ class Canonicalizer:
             return (v[0][block_id], v[1][block_id])
         return (v[block_id],)
 
-    def page_view_parts(self, layer_name: str) -> dict:
+    def page_view_parts(self, layer_name: str) -> dict[str, torch.Tensor]:
         """Full-pool canonical page views for the KVFlow chunk engine."""
         v = self._views[layer_name]
         if isinstance(v, tuple):
@@ -371,7 +380,7 @@ class CacheKey:
 
 
 def make_boundary_key(namespace: str, tp_size: int, rank: int,
-                      group_idx: int, block_hash) -> "CacheKey":
+                      group_idx: int, block_hash: object) -> "CacheKey":
     """A group's key at one block hash, with no layer: the address the
     hit policy asks about and the address the save/load builders expand
     into per-layer page keys."""
@@ -450,7 +459,7 @@ def compute_namespace(
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _spec_kind(spec) -> str:
+def _spec_kind(spec: object) -> str:
     """Mamba or attention; unknown spec types raise KVShrinkParseError
     (fail closed). Sliding-window specs are AttentionSpec subclasses and
     are intentionally NOT distinguished: their block layout is the
@@ -464,7 +473,7 @@ def _spec_kind(spec) -> str:
         f"Unsupported KV cache spec {type(spec).__name__}")
 
 
-def _iter_layer_specs(group_spec):
+def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
     """Yield (layer_name, spec) pairs, expanding UniformTypeKVCacheSpecs."""
     spec = group_spec.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
@@ -617,21 +626,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.num_layers = self.model_config.get_num_layers(
+        self.vllm_config: VllmConfig = vllm_config
+        self.model_config: ModelConfig = vllm_config.model_config
+        self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
+        self.num_layers: int = self.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.vllm_device = vllm_config.device_config.device_type
-        self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
+        self.vllm_device: str = vllm_config.device_config.device_type
+        self.rank: int = get_world_group().rank if model_parallel_is_initialized() else 0
 
         # Ordered worker-side layer names (populated in
         # register_kv_caches) for the block store layout.
         self._layer_names: list[str] = []
 
-        self._async_load_layer_config = load_async_load_layer_config_from_env(
-            num_layers=self.num_layers,
+        self._async_load_layer_config: AsyncLoadLayerConfig = (
+            load_async_load_layer_config_from_env(
+                num_layers=self.num_layers,
+            )
         )
 
         # One stack for every model. vLLM already describes any model as
@@ -639,10 +650,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # the one-group case; the only thing a GDN/Mamba model changes is
         # WHICH store layout is underneath, and that is an adapter
         # choice, not a second code path.
-        self._sched = None
-        self._worker = None
-        self._canon = None
-        self._groups: list = []
+        self._sched: Optional[HybridRequestScheduler] = None
+        self._worker: Optional[HybridWorker] = None
+        self._canon: Optional[Canonicalizer] = None
+        self._groups: list[GroupInfo] = []
         # Authoritative TP rank, set by _init_kv_stack. Distinct from
         # self.rank, which is read from the world group before
         # distributed init has run and is therefore 0 on every worker.

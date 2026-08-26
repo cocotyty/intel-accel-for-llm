@@ -8,10 +8,17 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import replace
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .backend import group_label, lookup_boundary
-from .kvshrink_connector import CacheKey, save_enabled
+from .kvshrink_connector import (CacheKey, Canonicalizer, GroupInfo,
+                                 GroupTransferMeta, KVShrinkConnectorMetadata,
+                                 LayerPageInfo, ReqMeta, save_enabled)
+
+if TYPE_CHECKING:
+    import torch
+
+    from iaxl import KVStore
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
 # logger (handler+level); an unconfigured logger would drop INFO
@@ -31,44 +38,48 @@ class _AsyncLoad:
 
     __slots__ = ("layer_tasks", "gate_layers", "released")
 
-    def __init__(self, layer_tasks: dict, gate_layers: set):
-        self.layer_tasks = layer_tasks
-        self.gate_layers = gate_layers
-        self.released = False
+    def __init__(
+        self, layer_tasks: dict[str, list[dict[str, Any]]],
+        gate_layers: set[str],
+    ):
+        self.layer_tasks: dict[str, list[dict[str, Any]]] = layer_tasks
+        self.gate_layers: set[str] = gate_layers
+        self.released: bool = False
 
 
 class HybridWorker:
     """Worker-role executor for the hybrid path (see module docstring)."""
 
-    def __init__(self, groups, layer_infos, namespace: str,
-                 canonicalizer, rank: int, tp_size: int):
+    def __init__(self, groups: list[GroupInfo],
+                 layer_infos: dict[str, LayerPageInfo], namespace: str,
+                 canonicalizer: Canonicalizer, rank: int, tp_size: int):
         """Wire up the worker-role pieces: the group/layer layout, this
         rank's store labels and the canonical page-view builder for
         this rank's block pool, plus this rank's TP identity (the worker
         persists and loads its OWN shard).
         """
-        self._groups = groups
-        self._layer_infos = layer_infos
-        self._canon = canonicalizer
-        self.rank = rank
-        self.tp_size = tp_size
+        self._groups: list[GroupInfo] = groups
+        self._layer_infos: dict[str, LayerPageInfo] = layer_infos
+        self._canon: Canonicalizer = canonicalizer
+        self.rank: int = rank
+        self.tp_size: int = tp_size
         # Store namespace per group (see backend.py's module docstring
         # for why group and rank must be part of it).
-        self._labels = [group_label(namespace, g.group_idx, rank)
-                        for g in groups]
+        self._labels: list[str] = [
+            group_label(namespace, g.group_idx, rank) for g in groups]
         # The store cannot exist until vLLM hands over kv_caches, long
         # after the connector is built; the connector assigns this in
         # register_kv_caches.
-        self.store = None
+        self.store: Optional[KVStore] = None
 
-        self._kv_caches_ref = None
+        self._kv_caches_ref: Optional[dict[str, torch.Tensor]] = None
         # Per-step load tasks: layer_name -> list of per-call engine
         # task dicts. Populated by start_load, popped by the per-layer
         # waits. A leftover at step end means a wait never ran ->
         # fail-stop (residue check in wait_save).
-        self._load_tasks: dict[str, list] = {}
+        self._load_tasks: dict[str, list[dict[str, Any]]] = {}
         # Pipelined attention saves: layer_name -> (group_idx, tasks).
-        self._step_attn_saves: dict = {}
+        self._step_attn_saves: dict[str, tuple[int, dict[str, dict[str, Any]]]] = {}
         # Sticky LOAD poison (allocation-after-HIT failures must
         # fail-stop every later worker hook, never degrade to recompute).
         self._load_poison: Optional[BaseException] = None
@@ -82,7 +93,7 @@ class HybridWorker:
         self._async_loads: dict[str, "_AsyncLoad"] = {}
 
         # attention layer_name -> group idx (mamba layers map out).
-        self._attn_layer_group = {
+        self._attn_layer_group: dict[str, int] = {
             ln: g.group_idx for g in groups if g.kind != "mamba"
             for ln in g.layer_names}
         # All GDN layer names, waited as one barrier in start_load
@@ -92,7 +103,9 @@ class HybridWorker:
     # ------------------------------------------------------------------
     # registration
     # ------------------------------------------------------------------
-    def register(self, kv_caches, execution_order: list[str]) -> None:
+    def register(
+        self, kv_caches: dict[str, torch.Tensor], execution_order: list[str]
+    ) -> None:
         """Bind canonical page views and record which layers recur."""
         self._kv_caches_ref = kv_caches
         self._canon.register(kv_caches)
@@ -106,7 +119,7 @@ class HybridWorker:
             raise RuntimeError(
                 "kvshrink hybrid: no attention layers found in the "
                 "execution order; nothing would ever wait for a load")
-        self._attn_order = tuple(attn_order)
+        self._attn_order: tuple[str, ...] = tuple(attn_order)
         logger.info(
             "kvshrink hybrid worker registered: %d layers, %d attention "
             "hook points, %d recurrent layers (namespace tp=%d rank=%d)",
@@ -149,8 +162,11 @@ class HybridWorker:
     # caller waits a LAYER at a time (vLLM's hook fires per layer), so
     # part views are flattened under "layer::part" keys and the
     # returned tasks are regrouped under the layer name.
-    def _submit_group_transfer(self, op, group_idx: int, layer_views,
-                               chunk_indices, chunk_labels) -> dict:
+    def _submit_group_transfer(
+        self, op: Any, group_idx: int,
+        layer_views: dict[str, dict[str, torch.Tensor]],
+        chunk_indices: list[int], chunk_labels: list[str],
+    ) -> dict[str, dict[str, Any]]:
         """One engine call covering every layer of the group, so the
         block is finalized by this call alone; returns per-layer tasks
         so the caller can wait a layer at a time."""
@@ -162,12 +178,14 @@ class HybridWorker:
                    layer_names=list(tensors),
                    tensors=tensors,
                    label=self._labels[group_idx])
-        by_layer: dict = {}
+        by_layer: dict[str, dict[str, Any]] = {}
         for key, task in tasks.items():
             by_layer.setdefault(key.rsplit("::", 1)[0], {})[key] = task
         return by_layer
 
-    def _wait_load(self, layer_tasks, wait: bool = True) -> bool:
+    def _wait_load(
+        self, layer_tasks: dict[str, Any], wait: bool = True
+    ) -> bool:
         """Block until the reads land, or with ``wait=False`` report
         whether they have without consuming them -- the poll used to
         decide if an async request may be released, which must not stall
@@ -184,7 +202,7 @@ class HybridWorker:
                 "transfer; forward would read unrestored blocks")
         return True
 
-    def _wait_store(self, tasks) -> None:
+    def _wait_store(self, tasks: dict[str, dict[str, Any]]) -> None:
         """Host-block until these writes land. An incomplete write is
         fail-stop, same as an incomplete load: the scheduler's save
         cursor has already advanced past these blocks, so losing them
@@ -201,7 +219,7 @@ class HybridWorker:
     # ------------------------------------------------------------------
     # load path
     # ------------------------------------------------------------------
-    def start_load(self, metadata) -> int:
+    def start_load(self, metadata: KVShrinkConnectorMetadata) -> int:
         """Submit ALL of this step's loads, then host-block on the GDN
         ones. Attention layers stay pipelined: vLLM calls a hook on
         entry to each of them, so their pages are waited for exactly
@@ -252,7 +270,10 @@ class HybridWorker:
                 (_now() - _t0) * 1e3, self.rank, self.tp_size)
         return npages
 
-    def _register_async_load(self, req_id, req_meta, sink: dict) -> None:
+    def _register_async_load(
+        self, req_id: str, req_meta: ReqMeta,
+        sink: dict[str, list[dict[str, Any]]],
+    ) -> None:
         """Track one request's cross-step load and compute its release
         gate.
         """
@@ -278,9 +299,9 @@ class HybridWorker:
                 "requested_prefix=%s", req_id, len(sink), len(gate),
                 len(recurrent), n)
 
-    def poll_finished_loads(self) -> set:
+    def poll_finished_loads(self) -> set[str]:
         """Report async requests whose gate layers have landed."""
-        finished: set = set()
+        finished: set[str] = set()
         for req_id, entry in list(self._async_loads.items()):
             if entry.released:
                 continue
@@ -337,7 +358,10 @@ class HybridWorker:
             self._poison_load(err)
             raise err
 
-    def _submit_op_load(self, req_id, op, sink) -> int:
+    def _submit_op_load(
+        self, req_id: str, op: GroupTransferMeta,
+        sink: dict[str, list[dict[str, Any]]],
+    ) -> int:
         """Submit one GroupTransferMeta to the engine (async get)."""
         group = self._groups[op.group_idx]
         if not op.keys:
@@ -354,7 +378,7 @@ class HybridWorker:
                     "forward with unrestored state")
                 self._poison_load(err)
                 raise err
-        by_layer: dict[str, list] = {}
+        by_layer: dict[str, list[tuple[int, str]]] = {}
         for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
             by_layer.setdefault(key.layer_name, []).append(
                 (gpu_block_id, key.hash_str))
@@ -375,7 +399,7 @@ class HybridWorker:
         views = {ln: self._canon.page_view_parts(ln) for ln in by_layer}
         # Split into calls with unique chunk labels (one engine call
         # maps chunk_labels 1:1 to chunk_indices).
-        calls: list[tuple[list, list]] = []
+        calls: list[tuple[list[int], list[str]]] = []
         slot_of: dict[str, int] = {}
         for gpu_block_id, h in entries:
             c = slot_of.get(h)
@@ -394,7 +418,7 @@ class HybridWorker:
                 npages += len(indices)
         return npages
 
-    def _wait_tasks(self, task_dicts) -> None:
+    def _wait_tasks(self, task_dicts: list[dict[str, Any]]) -> None:
         """Host-block until these engine tasks landed (fail-stop)."""
         try:
             for td in task_dicts:
@@ -406,11 +430,13 @@ class HybridWorker:
     # ------------------------------------------------------------------
     # save path
     # ------------------------------------------------------------------
-    def _gather_save_candidates(self, metadata) -> dict:
+    def _gather_save_candidates(
+        self, metadata: KVShrinkConnectorMetadata
+    ) -> dict[tuple[str, int, int, str, int], dict[str, Any]]:
         """Batch-level boundary candidates with cross-request dedup.
         Returns boundary_key -> {"group_idx", "pages": {layer_name:
         (key, gpu_block_id)}, "boundary_tokens"}."""
-        candidates: dict[tuple, dict] = {}
+        candidates: dict[tuple[str, int, int, str, int], dict[str, Any]] = {}
         for req_meta in metadata.reqs_to_save.requests.values():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
@@ -427,7 +453,10 @@ class HybridWorker:
                             op.snapshot_boundary_tokens
         return candidates
 
-    def _submit_group_layers_save(self, g_idx, layer_names, entries):
+    def _submit_group_layers_save(
+        self, g_idx: int, layer_names: list[str],
+        entries: list[tuple[int, str]],
+    ) -> dict[str, dict[str, Any]]:
         """Submit ONE async engine put covering ``layer_names`` for the
         blocks in ``entries`` (list of (gpu_block_id, chunk_label), same
         order for every layer -- scheduler invariant). Async D2H+zip on
@@ -445,7 +474,9 @@ class HybridWorker:
             self.store.put, g_idx, views, chunk_indices, chunk_labels)
         return tasks
 
-    def save_kv_layer(self, layer_name: str, metadata) -> None:
+    def save_kv_layer(
+        self, layer_name: str, metadata: KVShrinkConnectorMetadata
+    ) -> None:
         """Pipelined attention save. vLLM calls this on exit of EVERY
         attention layer during forward (kv_transfer_utils decorator).
         """
@@ -457,7 +488,7 @@ class HybridWorker:
         if g_idx is None:
             return  # not an attention layer we serve (fast path)
         expected = sorted(self._groups[g_idx].layer_names)
-        entries = []
+        entries: list[tuple[int, str]] = []
         for _bkey, cand in self._gather_save_candidates(metadata).items():
             if cand["group_idx"] != g_idx:
                 continue
@@ -473,7 +504,9 @@ class HybridWorker:
                                                entries)
         self._step_attn_saves[layer_name] = (g_idx, tasks)
 
-    def wait_save(self, metadata) -> tuple[int, int]:
+    def wait_save(
+        self, metadata: KVShrinkConnectorMetadata
+    ) -> tuple[int, int]:
         """Post-forward save: GDN groups submit here; attention groups
         collect their pipelined tasks; then wait for the writes,
         write every page of every group.

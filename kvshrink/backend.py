@@ -5,6 +5,12 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from iaxl import KVStore
+
+    from .kvshrink_connector import CacheKey
 
 logger = logging.getLogger("vllm." + __name__)
 
@@ -14,7 +20,7 @@ def group_label(namespace: str, group_idx: int, rank: int) -> str:
     return f"{namespace}_g{int(group_idx)}_r{int(rank)}"
 
 
-def lookup_boundary(store, key) -> bool:
+def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
     """Is this boundary readable, on every rank?"""
     chunk_id = key.hash_str
     try:

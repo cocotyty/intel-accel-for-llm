@@ -7,13 +7,21 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import replace
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from iaxl import generate_block_hashs
 
 from .backend import lookup_boundary
 from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta,
                      ReqMeta, ReqGroupState, ReqState, make_boundary_key)
+
+if TYPE_CHECKING:
+    from iaxl import KVStore
+
+    from .async_load_config import AsyncLoadLayerConfig
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.request import Request
 
 # ======================================================================
 # request scheduler (EngineCore side)
@@ -46,12 +54,12 @@ class HybridRequestScheduler:
     def __init__(
         self,
         groups: list[GroupInfo],
-        store,
+        store: "KVStore",
         hash_block_size: int,
         namespace: str,
         tp_size: int,
         rank: int,
-        async_load_config=None,
+        async_load_config: Optional["AsyncLoadLayerConfig"] = None,
         block_hash_source: str = "vllm",
     ):
         """Record the per-group layout, the read-only presence store
@@ -59,16 +67,17 @@ class HybridRequestScheduler:
         the resume/cursor-rollback counter that spans a request's whole
         scheduling lifecycle.
         """
-        self._groups = groups
-        self._store = store
-        self._hash_block_size = hash_block_size
-        self._namespace = namespace
-        self._tp_size = tp_size
-        self._rank = rank
+        self._groups: list[GroupInfo] = groups
+        self._store: KVStore = store
+        self._hash_block_size: int = hash_block_size
+        self._namespace: str = namespace
+        self._tp_size: int = tp_size
+        self._rank: int = rank
         # Async-load policy (AsyncLoadLayerConfig). None disables it, so
         # every request keeps the old behaviour of occupying a forward
         # step while its pages arrive.
-        self._async_load_config = async_load_config
+        self._async_load_config: Optional[AsyncLoadLayerConfig] = (
+            async_load_config)
         # Where a block's cache identity comes from. This is a DATA
         # COMPATIBILITY switch, not a behavioural one: the two sources
         # produce different key values, so flipping it makes every
@@ -79,7 +88,7 @@ class HybridRequestScheduler:
             raise ValueError(
                 f"unknown block hash source {block_hash_source!r}; "
                 "expected 'vllm' or 'legacy'")
-        self._block_hash_source = block_hash_source
+        self._block_hash_source: str = block_hash_source
         # Attention layers in execution order, used to size the
         # early-release prefix. Mamba layers are deliberately absent:
         # they are never partially released (see _decide_async).
@@ -94,7 +103,8 @@ class HybridRequestScheduler:
     # ------------------------------------------------------------------
     def on_new_request(
         self, req_id: str, block_hashes: list[int],
-        num_computed_tokens: int, request=None,
+        num_computed_tokens: int,
+        request: Optional["Request"] = None,
     ) -> None:
         """Register a fresh ReqState. Internal: called by us from
         get_num_new_matched_tokens / build_load_meta /
@@ -113,7 +123,9 @@ class HybridRequestScheduler:
                 ReqGroupState() for _ in self._groups),
         )
 
-    def take_async_load_plans(self, already_emitted: set) -> dict:
+    def take_async_load_plans(
+        self, already_emitted: set[str]
+    ) -> dict[str, ReqMeta]:
         """Load plans for requests vLLM parked, drained exactly once."""
         plans = {}
         for req_id in sorted(self._async_load_pending - already_emitted):
@@ -142,7 +154,7 @@ class HybridRequestScheduler:
                                      - already_emitted)
         return plans
 
-    def _request_block_hashes(self, request) -> list:
+    def _request_block_hashes(self, request: "Request") -> list[Any]:
         """This request's block identities, in block order."""
         if self._block_hash_source == "vllm":
             return list(request.block_hashes)
@@ -158,8 +170,8 @@ class HybridRequestScheduler:
         self._async_load_pending.discard(req_id)
 
     def on_cached_request(
-        self, req_id: str, new_block_ids, resumed: bool,
-        num_computed_tokens: Optional[int],
+        self, req_id: str, new_block_ids: tuple[list[int], ...],
+        resumed: bool, num_computed_tokens: Optional[int],
     ) -> None:
         """vLLM trigger: every scheduling pass, for each running
         (cached) request, via connector.build_connector_meta.
@@ -215,7 +227,7 @@ class HybridRequestScheduler:
 
     # ------------------------------------------------------------------
     def get_num_new_matched_tokens(
-        self, request, num_computed_tokens: int
+        self, request: "Request", num_computed_tokens: int
     ) -> tuple[Optional[int], bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
         if num_computed_tokens >= request.num_tokens:
@@ -275,7 +287,8 @@ class HybridRequestScheduler:
 
     # ------------------------------------------------------------------
     def update_state_after_alloc(
-        self, request, blocks, num_external_tokens: int
+        self, request: "Request", blocks: "KVCacheBlocks",
+        num_external_tokens: int
     ) -> None:
         """Record the allocated block tables per group (after alloc)."""
         req_id = request.request_id
@@ -313,7 +326,9 @@ class HybridRequestScheduler:
                 len(state.block_hashes))
 
     # ------------------------------------------------------------------
-    def build_load_meta(self, new_req, scheduled_tokens: int = 0) -> ReqMeta:
+    def build_load_meta(
+        self, new_req: "NewRequestData", scheduled_tokens: int = 0
+    ) -> ReqMeta:
         """Build the LOAD ReqMeta for a NewRequestData entry."""
         req_id = new_req.req_id
         state = self._req_states.get(req_id)
@@ -350,7 +365,7 @@ class HybridRequestScheduler:
         return meta
 
     def _build_load_meta_from_state(
-        self, req_id: str, state, scheduled_tokens: int,
+        self, req_id: str, state: ReqState, scheduled_tokens: int,
     ) -> ReqMeta:
         """The snapshot_boundary recorded by get_num_new_matched_tokens
         is the AUTHORITATIVE restore boundary for this alloc/load. NEVER recompute here: after
@@ -568,12 +583,12 @@ class HybridRequestScheduler:
                 snapshot_boundary_tokens=snapshot_boundary))
         return ReqMeta(group_ops=tuple(group_ops))
 
-    def _boundary_key(self, group: GroupInfo, block_hash) -> CacheKey:
+    def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
         """This rank's boundary key for one group at one block hash."""
         return make_boundary_key(self._namespace, self._tp_size,
                                  self._rank, group.group_idx, block_hash)
 
-    def _present(self, group_idx: int, block_hash) -> bool:
+    def _present(self, group_idx: int, block_hash: object) -> bool:
         """Store-presence predicate handed to the hit policy, which
         plans against boundary addresses without seeing store details."""
         return lookup_boundary(
@@ -600,10 +615,12 @@ class _StoreAsBlockPool:
     # ever counts it, so it needs no identity beyond being a value.
     null_block = object()
 
-    def __init__(self, present):
-        self._present = present
+    def __init__(self, present: Callable[[int, object], bool]):
+        self._present: Callable[[int, object], bool] = present
 
-    def get_cached_block(self, block_hash, kv_cache_group_ids):
+    def get_cached_block(
+        self, block_hash: object, kv_cache_group_ids: list[int],
+    ) -> Optional[list[object]]:
         blocks = []
         for group_id in kv_cache_group_ids:
             if not self._present(group_id, block_hash):
@@ -618,7 +635,7 @@ class HybridHitPolicy:
     def __init__(
         self,
         groups: list[GroupInfo],
-        present,
+        present: Callable[[int, object], bool],
         hash_block_size: int,
         num_computed_tokens: int,
     ):
@@ -627,14 +644,14 @@ class HybridHitPolicy:
         the request's computed tokens. Orders groups attention-first
         (tighter initial bound) and takes the global mamba alignment as
         the minimum across mamba groups."""
-        self._groups = groups
-        self._present = present
-        self._hash_block_size = hash_block_size
-        self._num_computed = num_computed_tokens
+        self._groups: list[GroupInfo] = groups
+        self._present: Callable[[int, object], bool] = present
+        self._hash_block_size: int = hash_block_size
+        self._num_computed: int = num_computed_tokens
         # full attention first (tighter initial bound)
-        self._ordered = sorted(
+        self._ordered: list[GroupInfo] = sorted(
             groups, key=lambda g: 0 if g.kind == "attention" else 1)
-        self._mamba_align = None
+        self._mamba_align: Optional[int] = None
         for g in groups:
             if g.kind == "mamba":
                 a = g.mamba_align_size
@@ -642,7 +659,7 @@ class HybridHitPolicy:
                     else min(self._mamba_align, a)
 
     # ------------------------------------------------------------------
-    def _lookup(self, group: GroupInfo, block_hashes,
+    def _lookup(self, group: GroupInfo, block_hashes: list[int],
                 candidate: int) -> int:
         """How far this group alone is restorable, in tokens."""
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
