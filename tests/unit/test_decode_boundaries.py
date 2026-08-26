@@ -41,7 +41,7 @@ class _LiveRequest:
 
 def _state(sched, live, hashes):
     st = ReqState(
-        request="r1", request_obj=live, block_hashes=list(hashes),
+        request=live, block_hashes=list(hashes),
         groups=tuple(ReqGroupState() for _ in sched._groups))
     sched._req_states["r1"] = st
     return st
