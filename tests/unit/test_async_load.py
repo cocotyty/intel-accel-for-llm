@@ -23,7 +23,7 @@ import pytest
 
 from conftest import make_spec
 from kvshrink.layout import (
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
+    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestMetadata)
 from kvshrink.layout import LookupStatus
 from kvshrink.worker import HybridWorker
 
@@ -96,9 +96,10 @@ def _meta(async_layers, req_id="r1"):
         return GroupTransferMeta(
             group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers),
             snapshot_boundary_tokens=64 if gidx == 1 else None)
-    req = ReqMeta(req_id=req_id, group_ops=(op(0, ATTN), op(1, GDN)),
-                  is_async=True, async_load_layers=async_layers)
-    return type("M", (), {"reqs_to_load": [req]})
+    md = RequestMetadata()
+    md.add_request(req_id, group_ops=(op(0, ATTN), op(1, GDN)),
+                   is_async=True, async_load_layers=async_layers)
+    return type("M", (), {"reqs_to_load": md})
 
 
 # ------------------------------------------------------------------
@@ -206,45 +207,45 @@ def test_parked_request_still_gets_a_load_plan():
     waits for a release that can never arrive. Observed as a live hang:
     "Running: 0 reqs, Waiting: 3, Deferred: 3" with throughput at zero.
     """
-    from kvshrink.layout import RequestGroupState, RequestState
+    from kvshrink.layout import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN)]
     sched = HybridRequestScheduler(
         groups, _FakeBackend(), hash_block_size=16, namespace="ns",
         tp_size=1, rank=0)
-    st = RequestState(
+    st = ReqState(
         request="r1", block_hashes=[1, 2], snapshot_boundary=32,
-        groups=(RequestGroupState(block_ids=[4, 5]),))
+        groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     st.async_load_layers = 1
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
     plans = sched.take_async_load_plans(already_emitted=set())
-    assert [p.req_id for p in plans] == ["r1"], (
+    assert list(plans) == ["r1"], (
         "the parked request got no load plan -- it would hang")
-    assert plans[0].is_async and plans[0].group_ops
+    assert plans["r1"].is_async and plans["r1"].group_ops
 
 
 def test_async_plan_is_emitted_only_once():
     """A second plan would submit a second transfer for a request that
     already has one in flight, stranding the first."""
-    from kvshrink.layout import RequestGroupState, RequestState
+    from kvshrink.layout import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeBackend(),
         hash_block_size=16, namespace="ns", tp_size=1, rank=0)
-    st = RequestState(
+    st = ReqState(
         request="r1", block_hashes=[1, 2], snapshot_boundary=32,
-        groups=(RequestGroupState(block_ids=[4, 5]),))
+        groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
     assert len(sched.take_async_load_plans(set())) == 1
-    assert sched.take_async_load_plans(set()) == []
+    assert sched.take_async_load_plans(set()) == {}
 
 
 def test_recurrent_models_can_go_async():
@@ -254,7 +255,7 @@ def test_recurrent_models_can_go_async():
     land in the slot vLLM will read, which it does -- see
     test_async_mamba_targets_the_slot_vllm_reads_as_prev.
     """
-    from kvshrink.layout import RequestState
+    from kvshrink.layout import ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     class _Cfg:
@@ -265,7 +266,7 @@ def test_recurrent_models_can_go_async():
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
         _FakeBackend(), hash_block_size=16, namespace="ns", tp_size=1,
         rank=0, async_load_config=_Cfg())
-    hybrid._req_states["r1"] = RequestState(request="r1")
+    hybrid._req_states["r1"] = ReqState(request="r1")
     assert hybrid._decide_async("r1", external=64) is True
 
 
@@ -298,17 +299,17 @@ def test_sync_still_refuses_zero_scheduled_tokens():
     lands in start_load_kv, and with no scheduled tokens no forward
     runs at all, so the slot would be left unrestored while the core
     has already credited the tokens."""
-    from kvshrink.layout import RequestGroupState, RequestState
+    from kvshrink.layout import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     sched = HybridRequestScheduler(
         groups, _FakeBackend(), hash_block_size=16, namespace="ns",
         tp_size=1, rank=0)
-    st = RequestState(
+    st = ReqState(
         request="r1", block_hashes=[1, 2, 3, 4], snapshot_boundary=64,
-        groups=(RequestGroupState(block_ids=[1, 2, 3, 4]),
-                RequestGroupState(block_ids=[7, 8, 9, 10])))
+        groups=(ReqGroupState(block_ids=[1, 2, 3, 4]),
+                ReqGroupState(block_ids=[7, 8, 9, 10])))
     st.is_async = False
     sched._req_states["r1"] = st
     with pytest.raises(RuntimeError, match="scheduled_tokens=0"):
@@ -324,15 +325,15 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     assertion (scheduler.py:2243: a finished-recving request must be
     parked or finished, never running) and killed EngineCore.
     """
-    from kvshrink.layout import RequestGroupState, RequestState
+    from kvshrink.layout import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeBackend(), hash_block_size=16,
         namespace="ns", tp_size=1, rank=0)
-    st = RequestState(
+    st = ReqState(
         request="r1", block_hashes=[1, 2], snapshot_boundary=32,
-        groups=(RequestGroupState(block_ids=[4, 5]),))
+        groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
 
@@ -350,7 +351,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
 
     # vLLM's second callback for the same request
     sched.update_state_after_alloc(_Req(), _Blocks(), 32)
-    assert sched.take_async_load_plans(set()) == [], (
+    assert sched.take_async_load_plans(set()) == {}, (
         "a second transfer was queued for a request already running")
 
 
@@ -363,21 +364,21 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     parked or done. Observed as EngineDeadError with 6/6 requests
     returning 500.
     """
-    from kvshrink.layout import RequestGroupState, RequestState
+    from kvshrink.layout import ReqGroupState, ReqState
     from kvshrink.scheduler import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeBackend(), hash_block_size=16,
         namespace="ns", tp_size=1, rank=0)
-    st = RequestState(
+    st = ReqState(
         request="r1", block_hashes=[1, 2], snapshot_boundary=32,
-        groups=(RequestGroupState(block_ids=[4, 5]),))
+        groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
     plans = sched.take_async_load_plans(set())
-    assert plans and plans[0].is_async
+    assert plans and plans["r1"].is_async
 
     assert st.is_async is False, (
         "a plan built after release would still be async")
