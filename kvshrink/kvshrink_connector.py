@@ -32,7 +32,7 @@ from iaxl import KVStore, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
-from .scheduler import load_async_load_layer_config_from_env
+from .async_load_config import load_async_load_layer_config_from_env
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
