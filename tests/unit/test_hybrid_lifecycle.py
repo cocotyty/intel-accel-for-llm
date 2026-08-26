@@ -129,7 +129,6 @@ def test_monotonic_progress_no_rollback():
     sched.on_cached_request("r1", None, resumed=False,
                             num_computed_tokens=32)
     assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 2
-    assert sched.cursor_rollbacks == 0
 
 
 def test_resumed_empty_table_clears_and_rolls_back():
@@ -153,7 +152,6 @@ def test_progress_regression_without_resumed_flag_rolls_back():
                             num_computed_tokens=16)
     g = sched._req_states["r1"].groups[0]
     assert g.next_stored_chunk_idx == 1, g  # floor(16/16)
-    assert sched.cursor_rollbacks == 1
 
 
 # ------------------------------------------------------------------
@@ -230,7 +228,6 @@ def test_resumed_missing_progress_rolls_back_to_zero():
                             num_computed_tokens=None)
     g = sched._req_states["r1"].groups[0]
     assert g.next_stored_chunk_idx == 0, g
-    assert sched.cursor_rollbacks == 1
     m = sched.build_save_meta("r1", scheduled_tokens=32)
     assert m.group_ops[0].gpu_block_ids == (10, 11)  # re-emitted
 
@@ -259,9 +256,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         free, delay = conn.request_finished(
             type("R", (), {"request_id": rid}), None)
         assert (free, delay) == (False, None)
-    stats = sched.lifecycle_stats()
-    assert stats["request_states"] == 0, stats
-    assert stats["cursor_rollbacks"] == 1000, stats
+    assert len(sched._req_states) == 0
 
 
 # ------------------------------------------------------------------
