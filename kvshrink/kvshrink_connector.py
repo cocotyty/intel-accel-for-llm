@@ -143,7 +143,7 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 
 
 # ======================================================================
-# lookup vocabulary (shared by scheduler, worker and backends)
+# lookup vocabulary (shared by scheduler, worker and the store)
 # ======================================================================
 # Cache hit policy for hybrid (Full Attention + GDN) models.
 #
@@ -683,7 +683,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # choice, not a second code path.
         self._sched = None
         self._worker = None
-        self._backend = None
         self._canon = None
         self._groups: list = []
         # Authoritative TP rank, set by _init_kv_stack. Distinct from
@@ -710,7 +709,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: KVCacheConfig,
     ) -> None:
         """Build the hybrid stack for this role."""
-        from .backend import KVStoreBackend
         from .scheduler import HybridRequestScheduler
         from .worker import HybridWorker
 
@@ -724,7 +722,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             rank = pc.rank
         else:
             # Scheduler-side keys are always rank 0; each worker verifies
-            # its own shard through its own backend.
+            # its own shard through its own store.
             rank = 0
         self.kvstore = None
         cache_config = vllm_config.cache_config
@@ -780,25 +778,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             # Presence-only store: the scheduler asks whether boundaries
             # are readable and never moves bytes.
-            self._backend = KVStoreBackend(KVStore(
+            store = KVStore(
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(i) for i in range(self.num_layers)],
                 tp_size=self.tp_size,
-            ))
-            self._backend.register_layout(namespace, tp_size, rank)
+            )
             self._sched = HybridRequestScheduler(
-                groups, self._backend, hash_block_size, namespace,
+                groups, store, hash_block_size, namespace,
                 tp_size, rank,
                 block_hash_source=self._block_hash_source(recurrent),
                 async_load_config=self._async_load_layer_config)
         else:
-            # The store needs kv_caches, which arrive later; bound in
-            # register_kv_caches.
-            self._backend = KVStoreBackend()
-            self._backend.register_layout(namespace, tp_size, rank)
+            # The store needs kv_caches, which arrive later; assigned
+            # to the worker in register_kv_caches.
             self._canon = Canonicalizer(layer_infos, num_blocks)
             self._worker = HybridWorker(
-                groups, layer_infos, self._backend,
+                groups, layer_infos, namespace,
                 self._canon, rank, tp_size)
 
         logger.info(
@@ -1072,7 +1067,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if self._worker is not None:
             self._register_layer_caches(kv_caches)
 
-        if self._backend is not None:
             # The store is handed the canonical page views, not the raw
             # tensors: every view is a (num_blocks, page_bytes) int8
             # array whose dim-0 rows are blocks, which is the shape the
@@ -1084,7 +1078,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             views = {
                 f"{ln}::{part}": view
                 for ln in self._layer_names
-                for part, view in self._canon.page_view_parts(ln)[0].items()
+                for part, view in self._canon.page_view_parts(ln).items()
             }
             self.kvstore = KVStore(
                 model_name=os.path.basename(self.model_config.model),
@@ -1098,7 +1092,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 rank=self._rank if self._rank is not None else self.rank,
                 tp_size=self.tp_size,
             )
-            self._backend.bind_store(self.kvstore)
+            self._worker.store = self.kvstore
             logger.info("Registered %d KV cache layers (%d page views)",
                         len(kv_caches), len(views))
 
