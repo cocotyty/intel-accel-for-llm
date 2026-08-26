@@ -16,7 +16,7 @@ Pure logic: no GPU, no disk, no model.
 from __future__ import annotations
 
 from conftest import make_spec
-from kvshrink.layout import GroupInfo, RequestGroupState, RequestState
+from kvshrink.layout import GroupInfo, ReqGroupState, ReqState
 from kvshrink.scheduler import HybridRequestScheduler
 
 
@@ -40,9 +40,9 @@ class _LiveRequest:
 
 
 def _state(sched, live, hashes):
-    st = RequestState(
+    st = ReqState(
         request="r1", request_obj=live, block_hashes=list(hashes),
-        groups=tuple(RequestGroupState() for _ in sched._groups))
+        groups=tuple(ReqGroupState() for _ in sched._groups))
     sched._req_states["r1"] = st
     return st
 

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from kvshrink.worker import HybridWorker
 from conftest import make_spec
 from kvshrink.layout import (
+    RequestMetadata,
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
 
 
@@ -64,8 +65,9 @@ def _save_meta():
         keys=(_key("m0", blk_hash=888, g_idx=1),),
         gpu_block_ids=(20,),
         snapshot_boundary_tokens=544)
-    return SimpleNamespace(reqs_to_save=[ReqMeta(
-        req_id="r1", group_ops=(attn_ops, mamba_ops))])
+    saves = RequestMetadata()
+    saves.add_request("r1", group_ops=(attn_ops, mamba_ops))
+    return SimpleNamespace(reqs_to_save=saves)
 
 
 def _worker():
