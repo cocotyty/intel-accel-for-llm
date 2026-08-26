@@ -11,8 +11,7 @@ from typing import Optional
 from iaxl import generate_block_hashs
 
 from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta,
-                     ReqMeta, ReqGroupState, ReqState,
-                     align_down, make_boundary_key)
+                     ReqMeta, ReqGroupState, ReqState, make_boundary_key)
 
 # ======================================================================
 # request scheduler (EngineCore side)
@@ -148,15 +147,6 @@ class HybridRequestScheduler:
         return [str(h) for h in generate_block_hashs(
             tokens[:-1], self._hash_block_size)]
 
-    def _sync_block_hashes(self, state: ReqState) -> None:
-        """Adopt block hashes vLLM has added since we registered."""
-        if state.request is None:
-            return
-        live = self._request_block_hashes(state.request)
-        if not live or len(live) <= len(state.block_hashes):
-            return
-        state.block_hashes.extend(live[len(state.block_hashes):])
-
     def on_request_finished(self, req_id: str) -> None:
         """vLLM trigger: core frees the request ->
         connector.request_finished -> here. Drop the ReqState;
@@ -174,7 +164,14 @@ class HybridRequestScheduler:
         state = self._req_states.get(req_id)
         if state is None:
             return
-        self._sync_block_hashes(state)
+        # Adopt block hashes vLLM has appended since we registered
+        # (decode completes blocks too; without this, generated tokens
+        # are never offloaded). Only ever extends -- hashes are
+        # content-addressed and append-only.
+        if state.request is not None:
+            live = self._request_block_hashes(state.request)
+            if len(live) > len(state.block_hashes):
+                state.block_hashes.extend(live[len(state.block_hashes):])
         old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
@@ -219,8 +216,9 @@ class HybridRequestScheduler:
         """External lookup; returns (hit_tokens, has_async_load)."""
         if num_computed_tokens >= request.num_tokens:
             return 0, False
+        block_hashes = self._request_block_hashes(request)
         self.on_new_request(
-            request.request_id, self._request_block_hashes(request),
+            request.request_id, block_hashes,
             num_computed_tokens, request=request)
         policy = HybridHitPolicy(
             self._groups, self._backend, self._hash_block_size,
@@ -229,7 +227,7 @@ class HybridRequestScheduler:
         # gated on live chunk presence (engine Record), so a nonzero
         # boundary is complete by construction; only record it.
         boundary = policy.find_longest_cache_hit(
-            self._request_block_hashes(request), request.num_tokens)
+            block_hashes, request.num_tokens)
         state = self._req_states.get(request.request_id)
         if boundary and state is not None and state.block_hashes:
             state.snapshot_boundary = boundary
@@ -443,9 +441,6 @@ class HybridRequestScheduler:
                             curr_idx = (boundary + scheduled_tokens -
                                         1) // bs
 
-                            def _slot_ok(t):
-                                return 0 <= t < len(ids) and ids[t] != 0
-
                             # Fail-closed contract: an external HIT has already
                             # committed num_computed_tokens=boundary via
                             # get_num_new_matched_tokens; silently skipping a
@@ -482,7 +477,8 @@ class HybridRequestScheduler:
                                     f"(req={req_id} boundary={boundary}): "
                                     "production hits must schedule >= 1 "
                                     "token; refusing to build load meta")
-                            if not _slot_ok(curr_idx):
+                            if not (0 <= curr_idx < len(ids)
+                                    and ids[curr_idx] != 0):
                                 raise RuntimeError(
                                     "kvshrink mamba load curr slot "
                                     f"invalid (req={req_id} "
@@ -491,13 +487,11 @@ class HybridRequestScheduler:
                                     f"table_idx={curr_idx} "
                                     f"table={ids}): refusing to enter "
                                     "forward with unrestored state")
-                            targets = {curr_idx}
-                            for table_idx in sorted(targets):
-                                gpu_block = ids[table_idx]
-                                for layer_name in group.layer_names:
-                                    keys.append(self._page_key(
-                                        key, layer_name))
-                                    gpu_ids.append(gpu_block)
+                            gpu_block = ids[curr_idx]
+                            for layer_name in group.layer_names:
+                                keys.append(self._page_key(
+                                    key, layer_name))
+                                gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids),
@@ -660,11 +654,6 @@ class HybridHitPolicy:
                     else min(self._mamba_align, a)
 
     # ------------------------------------------------------------------
-    def _boundary_key(self, group: GroupInfo, block_hash: int) -> CacheKey:
-        """This rank's boundary key for one group at one block hash."""
-        return make_boundary_key(self._namespace, self._tp_size,
-                                 self._rank, group.group_idx, block_hash)
-
     def _lookup(self, group: GroupInfo, block_hashes,
                 candidate: int) -> int:
         """How far this group alone is restorable, in tokens."""
@@ -702,8 +691,8 @@ class HybridHitPolicy:
         candidate = max_length
         if self._mamba_align is not None:
             # the last prompt token is always recomputed (logprobs + state)
-            candidate = min(candidate - 1,
-                            align_down(candidate - 1, self._mamba_align))
+            a = self._mamba_align
+            candidate = min(candidate - 1, (candidate - 1) // a * a)
 
         while True:
             changed = False
