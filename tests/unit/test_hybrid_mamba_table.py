@@ -1,8 +1,8 @@
 """Mamba block-table shape handling in build_save_meta/build_load_meta.
 
-Regression for super-master gate (devlog §5.10): block tables vary by
+block tables vary by
 token count -- single-element [X] (545-token req), null-prefixed
-[0,0,X], or [null, X]. Block 0 is the reserved null block (M0 verified).
+[0,0,X], or [null, X]. Block 0 is the reserved null block .
 Old code assumed len(ids) > 1 and silently skipped mamba snapshots for
 single-element tables; the fix picks the last NON-NULL block.
 
@@ -343,9 +343,9 @@ def test_load_meta_all_null_table_fail_closed():
 
 
 def test_load_meta_hit_sched_zero_fail_stop():
-    """External HIT with scheduled_tokens=0 -> FAIL-STOP (super-master
-    gate §5.33: production hits must schedule >= 1 token; sched=0 is a
-    test-only path that must never drive a real mamba load)."""
+    """External HIT with scheduled_tokens=0 -> FAIL-STOP. A production
+    hit always schedules at least one token; sched=0 is a test-only
+    path that must never drive a real mamba load."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[5, 9]])
     sched._req_states["r1"].snapshot_boundary = 544
@@ -360,7 +360,7 @@ def test_load_meta_hit_sched_zero_fail_stop():
     assert "scheduled_tokens=0" in str(raised)
 
 
-def test_gnnmt_completeness_intact_boundary_unchanged():
+def test_completeness_intact_boundary_unchanged():
     """Lookup: all pages present -> boundary unchanged (1088)."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
     backend = _Backend(set(), committed_pairs=_hybrid_pairs([0, 1], [1]))
@@ -372,7 +372,7 @@ def test_gnnmt_completeness_intact_boundary_unchanged():
     assert sched._req_states["r1"].snapshot_boundary == 1088
 
 
-def test_gnnmt_mamba_align_granularity():
+def test_mamba_align_granularity():
     """mamba_align_size > block_size (32 vs 16): final boundary 96 with
     a missing attention hash2 page -> mamba snapshot only at 96 -> full
     MISS (no intermediate boundary usable)."""
@@ -391,11 +391,11 @@ def test_gnnmt_mamba_align_granularity():
     assert ext == 0, ext  # mamba snapshot unusable below 96 -> MISS
 
 
-def test_gnnmt_mamba_partial_recovery_with_earlier_snapshot():
+def test_mamba_partial_recovery_with_earlier_snapshot():
     """If an EARLIER mamba snapshot is committed and intact (future M3
     multi-snapshot save), partial recovery is legal: hash1 attention
     page missing -> 1088 unusable, but 544 has a complete mamba
-    snapshot -> restore 544 (super-master gate, devlog §5.21)."""
+    snapshot -> restore 544."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
     # attention has hash0 only; mamba has snapshots at both
     backend = _Backend(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
