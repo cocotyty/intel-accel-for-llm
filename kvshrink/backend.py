@@ -137,10 +137,8 @@ class KVStoreBackend:
         return self._bound.put_wait(put_results=flat, wait=True)
 
     # -- presence ----------------------------------------------------
-    def lookup_boundary(self, key):
+    def lookup_boundary(self, key) -> bool:
         """Is this boundary readable, on every rank?"""
-        from .kvshrink_connector import LookupStatus
-
         chunk_id = str(key.hash_str)
         try:
             for r in range(self._tp_size):
@@ -152,10 +150,10 @@ class KVStoreBackend:
                             "boundary %s g%d present on rank %d but not on "
                             "rank %d; MISS (recompute re-saves all ranks)",
                             chunk_id[:12], key.group_idx, self._rank, r)
-                    return LookupStatus.MISS
-            return LookupStatus.HIT
+                    return False
+            return True
         except Exception:  # pragma: no cover - fail closed to MISS
             logger.exception("lookup error; treating as MISS")
-            return LookupStatus.MISS
+            return False
 
 

@@ -10,7 +10,6 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -158,23 +157,8 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 #   mamba_align_size and the final boundary recomputes exactly 1 token.
 # - Multiple groups converge via fixed-point iteration (full attention
 #   first, then mamba groups).
-# - Backend lookups return HIT / MISS (chunk tier is Record-gated,
-#   request, never allocates.
-class LookupStatus(Enum):
-    """Two-valued lookup verdict: HIT restores from external cache,
-    MISS recomputes (the fail-closed default)."""
-    HIT = "hit"
-    MISS = "miss"
-
-
-@dataclass(frozen=True)
-class LookupResult:
-    """Frozen policy output: the verdict and the number of boundary
-    tokens restorable from the external cache."""
-    status: LookupStatus
-    boundary_tokens: int = 0  # tokens that can be restored from external cache
-
-
+# - Backend lookups return a bool (chunk tier is Record-gated,
+#   request, never allocates).
 def align_down(tokens: int, align: int) -> int:
     """Largest multiple of ``align`` not exceeding ``tokens``. Snaps
     mamba candidates to align boundaries: GDN state is only addressable
