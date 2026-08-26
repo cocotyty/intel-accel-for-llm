@@ -439,19 +439,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 len(meta.reqs_to_load), len(meta.reqs_to_save))
         return meta
 
-    def lifecycle_stats(self) -> dict:
-        """Lifecycle counters, for tests and debugging."""
-        stats: dict = {
-            "role": "scheduler" if self._sched is not None else "worker",
-        }
-        if self._sched is not None:
-            stats.update(self._sched.lifecycle_stats())
-        return stats
-
-    ############################################################
-    # Hybrid path: worker side
-    ############################################################
-
     def _register_layer_caches(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> None:

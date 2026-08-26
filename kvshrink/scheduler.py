@@ -53,6 +53,11 @@ class HybridRequestScheduler:
         async_load_config=None,
         block_hash_source: str = "vllm",
     ):
+        """Record the per-group layout, hit-policy backend and TP
+        identity, and own the per-request RequestState table plus the
+        resume/cursor-rollback counter that spans a request's whole
+        scheduling lifecycle.
+        """
         self._groups = groups
         self._backend = backend
         self._hash_block_size = hash_block_size
@@ -84,26 +89,6 @@ class HybridRequestScheduler:
         # update_state_after_alloc for why this cannot be derived from
         # the scheduler output.
         self._async_load_pending: set[str] = set()
-        self.cursor_rollbacks = 0
-        """Record the per-group layout, hit-policy backend and TP
-        identity, and own the per-request RequestState table plus the
-        resume/cursor-rollback counter that spans a request's whole
-        scheduling lifecycle.
-
-        This is the DECISION side of the hybrid path: it only plans
-        (hit lookup, load/save ReqMeta) against a read-only backend;
-        the worker executes transfers and owns the page views and this
-        rank's writer lease."""
-
-    def lifecycle_stats(self) -> dict:
-        """Expose lifecycle counters for tests and operators: the
-        number of live RequestStates must drop to 0 once every request
-        has finished (or state leaked), alongside the cumulative cursor
-        rollbacks caused by preemption/resume."""
-        return {
-            "request_states": len(self._req_states),
-            "cursor_rollbacks": self.cursor_rollbacks,
-        }
 
     # ------------------------------------------------------------------
     def on_new_request(
@@ -207,7 +192,6 @@ class HybridRequestScheduler:
                 gstate = state.groups[g_idx]
                 safe = safe_n // group.block_size
                 if gstate.next_stored_chunk_idx > safe:
-                    self.cursor_rollbacks += 1
                     if os.getenv("KVSHRINK_DEBUG_LOG"):
                         logger.info(
                             "cursor rollback req=%s g%d: %d -> %d "
