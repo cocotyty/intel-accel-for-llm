@@ -24,7 +24,6 @@ import pytest
 from conftest import make_spec
 from kvshrink.kvshrink_connector import (
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestMetadata)
-from kvshrink.kvshrink_connector import LookupStatus
 from kvshrink.worker import HybridWorker
 
 PAGE = 4096
@@ -67,7 +66,7 @@ class _FakeBackend:
 
     def lookup_boundary(self, key, expected_layers=None,
                         expected_boundary_tokens=None):
-        return LookupStatus.HIT
+        return True
 
 
 class _FakeCanon:

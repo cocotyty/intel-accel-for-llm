@@ -16,7 +16,6 @@ from __future__ import annotations
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
-from kvshrink.kvshrink_connector import LookupStatus
 
 
 class _Backend:
@@ -44,7 +43,7 @@ class _Backend:
             hit = (key.group_idx, key.block_hash) in self.committed_pairs
         else:
             hit = key.block_hash in self.committed
-        return LookupStatus.HIT if hit else LookupStatus.MISS
+        return True if hit else False
 
 
 def _group(g_idx, kind, block_size, align=None):

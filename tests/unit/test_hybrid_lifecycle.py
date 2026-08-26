@@ -16,7 +16,7 @@ Rulings under test:
 import pytest
 
 from conftest import make_spec
-from kvshrink.kvshrink_connector import CacheKey, GroupInfo, LookupStatus
+from kvshrink.kvshrink_connector import CacheKey, GroupInfo
 from kvshrink.scheduler import HybridRequestScheduler
 
 PAGE = 64 * 1024
@@ -44,7 +44,7 @@ def _mamba():
 class _MissBackend:
     def lookup_boundary(self, key, expected_layers=None,
                         expected_boundary_tokens=None):
-        return LookupStatus.MISS
+        return False
 
 
 class _HitBackend:
@@ -55,8 +55,8 @@ class _HitBackend:
 
     def lookup_boundary(self, key, expected_layers=None,
                         expected_boundary_tokens=None):
-        return (LookupStatus.HIT if key.block_hash in self.committed
-                else LookupStatus.MISS)
+        return (True if key.block_hash in self.committed
+                else False)
 
 
 def _sched(groups, backend=None):
@@ -215,7 +215,7 @@ def test_abort_keeps_committed_boundary_hittable():
     sched.on_request_finished("r1")  # abort
     # a fresh lookup for the same hashes still hits
     assert backend.lookup_boundary(
-        CacheKey("ns", 1, 0, 0, 0, "")) == LookupStatus.HIT
+        CacheKey("ns", 1, 0, 0, 0, "")) == True
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():

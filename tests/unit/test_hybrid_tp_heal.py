@@ -19,7 +19,7 @@ Pure logic: fake store, no GPU, no disk.
 from __future__ import annotations
 
 from kvshrink.backend import KVStoreBackend, group_label
-from kvshrink.kvshrink_connector import CacheKey, LookupStatus
+from kvshrink.kvshrink_connector import CacheKey
 
 
 def _key(group_idx=0):
@@ -53,22 +53,22 @@ ALL = [group_label("ns", 0, 0), group_label("ns", 0, 1)]
 
 
 def test_all_ranks_present_hit():
-    assert _backend(ALL).lookup_boundary(_key()) is LookupStatus.HIT
+    assert _backend(ALL).lookup_boundary(_key()) is True
 
 
 def test_other_rank_missing_is_miss():
     b = _backend([group_label("ns", 0, 0)])
-    assert b.lookup_boundary(_key()) is LookupStatus.MISS
+    assert b.lookup_boundary(_key()) is False
 
 
 def test_own_rank_missing_is_miss():
     b = _backend([group_label("ns", 0, 1)])
-    assert b.lookup_boundary(_key()) is LookupStatus.MISS
+    assert b.lookup_boundary(_key()) is False
 
 
 def test_single_rank_skips_cross_rank_check():
     b = _backend([group_label("ns", 0, 0)], tp_size=1)
-    assert b.lookup_boundary(_key()) is LookupStatus.HIT
+    assert b.lookup_boundary(_key()) is True
     assert b._store.asked == [group_label("ns", 0, 0)]
 
 
@@ -76,7 +76,7 @@ def test_backend_error_fails_closed_to_miss():
     """A wrong hit silently corrupts output; a wrong miss costs one
     recompute. Errors resolve to the cheap mistake."""
     b = _backend(ALL, blow_up=True)
-    assert b.lookup_boundary(_key()) is LookupStatus.MISS
+    assert b.lookup_boundary(_key()) is False
 
 
 def test_groups_do_not_alias_each_other():
@@ -84,5 +84,5 @@ def test_groups_do_not_alias_each_other():
     part of the namespace or one group's data would answer for another.
     """
     b = _backend([group_label("ns", 0, 0), group_label("ns", 0, 1)])
-    assert b.lookup_boundary(_key(group_idx=0)) is LookupStatus.HIT
-    assert b.lookup_boundary(_key(group_idx=1)) is LookupStatus.MISS
+    assert b.lookup_boundary(_key(group_idx=0)) is True
+    assert b.lookup_boundary(_key(group_idx=1)) is False
