@@ -1,37 +1,6 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-"""Store access for the connector: one layout, one path.
-
-Every model is a list of KV cache groups, and every group is a block
-space in ``iaxl.KVStore``. A pure-attention model has one group; a
-GDN/Mamba model has two. Nothing here branches on the model kind.
-
-How a group maps onto the store
--------------------------------
-The store keys data as ``(label, chunk_id, tensor_key)``:
-
-- ``tensor_key`` is the layer name, so layers never collide and a
-  caller can wait for one layer while the others stream.
-- ``chunk_id`` is the block's content hash.
-- ``label`` is the namespace, and it is where everything the store does
-  not otherwise know about must go. It carries the model namespace, the
-  KV cache group and the TP rank: the store's own ``rank`` argument
-  drives its management port and logs, NOT its keys, so two ranks
-  sharing a label would overwrite each other's shards. Two groups
-  sharing a label would be worse -- the same prefix hash exists in both
-  groups, and the durability record is keyed by ``(label, chunk_id)``
-  without the layer, so they would be tracked as one unit despite having
-  different lifetimes.
-
-Why the whole group goes in one call
-------------------------------------
-The engine requires every tensor in a call to share shape and dtype, and
-a recurrent layer is two tensors of different shape (conv state, ssm
-state) over one storage. Passing canonical int8 page views satisfies
-that, and it also makes the call atomic: a block is finalized once, with
-all of its layers, so presence IS the commit. There is no second phase
-to publish and therefore nothing that can dangle.
-"""
+"""Store access for the connector: one layout, one path."""
 
 from __future__ import annotations
 
@@ -42,27 +11,15 @@ logger = logging.getLogger("vllm." + __name__)
 
 
 def group_label(namespace: str, group_idx: int, rank: int) -> str:
-    """Store namespace for one group's block space on one rank.
-
-    Underscore-separated because the store validates label components
-    and rejects its own separator; see the module docstring for why all
-    three parts must be present.
-    """
+    """Store namespace for one group's block space on one rank."""
     return f"{namespace}_g{int(group_idx)}_r{int(rank)}"
 
 
 class KVStoreBackend:
-    """Group-oriented facade over ``iaxl.KVStore``.
-
-    Thin by construction: it owns the label scheme and nothing else, so
-    the scheduler and worker never build store keys themselves and the
-    store never learns what a KV cache group is.
-    """
+    """Group-oriented facade over ``iaxl.KVStore``."""
 
     def __init__(self, kvstore: Any = None) -> None:
         # May be None at construction: on the worker the store cannot
-        # exist until vLLM hands over kv_caches, which happens long
-        # after the connector is built. bind_store closes that gap.
         self._store = kvstore
         self._namespace = ""
         self._tp_size = 1
@@ -109,10 +66,6 @@ class KVStoreBackend:
         return [str(label) for label in chunk_labels]
 
     # -- transfers ---------------------------------------------------
-    # A layer contributes one page view, or two when its K and V are
-    # separate tensors. The engine takes one flat tensor dict, but the
-    # caller waits a LAYER at a time (vLLM's hook fires per layer), so
-    # tasks are handed back regrouped under the layer name.
     @staticmethod
     def _flatten(layer_views) -> Dict[str, Any]:
         return {f"{ln}::{part}": view
@@ -144,11 +97,6 @@ class KVStoreBackend:
         whether they have without consuming them -- the poll used to
         decide if an async request may be released, which must not stall
         the step doing the asking.
-
-        Blocking and polling report failure differently on purpose. A
-        blocking call is made when forward is about to read these
-        blocks, so an incomplete transfer is fatal. A poll is a question
-        and "not yet" is a legitimate answer.
         """
         if not layer_tasks:
             return True
@@ -184,17 +132,7 @@ class KVStoreBackend:
 
     # -- presence ----------------------------------------------------
     def lookup_boundary(self, key):
-        """Is this boundary readable, on every rank?
-
-        Under TP each rank writes its own shard with no cross-rank
-        transaction, so a boundary present here but missing on a peer
-        must be a MISS: half a restore is worse than none. The peer that
-        is missing heals on the request's own re-save, because writing a
-        block again is idempotent.
-
-        Any error is a MISS. A wrong hit silently corrupts output; a
-        wrong miss costs one recompute.
-        """
+        """Is this boundary readable, on every rank?"""
         from .layout import LookupStatus
 
         chunk_id = str(key.hash_str)

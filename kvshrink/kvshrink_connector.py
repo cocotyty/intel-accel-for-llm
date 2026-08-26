@@ -39,13 +39,7 @@ ReqId = str
 
 
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
-    """Scheduler -> worker transfer plan.
-
-    ``requests`` are LOAD plans (executed before forward),
-    ``save_requests`` are SAVE plans (executed after forward). Both are
-    lists of ``layout.ReqMeta``; the worker only ever sees this
-    object, so each plan is fully self-describing.
-    """
+    """Scheduler -> worker transfer plan."""
 
     def __init__(self):
         super().__init__()
@@ -62,17 +56,7 @@ def _save_enabled() -> bool:
 
 
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
-    """KVShrink external KV cache connector.
-
-    ONE path for every model. vLLM already describes a model as a list
-    of KV cache groups, so a pure-attention model is the one-group case
-    and a GDN/Mamba model is the two-group case; the scheduler and
-    worker are written against groups and need no knowledge of which
-    they are serving.
-
-    A recurrent group changes nothing about how bytes are stored: every
-    group is a block space in one store, told apart by its namespace.
-    """
+    """KVShrink external KV cache connector."""
 
     @classmethod
     def requires_piecewise_for_cudagraph(
@@ -110,18 +94,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         # One stack for every model. vLLM already describes any model as
-        # a list of KV cache groups, so a pure-attention model is simply
-        # the one-group case; the only thing a GDN/Mamba model changes is
-        # WHICH store layout is underneath, and that is an adapter
-        # choice, not a second code path.
         self._sched = None
         self._worker = None
         self._backend = None
         self._canon = None
         self._groups: list = []
         # Authoritative TP rank, set by _init_kv_stack. Distinct from
-        # self.rank, which is read from the world group before
-        # distributed init has run and is therefore 0 on every worker.
         self._rank: Optional[int] = None
         self.kvstore: Optional[KVStore] = None
 
@@ -133,8 +111,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_intel_accel()
 
     ############################################################
-    # Construction
-    ############################################################
 
     def _init_kv_stack(
         self,
@@ -142,13 +118,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        """Build the hybrid stack for this role.
-
-        Scheduler role gets the hit policy + plan builder over a
-        READ-ONLY backend (presence checks only, no writer lease, no GPU
-        pool). Worker role gets the canonical page views + the transfer
-        engine over a WRITER backend holding this rank's single-writer
-        """
+        """Build the hybrid stack for this role."""
         from .backend import KVStoreBackend
         from .layout import Canonicalizer
         from .layout import (compute_namespace, parse_kv_cache_config,
@@ -161,9 +131,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         tp_size = int(getattr(pc, "tensor_parallel_size", 1) or 1)
         if role == KVConnectorRole.WORKER:
             # parallel_config.rank, NOT get_world_group(): the connector
-            # is constructed before distributed init in the worker
-            # processes, so the world group would report rank 0 on every
-            # TP rank and the ranks would overwrite each other's shards.
             rank = int(getattr(pc, "rank", 0) or 0)
         else:
             # Scheduler-side keys are always rank 0; each worker verifies
@@ -174,8 +141,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         model_config = vllm_config.model_config
 
         # Block-hash granularity, per v0.23.0's resolve_kv_cache_block_sizes:
-        # the GCD of the groups' block sizes (every group's block size is
-        # divisible by it). Single group -> that group's block size.
         block_sizes = sorted({int(g.kv_cache_spec.block_size)
                               for g in kv_cache_config.kv_cache_groups})
         hash_block_size = math.gcd(*block_sizes)
@@ -190,20 +155,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             pp_size=1,
         )
         # Fail-closed: a lossy codec would corrupt GDN state (see the
-        # function for why this path cannot tolerate what the
-        # attention-only path is designed to).
         validate_codec_env()
 
         groups, layer_infos, num_blocks = parse_kv_cache_config(
             kv_cache_config, hash_block_size=hash_block_size)
 
         # Fail-closed: speculative decoding widens the GDN state gather.
-        # v0.23.0's mamba_get_block_table_tensor returns
-        # block_table[start : start + 1 + num_speculative_blocks] and the
-        # decode path reads all of those columns, but an external
-        # snapshot only ever restores column 0 (the block holding this
-        # step's last scheduled token). Serving a hit would let the
-        # kernel read unrestored speculative slots.
         for g in kv_cache_config.kv_cache_groups:
             spec_blocks = int(
                 getattr(g.kv_cache_spec, "num_speculative_blocks", 0) or 0)
@@ -257,18 +214,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     @staticmethod
     def _block_hash_source(recurrent: bool) -> str:
-        """Which block-identity scheme to key the cache with.
-
-        Defaults preserve what each layout already wrote, because
-        switching schemes does not migrate data -- it renames it, and
-        every existing entry becomes unreachable until it is written
-        again. The block layout keeps its own token-derived hashes; the
-        boundary layout keeps vLLM's, which is what it shipped with.
-
-        ``KVSHRINK_BLOCK_HASH_SOURCE=vllm|legacy`` overrides, for
-        operators willing to trade one cold warm-up for a single scheme
-        across both layouts.
-        """
+        """Which block-identity scheme to key the cache with."""
         choice = (os.getenv("KVSHRINK_BLOCK_HASH_SOURCE") or "auto").lower()
         if choice == "auto":
             return "vllm" if recurrent else "legacy"
@@ -335,8 +281,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.kvstore
 
     ############################################################
-    # Scheduler Side Methods
-    ############################################################
 
     def get_num_new_matched_tokens(
         self,
@@ -360,12 +304,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         # Saves are SYNCHRONOUS (wait_for_save writes every page
-        # inside the step), so no in-flight job
-        # can still reference these blocks and vLLM may free them
-        # immediately. Returning True would promise a get_finished()
-        # ack that never comes -- a deterministic block leak.
-        # Committed boundaries are content-addressed and outlive the
-        # request; they are never deleted here.
         self._sched.on_request_finished(request.request_id)
         return False, None
     def request_finished_all_groups(
@@ -376,11 +314,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """SupportsHMA entry point (v0.23.0 calls this instead of
         ``request_finished`` whenever the hybrid memory allocator is on,
         which is the default for every model).
-
-        Both paths keep their own contract: hybrid frees immediately,
-        pure attention keeps deferring to get_finished(). The pure path
-        only ever has one KV cache group, so its single block list is
-        forwarded unchanged.
         """
         return self.request_finished(request, [])
     def build_connector_meta(
@@ -391,12 +324,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def _build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        """Assemble this pass's hybrid plans.
-
-        Order matters: for cached (running) requests the block-table
-        sync (``on_cached_request``) MUST run before ``build_save_meta``,
-        so the save plan already sees blocks allocated in the SAME pass.
-        """
+        """Assemble this pass's hybrid plans."""
         meta = KVShrinkConnectorMetadata()
         sched = self._sched
         debug = bool(os.getenv("KVSHRINK_DEBUG_LOG"))
@@ -427,11 +355,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     meta.save_requests.append(save_meta)
 
         # ASYNC requests ride NEITHER list: vLLM parks them in
-        # WAITING_FOR_REMOTE_KVS, so they are absent from
-        # scheduled_new_reqs and from scheduled_cached_reqs alike. Their
-        # plan comes from what update_state_after_alloc recorded, and
-        # without it the worker would have nothing to transfer and the
-        # request would wait forever to be released.
         for req_meta in sched.take_async_load_plans(
                 {r.req_id for r in meta.requests}):
             if debug:
@@ -442,10 +365,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             meta.requests.append(req_meta)
 
         # PREEMPTION-RESUMED requests ride scheduled_cached_reqs.
-        # resumed_req_ids, NOT scheduled_new_reqs. Their external-hit
-        # tokens were accepted this same pass, so without a load plan
-        # here the worker would never restore the pages while the core
-        # already skips recompute -- silent garbage output.
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in (getattr(cr, "resumed_req_ids", None) or ()):
             req_meta = sched.build_resumed_load_meta(
@@ -460,8 +379,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 meta.requests.append(req_meta)
 
         # Running requests cross boundaries in later steps too (chunked
-        # prefill tails, decode-time crossings): sync their tables first,
-        # then emit incremental saves.
         if save_enabled:
             resumed = getattr(cr, "resumed_req_ids", None) or set()
             new_bids = getattr(cr, "new_block_ids", None) or []
@@ -493,24 +410,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return stats
 
     ############################################################
-    # Hybrid path: worker side
-    ############################################################
 
     def _register_layer_caches(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> None:
-        """Bind canonical page views, in model execution order.
-
-        The order matters to the async release gate, which holds a
-        request until its FIRST N layers have landed -- a statement
-        about position, not about names. The ``kv_caches`` dict does not
-        carry it: v0.23.0 builds it group by group
-        (``_kv_cache_spec_attn_group_iterator``), so mamba and attention
-        layers arrive in separate runs. We recover the order the way
-        vLLM's own ``bind_kv_cache`` does, from the layer index in the
-        layer name, and fail closed if the names do not yield a unique
-        order rather than gate on an arbitrary prefix.
-        """
+        """Bind canonical page views, in model execution order."""
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
         from vllm.model_executor.models.utils import extract_layer_index
@@ -552,8 +456,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return metadata
 
     ############################################################
-    # Worker Side Methods
-    ############################################################
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not kv_caches:
@@ -572,13 +474,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         if self._backend is not None:
             # The store is handed the canonical page views, not the raw
-            # tensors: every view is a (num_blocks, page_bytes) int8
-            # array whose dim-0 rows are blocks, which is the shape the
-            # transfer path uses for both attention and GDN. Raw tensors
-            # would not do -- a GDN layer is two tensors of different
-            # shape and dtype, and the engine requires one shape per
-            # call. Views are keyed per part because a split-K/V
-            # attention layer contributes two.
             views = {
                 f"{ln}::{part}": view
                 for ln in self._layer_names
@@ -589,10 +484,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 block_dim=0,
                 kv_caches=views,
                 # _rank, not self.rank: the latter comes from the world
-                # group, which reports 0 on every TP rank because the
-                # connector is built before distributed init. Two ranks
-                # claiming rank 0 collide on the management port and
-                # would overwrite each other's shards.
                 rank=self._rank if self._rank is not None else self.rank,
                 tp_size=self.tp_size,
             )
@@ -624,8 +515,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if self._connector_metadata is None:
             return
         # Pipelined attention save: submit this layer's D2H+zip now
-        # so it overlaps the remaining layers' compute. GDN groups
-        # never reach this hook; they save in wait_for_save.
         self._worker.save_kv_layer(layer_name, self._metadata())
         return
     def wait_for_save(self) -> None:
@@ -634,8 +523,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         hw = self._worker
         # A sticky load poison and any un-waited load must surface here,
-        # before anything is persisted: entering the save path after the
-        # forward read unrestored state would commit wrong data.
         hw.raise_load_poison()
         hw.loads_drained_check()
         if not hw.save_enabled():
@@ -660,19 +547,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """Report transfers that completed since the last step.
-
-        Worker-side only; the scheduler role has nothing in flight.
-        """
+        """Report transfers that completed since the last step."""
         if self._worker is None:
             return None, None
         # A sticky poison surfaces at every hook entry and is never
-        # swallowed by the finish protocol; raising here also stops a
-        # poisoned request from being reported as successfully loaded
-        # (vLLM aborts it instead, so it cannot hang).
         self._worker.raise_load_poison()
         # Saves complete within the step, so nothing is ever reported as
-        # finished-sending. Loads may not: an async request stays parked
-        # until we name it here.
         recving = self._worker.poll_finished_loads()
         return None, (recving or None)
