@@ -146,7 +146,7 @@ def test_mamba_lookup_starts_left_of_boundary():
     """Mamba right-to-left scan must start at the hash AT the aligned
     boundary (aligned//gran - 1), never at the block AFTER the candidate.
 
-    Regression for super-master gate (devlog §5.10): with a longer hash
+    with a longer hash
     chain and another group shrinking the candidate, probing from
     aligned//gran could hit a snapshot to the RIGHT of the candidate and
     report a false boundary.
@@ -232,7 +232,7 @@ def test_multiple_attention_groups_all_validated():
     """Two attention groups, g1's manifest lacks hash2: the hit must
     shrink to 64 even though g0 has all four hashes. Pre-fix only the
     first attention group was looked up and later ones were blindly
-    trimmed (super-master gate, devlog §5.21)."""
+    trimmed."""
     groups = [_group(0, "attention", 32), _group(1, "attention", 32)]
     b, hashes = _group_aware(
         {(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)}, 4)

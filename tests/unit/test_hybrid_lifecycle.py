@@ -221,7 +221,7 @@ def test_abort_keeps_committed_boundary_hittable():
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():
-    """Fail-closed (super-master gate §6.10): resumed=True with missing
+    """Fail-closed: resumed=True with missing
     num_computed rolls ALL group cursors to 0 (safe N=0), never skips."""
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
@@ -265,7 +265,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
 
 
 # ------------------------------------------------------------------
-# 9: preemption-resume LOAD metadata (M7 TP2-P1 regression)
+# 9: preemption-resume LOAD metadata
 # ------------------------------------------------------------------
 # vLLM v1 carries preempted->rescheduled requests in
 # scheduled_cached_reqs.resumed_req_ids, NOT scheduled_new_reqs. The

@@ -43,7 +43,7 @@ vLLM defaults prefix caching **off** for hybrid models
 `none`. In that state a request holds one `max_model_len` block, chunks
 stop at arbitrary positions, and no snapshot could ever be keyed to a
 reproducible prefix length. The connector therefore **refuses to start**
-unless the mode is `align` (`hybrid_config.py`), naming the flags that
+unless the mode is `align` (`layout.py`), naming the flags that
 fix it. Serving must use:
 
 ```
@@ -75,7 +75,7 @@ fix it. Serving must use:
 | **block hash** | Content hash of a block, computed by vLLM's own `hash_block_tokens`. In v0.23 it is **sha256 bytes**, not an int. Storage is content addressed, which is what makes the cache shared across requests. |
 | **namespace** | Top-level isolation derived from the model/topology, so different models or TP layouts never collide. Below it: `tp_size / rank / group / boundary hash`. |
 | **chunk** | The storage layer's transfer unit. Each page is split into chunks that are compressed, named and persisted independently. |
-| **manifest** | The atomic commit point for a group of chunks. Chunks are staged first; the manifest is written last. **Before the manifest lands, the group is invisible**, so a crash mid-write cannot produce a false hit. |
+| **label** | A group's namespace inside the store, `{namespace}_g{group}_r{rank}`. A group's whole layer set is written in one call under its label, so the block is finalized by that write: there is no second step that could publish a boundary before its data. |
 | **snapshot boundary** | The token count a request restored to. Locked at lookup time and never recomputed afterwards, because by then the progress counters have already moved. |
 | **save cursor** (`next_stored_chunk_idx`) | Per group: what has already been emitted. Rolls **back** on resume, because saves issued before preemption may never have been persisted; re-emitting is an idempotent overwrite. |
 | **fail-closed** | The first principle. A false hit corrupts output silently; a false miss costs one recompute. Every uncertain case resolves to MISS, refuse, or raise. |
@@ -100,15 +100,11 @@ workers, so the work order must be self-contained.
 
 | File | Role |
 |---|---|
-| `kvshrink_connector.py` | The vLLM interface. Dispatches to the hybrid stack when `kv_cache_config.has_mamba_layers`, otherwise runs the original attention-only code unchanged. |
-| `hybrid_scheduler.py` | Scheduler-side per-request state machine: hit registration, block-table mirror, save cursor, plan construction. |
-| `hybrid_policy.py` | Hit decision: contiguous prefix, all groups agreeing, boundary alignment. Anything unclear is a MISS. |
-| `hybrid_canonical.py` | Canonical page views over the raw KV tensors, including split K/V layouts. |
-| `hybrid_config.py` | Parses vLLM's `KVCacheConfig` into groups/layers. Every anomaly raises. |
-| `hybrid_metadata.py` | Keys and work-order structures. Pure data, picklable. |
-| `hybrid_worker.py` | Worker-side execution: piggybacked loads, pipelined saves, poison and fail-stop. |
-| `hybrid_backend.py` | Storage adapter: key translation, role-specific construction, cross-rank verification. Any exception becomes a MISS. |
-| `hybrid_metrics*.py` | Metric definitions and the standalone exporter. |
+| `kvshrink_connector.py` | The vLLM interface. A model is a list of KV cache groups, so a pure-attention model is the one-group case and a GDN model the multi-group case; the layers below are written against groups. |
+| `scheduler.py` | Scheduler-side per-request state machine: hit registration, block-table mirror, save cursor, plan construction, and the hit policy. |
+| `worker.py` | Worker-side execution: load submission, pipelined attention saves, poison and fail-stop. |
+| `layout.py` | vLLM's `KVCacheConfig` parsed into groups and layers, the keys and work orders built from it, and the canonical page views. Every anomaly raises. |
+| `backend.py` | The store adapter: one label per (group, rank), and cross-rank verification. Any exception becomes a MISS. |
 
 ---
 
@@ -153,7 +149,7 @@ attention, boundary granularity 544 tokens**.
 ```mermaid
 sequenceDiagram
     participant Core as vLLM scheduler
-    participant Sched as hybrid_scheduler.py
+    participant Sched as scheduler.py
     participant W as worker process
     participant Store as external store<br/>(host memory + disk)
 
@@ -169,7 +165,7 @@ sequenceDiagram
     Core->>W: work order (pickled)
     W->>W: forward, computing all 1200 tokens
     W->>Store: save: pages compressed and staged
-    Note over W,Store: manifest written last;<br/>only now are these pages visible to lookups
+    Note over W,Store: the write itself is the commit;<br/>the block is visible once it lands
 ```
 
 A miss is not a failure: its whole purpose is to leave a snapshot behind
@@ -183,7 +179,7 @@ boundary).
 ```mermaid
 sequenceDiagram
     participant Core as vLLM scheduler
-    participant Sched as hybrid_scheduler.py
+    participant Sched as scheduler.py
     participant W as worker process
     participant Store as external store
 
@@ -237,7 +233,7 @@ sequenceDiagram
     participant Core as vLLM core (scheduler process)
     participant Mix as KVConnectorModelRunnerMixin (worker side)
     participant Con as kvshrink_connector.py (worker role)
-    participant Wk as hybrid_worker.py
+    participant Wk as worker.py
     participant Eng as IAXL engine (transfer stream + pinned pool)
     participant GPU as forward
 
@@ -265,8 +261,7 @@ sequenceDiagram
     Mix->>Con: 6. wait_for_save() - right after forward
     Con->>Wk: submit GDN group saves
     Note over Wk: GDN state is only final AFTER forward,<br/>so it cannot be pipelined like attention
-    Wk->>Eng: wait all, collect checksums
-    Wk->>Eng: atomic manifest per boundary
+    Wk->>Eng: wait for every write to land
     Wk->>Eng: drain persist, then evict over watermark
     Mix->>Con: 7. get_finished()
     Mix->>Con: 8. clear_connector_metadata()
@@ -306,7 +301,7 @@ flowchart TD
     P --> M{GDN group:<br/>does progress land exactly<br/>on a boundary?}
     M -- yes --> N[emit the whole state block<br/>key = that boundary's hash]
     M -- no --> O[emit nothing:<br/>a partial segment is not<br/>a valid restore point]
-    R --> X[worker after forward:<br/>read, compress, stage chunks,<br/>then atomically write the manifest]
+    R --> X[worker after forward:<br/>read, compress and write<br/>every page of the group]
     N --> X
 ```
 
@@ -344,17 +339,17 @@ a deterministic block leak.
 ```mermaid
 flowchart LR
     subgraph SP[scheduler process]
-        POL[hybrid_policy<br/>hit decision]
-        SCH[hybrid_scheduler<br/>state machine]
-        BE1[hybrid_backend<br/>read-only: existence]
+        POL[scheduler<br/>hit policy]
+        SCH[scheduler<br/>state machine]
+        BE1[backend<br/>read-only: existence]
     end
     subgraph WP["worker process (per rank)"]
-        WK[hybrid_worker<br/>load / save execution]
-        BE2[hybrid_backend<br/>full engine: stream + codec]
+        WK[worker<br/>load / save execution]
+        BE2[backend<br/>full engine: stream + codec]
     end
     subgraph ST[external store]
         MEM[host memory tier]
-        DSK[(disk: chunks + manifests)]
+        DSK[(disk: chunks)]
         DB[(record: chunk existence)]
     end
     POL --> SCH
@@ -368,7 +363,7 @@ flowchart LR
 ```
 
 The scheduler side only answers *whether* and *how much*; the worker
-side only executes. Visibility is gated solely by the manifest plus the
+side only executes. Visibility is gated solely by the write plus the
 record, which is how "recompute rather than corrupt" is actually
 implemented: **nothing half-written is ever visible to a lookup**.
 
@@ -380,7 +375,7 @@ implemented: **nothing half-written is ever visible to a lookup**.
 |---|---|---|
 | `mamba_cache_mode != "align"` | refuse to start | no addressable boundary exists; the cache would silently store nothing |
 | `num_speculative_blocks > 0` | refuse to start | the kernel reads more columns than a snapshot restores |
-| layer index duplicated or unparsable | refuse to start | execution order would be guessed, and the piggyback mapping depends on it |
+| layer index duplicated or unparsable | refuse to start | execution order would be guessed, and the async release gate depends on it |
 | unknown spec, mismatched block sizes, unknown dtype | refuse to start | the page layout would be guessed |
 | boundary missing on any TP rank | MISS | ranks commit independently; a partial commit heals when the request recomputes and re-saves |
 | any exception during lookup | MISS | an unreadable store must never look like a hit |
