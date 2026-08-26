@@ -131,14 +131,13 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    request: Any = None
     # The live vLLM Request, when we were handed one. Held so the save
     # path can read AUTHORITATIVE block hashes as they grow: vLLM
     # appends to Request.block_hashes every time decode completes a
     # block, and recomputing them here instead would have to reproduce
     # vLLM's hashing byte for byte forever. Dropped in
     # on_request_finished together with the rest of the state.
-    request_obj: Any = None
+    request: Any = None
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     snapshot_boundary: int = 0

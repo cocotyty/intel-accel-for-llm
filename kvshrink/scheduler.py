@@ -276,15 +276,14 @@ class HybridRequestScheduler:
     # ------------------------------------------------------------------
     def on_new_request(
         self, req_id: str, block_hashes: list[int],
-        num_computed_tokens: int, request_obj=None,
+        num_computed_tokens: int, request=None,
     ) -> None:
         """Register a fresh ReqState. Internal: called by us from
         get_num_new_matched_tokens / build_load_meta /
         update_state_after_alloc when a request first becomes visible
         (vLLM has no dedicated "new request" connector hook)."""
         self._req_states[req_id] = ReqState(
-            request=req_id,
-            request_obj=request_obj,
+            request=request,
             block_hashes=list(block_hashes),
             num_computed_tokens=num_computed_tokens,
             groups=tuple(
@@ -370,9 +369,9 @@ class HybridRequestScheduler:
         vLLM -- so it is treated as "nothing new" rather than as a
         reason to drop hashes the save cursor may already have passed.
         """
-        if state.request_obj is None:
+        if state.request is None:
             return
-        live = self._request_block_hashes(state.request_obj)
+        live = self._request_block_hashes(state.request)
         if not live or len(live) <= len(state.block_hashes):
             return
         state.block_hashes.extend(live[len(state.block_hashes):])
@@ -467,7 +466,7 @@ class HybridRequestScheduler:
             return 0, False
         self.on_new_request(
             request.request_id, self._request_block_hashes(request),
-            num_computed_tokens, request_obj=request)
+            num_computed_tokens, request=request)
         policy = HybridHitPolicy(
             self._groups, self._backend, self._hash_block_size,
             num_computed_tokens, self._namespace, self._tp_size, self._rank)
@@ -593,7 +592,7 @@ class HybridRequestScheduler:
         if state is None:
             self.on_new_request(
                 req_id, self._request_block_hashes(request), 0,
-                request_obj=request)
+                request=request)
             state = self._req_states[req_id]
         state.num_computed_tokens = (
             state.num_computed_tokens + num_external_tokens)
