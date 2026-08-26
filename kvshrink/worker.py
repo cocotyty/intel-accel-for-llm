@@ -54,7 +54,6 @@ from dataclasses import replace
 from typing import Optional
 
 from .kvshrink_connector import CacheKey
-from .kvshrink_connector import LookupStatus
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
 # logger (handler+level); an unconfigured logger would drop INFO
@@ -411,8 +410,7 @@ class HybridWorker:
             # The scheduler's HIT and this submit are not atomic.
             first = self._worker_key(op.keys[0])
             boundary_key = replace(first, layer_name="")
-            if self._backend.lookup_boundary(
-                    boundary_key) != LookupStatus.HIT:
+            if not self._backend.lookup_boundary(boundary_key):
                 err = RuntimeError(
                     "kvshrink mamba load: boundary vanished after HIT "
                     f"req={req_id} boundary="

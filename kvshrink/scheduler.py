@@ -26,8 +26,8 @@ from typing import Optional
 
 from iaxl import generate_block_hashs
 
-from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta, LookupResult,
-                     LookupStatus, ReqMeta, ReqGroupState, ReqState,
+from .kvshrink_connector import (CacheKey, GroupInfo, GroupTransferMeta,
+                     ReqMeta, ReqGroupState, ReqState,
                      align_down, make_boundary_key)
 
 # ======================================================================
@@ -470,34 +470,21 @@ class HybridRequestScheduler:
         policy = HybridHitPolicy(
             self._groups, self._backend, self._hash_block_size,
             num_computed_tokens, self._namespace, self._tp_size, self._rank)
-        result, trace = policy.find_longest_cache_hit(
+        # Restorable boundary in tokens; 0 = miss. The policy already
+        # gated on live chunk presence (engine Record), so a nonzero
+        # boundary is complete by construction; only record it.
+        boundary = policy.find_longest_cache_hit(
             self._request_block_hashes(request), request.num_tokens)
-        if result.status == LookupStatus.HIT:
-            # The policy HIT already gated on live chunk presence
-            # (engine Record), so the boundary is complete by
-            # construction; only record the snapshot point.
-            state = self._req_states.get(request.request_id)
-            if state is not None:
-                if state.block_hashes:
-                    state.snapshot_boundary = result.boundary_tokens
-                else:
-                    result = LookupResult(LookupStatus.MISS, 0)
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info(
-                "policy result req=%s status=%s boundary=%d hashes=%d "
-                "trace=%s",
-                request.request_id, result.status.value,
-                result.boundary_tokens, len(request.block_hashes), trace)
-        # Metrics recorded on the FINAL completeness result (not the
-        # raw policy trace).
-        external = result.boundary_tokens - num_computed_tokens
-        if external < 0:
-            external = 0
+        state = self._req_states.get(request.request_id)
+        if boundary and state is not None and state.block_hashes:
+            state.snapshot_boundary = boundary
+        else:
+            boundary = 0
+        external = max(0, boundary - num_computed_tokens)
         use_async = self._decide_async(request.request_id, external)
         logger.debug(
-            "req=%s external_hit=%d boundary=%d async=%s trace=%s",
-            request.request_id, external, result.boundary_tokens,
-            use_async, trace)
+            "req=%s external_hit=%d boundary=%d async=%s",
+            request.request_id, external, boundary, use_async)
         return external, use_async
 
     # ------------------------------------------------------------------
@@ -725,8 +712,7 @@ class HybridRequestScheduler:
                         break
                     blk_hash = state.block_hashes[i]
                     key = self._boundary_key(group, blk_hash)
-                    if self._backend.lookup_boundary(
-                            key) != LookupStatus.HIT:
+                    if not self._backend.lookup_boundary(key):
                         break
                     # v0.21 hashes are per complete block: hash i == block i
                     if i < len(ids):
@@ -756,8 +742,7 @@ class HybridRequestScheduler:
                     if 0 <= idx < len(state.block_hashes):
                         blk_hash = state.block_hashes[idx]
                         key = self._boundary_key(group, blk_hash)
-                        if self._backend.lookup_boundary(
-                                key) == LookupStatus.HIT:
+                        if self._backend.lookup_boundary(key):
                             bs = group.block_size
                             # CURR running-state index for this step
                             # (upstream align-mode formula):
@@ -1022,7 +1007,7 @@ class _StoreAsBlockPool:
         for group_id in kv_cache_group_ids:
             key = make_boundary_key(self._namespace, self._tp_size,
                                     self._rank, group_id, block_hash)
-            if self._backend.lookup_boundary(key) != LookupStatus.HIT:
+            if not self._backend.lookup_boundary(key):
                 return None
             blocks.append(_StoreAsBlockPool.null_block)
         return blocks
@@ -1110,43 +1095,29 @@ class HybridHitPolicy:
     # ------------------------------------------------------------------
     def find_longest_cache_hit(
         self, block_hashes: list[int], max_length: int
-    ) -> tuple[LookupResult, dict]:
-        """Fixed-point convergence over all groups.
+    ) -> int:
+        """Fixed-point convergence over all groups. Returns the
+        restorable boundary in tokens; 0 = miss.
 
-        Returns (LookupResult, trace) where trace records per-group
-        decisions for logging / differential testing.
+        Every group is looked up on its own: a hit on group A says
+        nothing about group B, whose blocks live under a different
+        label and may never have been written.
         """
         candidate = max_length
         if self._mamba_align is not None:
             # the last prompt token is always recomputed (logprobs + state)
             candidate = min(candidate - 1,
                             align_down(candidate - 1, self._mamba_align))
-        trace = {"iterations": [], "final": candidate}
 
         while True:
             changed = False
-            iteration = {}
             for group in self._ordered:
-                kind = group.kind
-                # Every group is looked up on its own: a hit on group
-                # A says nothing about group B, whose blocks live under
-                # a different label and may never have been written.
                 hit = self._lookup(group, block_hashes, candidate)
-                iteration[group.group_idx] = {"kind": kind, "hit": hit}
                 if hit < candidate:
                     candidate = hit
                     changed = True
                 if candidate <= self._num_computed:
-                    trace["iterations"].append(iteration)
-                    trace["final"] = 0
-                    return (LookupResult(LookupStatus.MISS, 0), trace)
-            trace["iterations"].append(iteration)
+                    return 0
             if not changed:
                 break
-
-        external = candidate - self._num_computed
-        trace["final"] = candidate
-        trace["external"] = external
-        if external <= 0:
-            return (LookupResult(LookupStatus.MISS, 0), trace)
-        return (LookupResult(LookupStatus.HIT, candidate), trace)
+        return candidate if candidate > self._num_computed else 0
