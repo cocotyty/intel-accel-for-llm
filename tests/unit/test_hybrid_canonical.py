@@ -18,11 +18,9 @@ SSM_BYTES = 16 * 128 * 128 * 4  # fp32
 def _info(layer_name, spec_kind, group_idx):
     from kvshrink.kvshrink_connector import LayerPageInfo
     return LayerPageInfo(
-        layer_name=layer_name, group_idx=group_idx, spec_kind=spec_kind,
         num_blocks=NUM_BLOCKS,
-        page_size_bytes=PAGE, unpadded_page_size_bytes=PAGE,
+        page_size_bytes=PAGE,
         block_stride_bytes=PAGE, storage_offset_bytes=0,
-        dtype="torch.int8",
     )
 
 

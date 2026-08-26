@@ -36,8 +36,7 @@ GDN = ["m0", "m2"]
 def _group(g_idx, kind, layers):
     return GroupInfo(
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
-        block_size=16, page_size_bytes=PAGE,
-        mamba_cache_mode="align" if kind == "mamba" else None,
+        block_size=16,
         mamba_align_size=16 if kind == "mamba" else None,
         spec=make_spec(kind, 16))
 
@@ -81,7 +80,7 @@ class _FakeCanon:
 
 def _worker(backend):
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in ORDER}, 64, backend,
+    w = HybridWorker(groups, {ln: None for ln in ORDER}, backend,
                      _FakeCanon(), rank=0, tp_size=1)
     w.register({ln: None for ln in ORDER}, ORDER)
     return w

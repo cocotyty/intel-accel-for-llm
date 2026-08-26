@@ -31,8 +31,6 @@ _pick = KVShrinkConnector._block_hash_source
 def _group(kind):
     return GroupInfo(
         group_idx=0, kind=kind, layer_names=("l0",), block_size=16,
-        page_size_bytes=4096,
-        mamba_cache_mode="align" if kind == "mamba" else None,
         mamba_align_size=16 if kind == "mamba" else None,
         spec=make_spec(kind, 16))
 

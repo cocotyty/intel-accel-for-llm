@@ -34,8 +34,7 @@ PAGE = 4096
 def _group(g_idx, kind, layers, block_size=16):
     return GroupInfo(
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
-        block_size=block_size, page_size_bytes=PAGE,
-        mamba_cache_mode="align" if kind == "mamba" else None,
+        block_size=block_size,
         mamba_align_size=block_size if kind == "mamba" else None,
         spec=make_spec(kind, block_size))
 
@@ -86,7 +85,7 @@ def _worker(backend=None, order=ORDER, gdn=None):
               _group(1, "mamba", gdn if gdn is not None
                      else [ln for ln in order if ln in GDN])]
     layer_infos = {ln: None for ln in order}
-    w = HybridWorker(groups, layer_infos, 64, backend or _FakeBackend(),
+    w = HybridWorker(groups, layer_infos, backend or _FakeBackend(),
                      _FakeCanon(), rank=0, tp_size=1)
     w.register({ln: None for ln in order}, order)
     return w
@@ -124,7 +123,7 @@ def test_attention_execution_order_is_recorded():
 def test_model_without_attention_layers_fails_closed():
     """Nothing would ever wait for an attention page."""
     groups = [_group(0, "attention", []), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in GDN}, 64, _FakeBackend(),
+    w = HybridWorker(groups, {ln: None for ln in GDN}, _FakeBackend(),
                      _FakeCanon(), rank=0, tp_size=1)
     with pytest.raises(RuntimeError, match="no attention layers"):
         w.register({ln: None for ln in GDN}, GDN)

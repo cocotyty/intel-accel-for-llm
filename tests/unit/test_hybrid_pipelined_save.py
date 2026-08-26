@@ -21,9 +21,7 @@ from kvshrink.kvshrink_connector import (
 def _group(g_idx, kind, layers):
     return GroupInfo(group_idx=g_idx, kind=kind,
                      layer_names=tuple(layers), block_size=16,
-                     page_size_bytes=1024,
-                     mamba_cache_mode=None, mamba_align_size=None,
-                     spec=make_spec(kind, 16))
+                     mamba_align_size=None, spec=make_spec(kind, 16))
 
 
 def _key(layer_name, blk_hash=777, g_idx=0):
@@ -74,7 +72,7 @@ def _worker():
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"])]
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
-                     num_blocks=64, backend=_FakeBackend(),
+                     backend=_FakeBackend(),
                      canonicalizer=_FakeCanon(), rank=0, tp_size=1)
     w._kv_caches_ref = object()  # truthy: kv caches registered
     return w

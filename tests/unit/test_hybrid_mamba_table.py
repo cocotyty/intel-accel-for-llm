@@ -51,8 +51,7 @@ def _group(g_idx, kind, block_size, align=None):
     return GroupInfo(
         group_idx=g_idx, kind=kind,
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
-        block_size=block_size, page_size_bytes=1024,
-        mamba_cache_mode="align" if kind == "mamba" else None,
+        block_size=block_size,
         mamba_align_size=align, spec=make_spec(kind, block_size))
 
 

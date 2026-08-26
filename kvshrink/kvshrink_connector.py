@@ -442,15 +442,10 @@ class LayerPageInfo:
     for packed layouts, and may differ per layer for heterogeneous
     pages.
     """
-    layer_name: str
-    group_idx: int
-    spec_kind: str  # "attention" | "mamba" | "sliding_window" | "mla"
     num_blocks: int  # global block pool size for this layer's view
     page_size_bytes: int
-    unpadded_page_size_bytes: int
     block_stride_bytes: int
     storage_offset_bytes: int
-    dtype: str
 
 
 @dataclass(frozen=True)
@@ -473,8 +468,7 @@ class GroupInfo:
       (each group's block pool is allocated independently).
     - Behavior dispatch: ``kind`` selects the access pattern --
       attention pages are sliceable per ``block_size`` tokens, mamba
-      groups are stored/loaded whole at boundaries using
-      ``mamba_cache_mode`` / ``mamba_align_size``.
+      groups are stored/loaded whole at aligned boundaries.
     - Validation: the store fail-closed checks the group exists and
       page sizes match before any chunk move.
     """
@@ -483,8 +477,6 @@ class GroupInfo:
     kind: str  # "attention" | "mamba" | "sliding_window" | "mla"
     layer_names: tuple[str, ...]
     block_size: int  # tokens per block for this group
-    page_size_bytes: int
-    mamba_cache_mode: Optional[str]  # None for attention groups
     mamba_align_size: Optional[int]  # offload chunk alignment for mamba
     # vLLM's own spec for this group, kept so the hit policy can hand it
     # back to vLLM's matching code instead of reimplementing it.
@@ -714,9 +706,9 @@ def parse_kv_cache_config(
     - ``kv_cache_groups`` -> ``groups`` (list[GroupInfo]): vLLM splits a
       hybrid model's KV cache into groups of layers with the same storage
       spec (e.g. group 0 = full-attention layers, group 1 = GDN/mamba
-      layers). For each group we record its kind, layer names, block_size
-      (tokens per block) and page_size_bytes; mamba groups additionally
-      get mamba_cache_mode / mamba_align_size. Consumed by:
+      layers). For each group we record its kind, layer names and
+      block_size (tokens per block); mamba groups additionally get
+      mamba_align_size. Consumed by:
       the scheduler (per-group block_ids bookkeeping and save/load
       planning), boundary_backend (fail-closed group validation, storage
       labels embed group_idx), and policy (attention pages are sliceable
@@ -802,8 +794,6 @@ def parse_kv_cache_config(
                 kind=kind,
                 layer_names=tuple(g.layer_names),
                 block_size=block_size,
-                page_size_bytes=page_size,
-                mamba_cache_mode=mamba_mode,
                 mamba_align_size=align,
                 spec=per_layer_specs[0][1],
             )
@@ -813,8 +803,6 @@ def parse_kv_cache_config(
                 kind=kind,
                 layer_names=tuple(g.layer_names),
                 block_size=block_size,
-                page_size_bytes=page_size,
-                mamba_cache_mode=None,
                 mamba_align_size=None,
                 spec=per_layer_specs[0][1],
             )
@@ -840,7 +828,6 @@ def parse_kv_cache_config(
                     raise KVShrinkParseError(
                         f"Layer {name} has no dtype in spec")
             _dtype_size(dtype)  # fail closed on unknown dtype
-            dtype_str = str(dtype)
             # KVCacheTensor is (size, shared_by) only; packed layouts
             # (block_stride/offset) are not expressible and are rejected
             # here rather than guessed.
@@ -851,17 +838,10 @@ def parse_kv_cache_config(
                 block_stride_bytes = int(spec.page_size_bytes)
             storage_offset_bytes = int(getattr(tensor, "offset", None) or 0)
             layer_infos[name] = LayerPageInfo(
-                layer_name=name,
-                group_idx=g_idx,
-                spec_kind=kind,
                 num_blocks=num_blocks,
                 page_size_bytes=int(spec.page_size_bytes),
-                unpadded_page_size_bytes=int(
-                    getattr(spec, "unpadded_page_size_bytes", None)
-                    or spec.page_size_bytes),
                 block_stride_bytes=block_stride_bytes,
                 storage_offset_bytes=storage_offset_bytes,
-                dtype=dtype_str,
             )
 
     if not groups:
@@ -926,7 +906,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        self.block_size = vllm_config.cache_config.block_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
@@ -1045,7 +1024,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "speculative decoding or the KV connector.")
         self._groups = groups
         self._rank = rank
-        self._tp_size = tp_size
         # A recurrent group changes only which block hashes we ask
         # about (see _block_hash_source); the storage below is the same.
         recurrent = any(g.kind == "mamba" for g in groups)
@@ -1071,7 +1049,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._backend.register_layout(namespace, tp_size, rank)
             self._canon = Canonicalizer(layer_infos, num_blocks)
             self._worker = HybridWorker(
-                groups, layer_infos, num_blocks, self._backend,
+                groups, layer_infos, self._backend,
                 self._canon, rank, tp_size)
 
         logger.info(
@@ -1157,11 +1135,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             os.environ[target] = devices[self.rank]
             logger.info("Bound rank %d: %s=%s", self.rank, target, devices[self.rank])
-
-    def _store(self) -> KVStore:
-        if self.kvstore is None:
-            raise RuntimeError("KVStore has not been initialized")
-        return self.kvstore
 
     ############################################################
     # Scheduler Side Methods
