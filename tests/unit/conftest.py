@@ -38,6 +38,16 @@ def _clean_kvshrink_env(monkeypatch):
     # The exporter binds a port; unit tests never need it.
 
 
+class FakeBlocks:
+    """KVCacheBlocks stand-in: production only calls get_block_ids()."""
+
+    def __init__(self, ids_per_group):
+        self._ids = tuple(tuple(ids) for ids in ids_per_group)
+
+    def get_block_ids(self):
+        return self._ids
+
+
 def make_spec(kind: str, block_size: int):
     """A real vLLM KVCacheSpec for one group.
 

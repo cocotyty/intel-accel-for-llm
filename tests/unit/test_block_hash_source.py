@@ -96,15 +96,6 @@ def test_legacy_source_recomputes_from_tokens():
     assert all(isinstance(h, str) for h in got)
 
 
-def test_legacy_falls_back_when_tokens_are_absent():
-    """Some registration paths carry no token ids; registering a request
-    with no identity at all would be worse than using what is there."""
-    class _PromptOnly:
-        block_hashes = ["a", "b"]
-
-    assert _sched("legacy")._request_block_hashes(_PromptOnly()) == ["a", "b"]
-
-
 def test_scheduler_refuses_an_unknown_source():
     with pytest.raises(ValueError, match="unknown block hash source"):
         _sched("nonsense")

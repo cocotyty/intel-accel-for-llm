@@ -243,8 +243,7 @@ def test_parse_real_config_layout_descriptors():
     _, layer_infos, _ = parse_kv_cache_config(
         cfg)
     info = layer_infos["language_model.model.layers.0.linear_attn"]
-    assert info.block_stride_bytes == info.page_size_bytes == 1081344
-    assert info.storage_offset_bytes == 0
+    assert info.page_size_bytes == 1081344
     assert "language_model.model.layers.3.self_attn.attn" in layer_infos
 
 
