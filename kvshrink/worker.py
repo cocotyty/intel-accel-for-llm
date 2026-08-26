@@ -167,17 +167,17 @@ class HybridWorker:
         npages = 0
         _t0 = _now()
         try:
-            for req_meta in metadata.reqs_to_load:
+            for req_id, req_meta in metadata.reqs_to_load.requests.items():
                 # Async requests get their OWN sink: their tasks must
                 # survive this step, and must not be host-blocked by
                 # the GDN barrier below (that barrier is for requests
                 # about to enter forward; an async one is not).
-                is_async = bool(getattr(req_meta, "is_async", False))
+                is_async = req_meta.is_async
                 sink = {} if is_async else self._load_tasks
-                for op in getattr(req_meta, "group_ops", []):
-                    npages += self._submit_op_load(req_meta, op, sink)
+                for op in req_meta.group_ops:
+                    npages += self._submit_op_load(req_id, op, sink)
                 if is_async:
-                    self._register_async_load(req_meta, sink)
+                    self._register_async_load(req_id, req_meta, sink)
         except BaseException as e:
             # Submit-stage failures (pool budget, engine errors) must
             # poison like wait-stage failures: a partially submitted
@@ -196,13 +196,12 @@ class HybridWorker:
                 (_now() - _t0) * 1e3, self.rank, self.tp_size)
         return npages
 
-    def _register_async_load(self, req_meta, sink: dict) -> None:
+    def _register_async_load(self, req_id, req_meta, sink: dict) -> None:
         """Track one request's cross-step load and compute its release
         gate.
         """
         if not sink:
             return
-        req_id = req_meta.req_id
         if req_id in self._async_loads:
             err = RuntimeError(
                 f"kvshrink async load: request {req_id} already has an "
@@ -210,7 +209,7 @@ class HybridWorker:
             self._poison_load(err)
             raise err
         recurrent = {ln for ln in sink if ln not in self._attn_layer_group}
-        n = getattr(req_meta, "async_load_layers", -1)
+        n = req_meta.async_load_layers
         if n is None or n < 0:
             gate = set(sink)
         else:
@@ -288,7 +287,7 @@ class HybridWorker:
             self._poison_load(err)
             raise err
 
-    def _submit_op_load(self, req_meta, op, sink) -> int:
+    def _submit_op_load(self, req_id, op, sink) -> int:
         """Submit one GroupTransferMeta to the engine (async get)."""
         group = self._groups[op.group_idx]
         if not op.keys:
@@ -301,7 +300,7 @@ class HybridWorker:
                     boundary_key) != LookupStatus.HIT:
                 err = RuntimeError(
                     "kvshrink mamba load: boundary vanished after HIT "
-                    f"req={req_meta.req_id} boundary="
+                    f"req={req_id} boundary="
                     f"{op.snapshot_boundary_tokens}; refusing to enter "
                     "forward with unrestored state")
                 self._poison_load(err)
@@ -320,7 +319,7 @@ class HybridWorker:
             if ent != entries:
                 err = RuntimeError(
                     "kvshrink chunk load: inconsistent op expansion "
-                    f"req={req_meta.req_id} group={op.group_idx} "
+                    f"req={req_id} group={op.group_idx} "
                     f"layer={layer_name}")
                 self._poison_load(err)
                 raise err
@@ -370,7 +369,7 @@ class HybridWorker:
         Returns boundary_key -> {"group_idx", "pages": {layer_name:
         (key, gpu_block_id)}, "boundary_tokens"}."""
         candidates: dict[tuple, dict] = {}
-        for req_meta in metadata.reqs_to_save:
+        for req_meta in metadata.reqs_to_save.requests.values():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     key = self._worker_key(key)

@@ -11,7 +11,7 @@ from typing import Optional
 from iaxl import generate_block_hashs
 
 from .layout import (CacheKey, GroupInfo, GroupTransferMeta, LookupResult,
-                     LookupStatus, ReqMeta, RequestGroupState, RequestState,
+                     LookupStatus, ReqMeta, ReqGroupState, ReqState,
                      align_down, make_boundary_key)
 
 # ======================================================================
@@ -54,7 +54,7 @@ class HybridRequestScheduler:
         block_hash_source: str = "vllm",
     ):
         """Record the per-group layout, hit-policy backend and TP
-        identity, and own the per-request RequestState table plus the
+        identity, and own the per-request ReqState table plus the
         resume/cursor-rollback counter that spans a request's whole
         scheduling lifecycle.
         """
@@ -84,7 +84,7 @@ class HybridRequestScheduler:
         # they are never partially released (see _decide_async).
         self._attention_layers: tuple[str, ...] = tuple(
             ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
-        self._req_states: dict[str, RequestState] = {}
+        self._req_states: dict[str, ReqState] = {}
         # Async requests whose load plan has not been emitted yet. See
         # update_state_after_alloc for why this cannot be derived from
         # the scheduler output.
@@ -95,22 +95,22 @@ class HybridRequestScheduler:
         self, req_id: str, block_hashes: list[int],
         num_computed_tokens: int, request_obj=None,
     ) -> None:
-        """Register a fresh RequestState. Internal: called by us from
+        """Register a fresh ReqState. Internal: called by us from
         get_num_new_matched_tokens / build_load_meta /
         update_state_after_alloc when a request first becomes visible
         (vLLM has no dedicated "new request" connector hook)."""
-        self._req_states[req_id] = RequestState(
+        self._req_states[req_id] = ReqState(
             request=req_id,
             request_obj=request_obj,
             block_hashes=list(block_hashes),
-            num_locally_computed_tokens=num_computed_tokens,
+            num_computed_tokens=num_computed_tokens,
             groups=tuple(
-                RequestGroupState() for _ in self._groups),
+                ReqGroupState() for _ in self._groups),
         )
 
-    def take_async_load_plans(self, already_emitted: set) -> list:
+    def take_async_load_plans(self, already_emitted: set) -> dict:
         """Load plans for requests vLLM parked, drained exactly once."""
-        plans = []
+        plans = {}
         for req_id in sorted(self._async_load_pending - already_emitted):
             state = self._req_states.get(req_id)
             if state is None:
@@ -127,7 +127,7 @@ class HybridRequestScheduler:
             # request is either parked or done.
             state.is_async = False
             if meta is not None and meta.group_ops:
-                plans.append(meta)
+                plans[req_id] = meta
             else:
                 logger.warning(
                     "async req=%s has no restorable pages; dropping the "
@@ -149,7 +149,7 @@ class HybridRequestScheduler:
         return [str(h) for h in generate_block_hashs(
             tokens[:-1], self._hash_block_size)]
 
-    def _sync_block_hashes(self, state: RequestState) -> None:
+    def _sync_block_hashes(self, state: ReqState) -> None:
         """Adopt block hashes vLLM has added since we registered."""
         if state.request_obj is None:
             return
@@ -160,7 +160,7 @@ class HybridRequestScheduler:
 
     def on_request_finished(self, req_id: str) -> None:
         """vLLM trigger: core frees the request ->
-        connector.request_finished -> here. Drop the RequestState;
+        connector.request_finished -> here. Drop the ReqState;
         committed boundaries are content-addressed and stay."""
         self._req_states.pop(req_id, None)
         self._async_load_pending.discard(req_id)
@@ -176,12 +176,12 @@ class HybridRequestScheduler:
         if state is None:
             return
         self._sync_block_hashes(state)
-        old_progress = max(state.num_locally_computed_tokens,
+        old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
                       and num_computed_tokens < old_progress)
         if num_computed_tokens is not None:
-            state.num_locally_computed_tokens = num_computed_tokens
+            state.num_computed_tokens = num_computed_tokens
             state.last_known_progress = num_computed_tokens
         if resumed or regression:
             # fail-closed: a missing progress on resume is treated as
@@ -297,8 +297,8 @@ class HybridRequestScheduler:
                 req_id, self._request_block_hashes(request), 0,
                 request_obj=request)
             state = self._req_states[req_id]
-        state.num_locally_computed_tokens = (
-            state.num_locally_computed_tokens + num_external_tokens)
+        state.num_computed_tokens = (
+            state.num_computed_tokens + num_external_tokens)
         state.pending_load_tokens = num_external_tokens
         if hasattr(blocks, "get_block_ids"):
             all_block_ids = blocks.get_block_ids()
@@ -383,8 +383,8 @@ class HybridRequestScheduler:
                 "TAIL req=%s snapshot_boundary=%d computed_before_fwd=%d "
                 "external=%d num_tokens=%s",
                 req_id, state.snapshot_boundary,
-                state.num_locally_computed_tokens,
-                state.snapshot_boundary - state.num_locally_computed_tokens,
+                state.num_computed_tokens,
+                state.snapshot_boundary - state.num_computed_tokens,
                 num_tokens)
         group_ops = []
         for g_idx, group in enumerate(self._groups):
@@ -520,8 +520,7 @@ class HybridRequestScheduler:
                 snapshot_boundary_tokens=boundary if group.kind == "mamba"
                 else None))
         return ReqMeta(
-            req_id=req_id,
-            external_hit_tokens=boundary - state.num_locally_computed_tokens,
+            external_hit_tokens=boundary - state.num_computed_tokens,
             group_ops=tuple(group_ops),
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
@@ -533,8 +532,8 @@ class HybridRequestScheduler:
         """Production save: INCREMENTAL per-group page persistence."""
         state = self._req_states.get(req_id)
         if state is None:
-            return ReqMeta(req_id=req_id)
-        progress = state.num_locally_computed_tokens + scheduled_tokens
+            return ReqMeta()
+        progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
                                         progress)
         group_ops = []
@@ -593,11 +592,7 @@ class HybridRequestScheduler:
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids),
                 snapshot_boundary_tokens=snapshot_boundary))
-        return ReqMeta(
-            req_id=req_id,
-            external_hit_tokens=0,
-            group_ops=tuple(group_ops),
-        )
+        return ReqMeta(group_ops=tuple(group_ops))
 
     def _boundary_key(self, group: GroupInfo, block_hash) -> CacheKey:
         """This rank's boundary key for one group at one block hash."""

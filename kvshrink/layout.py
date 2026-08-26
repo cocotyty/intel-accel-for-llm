@@ -85,35 +85,47 @@ class GroupTransferMeta:
     snapshot_boundary_tokens: Optional[int] = None  # mamba restore point
 
 
+ReqId = str
+
+
 @dataclass
 class ReqMeta:
     """All transfer instructions for one request in one step."""
-    req_id: str
-    external_hit_tokens: int = 0
     group_ops: tuple[GroupTransferMeta, ...] = ()
-    # LOAD plans only. When set, vLLM parked this request in
-    # WAITING_FOR_REMOTE_KVS rather than giving it a forward step: the
-    # worker must keep the transfer alive ACROSS steps and name the
-    # request in get_finished() once enough of it has landed, otherwise
-    # the request never becomes runnable again.
+    external_hit_tokens: int = 0
     is_async: bool = False
-    # How many LEADING ATTENTION layers must land before the request is
-    # released; -1 means every layer. Counted in attention layers only:
-    # recurrent state is never partially released, because the whole
-    # snapshot is read at the very start of forward. The worker adds
-    # every mamba op to the release gate regardless of this number.
     async_load_layers: int = -1
 
 
 @dataclass
-class RequestGroupState:
+class RequestMetadata:
+    requests: dict[ReqId, ReqMeta] = field(default_factory=dict)
+
+    def add_request(
+        self,
+        req_id: ReqId,
+        group_ops: tuple[GroupTransferMeta, ...] = (),
+        external_hit_tokens: int = 0,
+        is_async: bool = False,
+        async_load_layers: int = -1,
+    ) -> None:
+        self.requests[req_id] = ReqMeta(
+            group_ops,
+            external_hit_tokens,
+            is_async,
+            async_load_layers,
+        )
+
+
+@dataclass
+class ReqGroupState:
     """Per-group mutable state for one request (scheduler side)."""
     block_ids: list[int] = field(default_factory=list)
     next_stored_chunk_idx: int = 0
 
 
 @dataclass
-class RequestState:
+class ReqState:
     request: Any = None
     # The live vLLM Request, when we were handed one. Held so the save
     # path can read AUTHORITATIVE block hashes as they grow: vLLM
@@ -123,9 +135,9 @@ class RequestState:
     # on_request_finished together with the rest of the state.
     request_obj: Any = None
     block_hashes: list[int] = field(default_factory=list)
-    num_locally_computed_tokens: int = 0
+    num_computed_tokens: int = 0
     snapshot_boundary: int = 0
-    groups: tuple[RequestGroupState, ...] = ()
+    groups: tuple[ReqGroupState, ...] = ()
     # External tokens accepted by the core in the CURRENT scheduling
     # pass (recorded by update_state_after_alloc): tokens the core will
     # skip recompute for, so the worker MUST restore them before
