@@ -53,7 +53,7 @@ import os
 from dataclasses import replace
 from typing import Optional
 
-from .kvshrink_connector import CacheKey
+from .kvshrink_connector import CacheKey, save_enabled
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
 # logger (handler+level); an unconfigured logger would drop INFO
@@ -209,7 +209,7 @@ class HybridWorker:
         """Canonical page views over the raw KV tensors of one layer:
         part key -> (num_blocks, page_bytes) GPU view. The chunk
         engine moves rows of these views, indexed by GPU block id."""
-        parts, _chunk_dim = self._canon.page_view_parts(layer_name)
+        parts = self._canon.page_view_parts(layer_name)
         return parts
 
     # ------------------------------------------------------------------
@@ -356,29 +356,23 @@ class HybridWorker:
                 self._async_loads.pop(req_id, None)
         return finished
 
-    def _drain_async_layer(self, layer_name: str) -> list:
-        """Collect any released async request's tasks for this layer.
+    def wait_layer_load(self, layer_name: str) -> None:
+        """Attention-layer entry hook: wait this layer's pages.
 
-        Drains EVERY released entry, not just the ones running in this
-        batch: the worker is not told which requests a forward step
+        Drains EVERY released async entry, not just the ones running in
+        this batch: the worker is not told which requests a forward step
         covers, and a task waited a step early only costs a wait for
         bytes already on their way, while a task never waited means
         forward read unrestored memory.
         """
-        tds: list = []
+        self.raise_load_poison()
+        tds = self._load_tasks.pop(layer_name, [])
         for req_id, entry in list(self._async_loads.items()):
             if not entry.released:
                 continue
             tds += entry.layer_tasks.pop(layer_name, [])
             if not entry.layer_tasks:
                 self._async_loads.pop(req_id, None)
-        return tds
-
-    def wait_layer_load(self, layer_name: str) -> None:
-        """Attention-layer entry hook: wait this layer's pages."""
-        self.raise_load_poison()
-        tds = self._load_tasks.pop(layer_name, [])
-        tds += self._drain_async_layer(layer_name)
         if tds:
             self._wait_tasks(tds)
 
@@ -470,13 +464,6 @@ class HybridWorker:
     # ------------------------------------------------------------------
     # save path
     # ------------------------------------------------------------------
-    def save_enabled(self) -> bool:
-        """Reflects the KVSHRINK_SAVE switch: ON by default; "0"
-        disables production saving and KVSHRINK_DEBUG_AUTOSAVE=1
-        force-enables it."""
-        return (os.getenv("KVSHRINK_SAVE", "1") != "0"
-                or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
-
     def _gather_save_candidates(self, metadata) -> dict:
         """Batch-level boundary candidates with cross-request dedup.
         Returns boundary_key -> {"group_idx", "pages": {layer_name:
@@ -535,7 +522,7 @@ class HybridWorker:
         """
         if os.getenv("KVSHRINK_SAVE_PIPELINED", "1") == "0":
             return
-        if not self.save_enabled():
+        if not save_enabled():
             return
         g_idx = self._attn_layer_group.get(layer_name)
         if g_idx is None:
@@ -669,15 +656,7 @@ class HybridWorker:
 
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
-        """Flush and release the backend (Record sync, writer lease),
-        then re-raise the first sticky load poison so cleanup never
+        """Re-raise the first sticky load poison so cleanup never
         masks it."""
-        errors = []
-        try:
-            self._backend.close()
-        except BaseException as e:  # pragma: no cover - collect
-            errors.append(e)
         if self._load_poison is not None:
-            errors.append(self._load_poison)
-        if errors:
-            raise errors[0]
+            raise self._load_poison

@@ -6,7 +6,6 @@ block (block_size granularity), e.g. 2135-token prompt with block_size=544
 """
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo, CacheKey
-from kvshrink.kvshrink_connector import align_down
 from kvshrink.scheduler import HybridHitPolicy
 
 
@@ -81,7 +80,7 @@ def test_align_down_and_minus_one():
     groups = [_group(0, "mamba", 16, align=32)]
     b, hashes = _hashes({0, 1, 2, 3, 4, 5}, 6)  # 96 tokens
     policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
-    # candidate = min(99, align_down(99, 32)) = 96 -> idx 6/5 ... hash5 HIT -> 96
+    # candidate = min(99, 99//32*32) = 96 -> idx 6/5 ... hash5 HIT -> 96
     assert policy.find_longest_cache_hit(hashes, 100) == 96
 
 
@@ -116,7 +115,7 @@ def test_boundary_table():
         b, hashes = _hashes(set(range(n_blocks)), n_blocks)
         policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
         boundary = policy.find_longest_cache_hit(hashes, length)
-        expected = align_down(length - 1, 32)
+        expected = (length - 1) // 32 * 32
         if expected == 0:
             assert boundary == 0, f"len={length}"
         else:
@@ -144,7 +143,7 @@ def test_mamba_lookup_starts_left_of_boundary():
     # -> boundary 80 > candidate 64 (false, never allowed).
     b, hashes = _hashes({0, 1, 2, 3, 4}, 6)
     policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
-    # mamba: align_down(95,32)=64 -> idx=64//16-1=3 -> hash3 HIT -> 64
+    # mamba: 95//32*32=64 -> idx=64//16-1=3 -> hash3 HIT -> 64
     assert policy.find_longest_cache_hit(hashes, 96) == 64
 
 
@@ -153,7 +152,7 @@ def test_mamba_snapshot_exactly_at_boundary():
     groups = [_group(0, "mamba", 16, align=32)]
     b, hashes = _hashes({3}, 4)  # hash3 = 64-token boundary
     policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
-    # candidate = min(63, align_down(63,32)) = 32 -> idx=32//16-1=1 ->
+    # candidate = min(63, 63//32*32) = 32 -> idx=32//16-1=1 ->
     # hash1 MISS -> hash0 MISS -> MISS (no snapshot below 32)
     assert policy.find_longest_cache_hit(hashes, 64) == 0
 
@@ -180,7 +179,7 @@ def test_mamba_candidate_below_gran_miss():
     groups = [_group(0, "mamba", 16, align=32)]
     b, hashes = _hashes({0}, 2)  # hash0 (16 tokens) committed
     policy = HybridHitPolicy(groups, b, 16, 0, "ns", 2, 0)
-    # candidate = min(15, align_down(15,32)=0) = 0 -> MISS
+    # candidate = min(15, 15//32*32=0) = 0 -> MISS
     assert policy.find_longest_cache_hit(hashes, 16) == 0
 
 

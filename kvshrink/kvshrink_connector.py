@@ -225,13 +225,6 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 #   first, then mamba groups).
 # - Backend lookups return a bool (chunk tier is Record-gated,
 #   request, never allocates).
-def align_down(tokens: int, align: int) -> int:
-    """Largest multiple of ``align`` not exceeding ``tokens``. Snaps
-    mamba candidates to align boundaries: GDN state is only addressable
-    on aligned positions."""
-    return (tokens // align) * align
-
-
 # ======================================================================
 # canonical page views
 # ======================================================================
@@ -376,13 +369,12 @@ class Canonicalizer:
             return (v[0][block_id], v[1][block_id])
         return (v[block_id],)
 
-    def page_view_parts(self, layer_name: str):
+    def page_view_parts(self, layer_name: str) -> dict:
         """Full-pool canonical page views for the KVFlow chunk engine.
 
-        Returns ``(parts, chunk_dim)``: ``parts`` maps a stable part key to
-        a ``(num_blocks, page_bytes)`` int8 GPU view whose dim-0 rows are the
-        per-block pages (regular strides, as GpuTransferContext requires);
-        ``chunk_dim`` is always 0. Split-K/V attention layers yield
+        Maps a stable part key to a ``(num_blocks, page_bytes)`` int8 GPU
+        view whose dim-0 rows are the per-block pages (regular strides, as
+        GpuTransferContext requires). Split-K/V attention layers yield
         ``{"k": k_view, "v": v_view}`` (logical page = K||V); contiguous
         layouts (mamba state, packed attention) yield ``{"page": view}``.
 
@@ -392,8 +384,8 @@ class Canonicalizer:
         """
         v = self._views[layer_name]
         if isinstance(v, tuple):
-            return {"k": v[0], "v": v[1]}, 0
-        return {"page": v}, 0
+            return {"k": v[0], "v": v[1]}
+        return {"page": v}
 
     def get_page(self, layer_name: str, block_id: int) -> torch.Tensor:
         """Single tensor for one logical page: the canonical view row,
@@ -681,7 +673,6 @@ def _iter_layer_specs(group_spec):
 
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
-    hash_block_size: int,
 ) -> tuple[list[GroupInfo], dict[str, LayerPageInfo], int]:
     """Return (groups, layer_infos, num_blocks).
 
@@ -807,25 +798,15 @@ def parse_kv_cache_config(
                         f"Layer {name} MambaSpec has empty dtypes")
                 dtype = spec.dtypes[0]
             else:
-                dtype = getattr(spec, "dtype", None)
-                if dtype is None:
-                    raise KVShrinkParseError(
-                        f"Layer {name} has no dtype in spec")
+                dtype = spec.dtype
             _dtype_size(dtype)  # fail closed on unknown dtype
-            # KVCacheTensor is (size, shared_by) only; packed layouts
-            # (block_stride/offset) are not expressible and are rejected
-            # here rather than guessed.
-            t_block_stride = int(getattr(tensor, "block_stride", None) or 0)
-            if t_block_stride > 0:
-                block_stride_bytes = t_block_stride
-            else:
-                block_stride_bytes = int(spec.page_size_bytes)
-            storage_offset_bytes = int(getattr(tensor, "offset", None) or 0)
+            # KVCacheTensor is (size, shared_by) only: pages are
+            # contiguous and start at storage offset 0.
             layer_infos[name] = LayerPageInfo(
                 num_blocks=num_blocks,
                 page_size_bytes=int(spec.page_size_bytes),
-                block_stride_bytes=block_stride_bytes,
-                storage_offset_bytes=storage_offset_bytes,
+                block_stride_bytes=int(spec.page_size_bytes),
+                storage_offset_bytes=0,
             )
 
     if not groups:
@@ -851,7 +832,7 @@ def parse_kv_cache_config(
 # Connector
 ############################################################
 
-def _save_enabled() -> bool:
+def save_enabled() -> bool:
     """Production save is ON by default; KVSHRINK_SAVE=0 disables it and
     KVSHRINK_DEBUG_AUTOSAVE=1 force-enables it."""
     return (os.getenv("KVSHRINK_SAVE", "1") != "0"
@@ -950,13 +931,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         from .worker import HybridWorker
 
         pc = vllm_config.parallel_config
-        tp_size = int(getattr(pc, "tensor_parallel_size", 1) or 1)
+        tp_size = pc.tensor_parallel_size
         if role == KVConnectorRole.WORKER:
             # parallel_config.rank, NOT get_world_group(): the connector
             # is constructed before distributed init in the worker
             # processes, so the world group would report rank 0 on every
             # TP rank and the ranks would overwrite each other's shards.
-            rank = int(getattr(pc, "rank", 0) or 0)
+            rank = pc.rank
         else:
             # Scheduler-side keys are always rank 0; each worker verifies
             # its own shard through its own backend.
@@ -972,10 +953,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                               for g in kv_cache_config.kv_cache_groups})
         hash_block_size = math.gcd(*block_sizes)
         namespace = compute_namespace(
-            model_id=str(getattr(model_config, "model", "model")),
-            model_revision=str(getattr(model_config, "revision", None) or ""),
+            model_id=model_config.model,
+            model_revision=model_config.revision or "",
             tokenizer_revision=str(
-                getattr(model_config, "tokenizer_revision", None) or ""),
+                model_config.tokenizer_revision or ""),
             cache_dtype=str(getattr(cache_config, "cache_dtype", "auto")),
             kv_schema_version=SCHEMA_VERSION,
             tp_size=tp_size,
@@ -987,7 +968,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         validate_codec_env()
 
         groups, layer_infos, num_blocks = parse_kv_cache_config(
-            kv_cache_config, hash_block_size=hash_block_size)
+            kv_cache_config)
 
         # Fail-closed: speculative decoding widens the GDN state gather.
         # v0.23.0's mamba_get_block_table_tensor returns
@@ -998,7 +979,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # kernel read unrestored speculative slots.
         for g in kv_cache_config.kv_cache_groups:
             spec_blocks = int(
-                getattr(g.kv_cache_spec, "num_speculative_blocks", 0) or 0)
+                g.kv_cache_spec.num_speculative_blocks)
             if spec_blocks:
                 raise RuntimeError(
                     "kvshrink hybrid: speculative decoding is not "
@@ -1170,11 +1151,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """
         return self.request_finished(request, [])
     def build_connector_meta(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> KVConnectorMetadata:
-        return self._build_connector_meta(scheduler_output)
-    def _build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Assemble this pass's hybrid plans.
@@ -1186,7 +1162,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         meta = KVShrinkConnectorMetadata()
         sched = self._sched
         debug = bool(os.getenv("KVSHRINK_DEBUG_LOG"))
-        save_enabled = _save_enabled()
+        save_on = save_enabled()
         num_sched = scheduler_output.num_scheduled_tokens
 
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -1206,7 +1182,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         len(op.keys), len(op.gpu_block_ids))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
                 meta.reqs_to_load.requests[new_req.req_id] = req_meta
-            if save_enabled:
+            if save_on:
                 save_meta = sched.build_save_meta(
                     new_req.req_id, num_sched.get(new_req.req_id, 0))
                 if save_meta.group_ops:
@@ -1233,7 +1209,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # here the worker would never restore the pages while the core
         # already skips recompute -- silent garbage output.
         cr = scheduler_output.scheduled_cached_reqs
-        for req_id in (getattr(cr, "resumed_req_ids", None) or ()):
+        for req_id in cr.resumed_req_ids:
             req_meta = sched.build_resumed_load_meta(
                 req_id, num_sched.get(req_id, 0))
             if req_meta is None:
@@ -1248,11 +1224,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Running requests cross boundaries in later steps too (chunked
         # prefill tails, decode-time crossings): sync their tables first,
         # then emit incremental saves.
-        if save_enabled:
-            resumed = getattr(cr, "resumed_req_ids", None) or set()
-            new_bids = getattr(cr, "new_block_ids", None) or []
-            ncts = getattr(cr, "num_computed_tokens", None) or []
-            for i, req_id in enumerate(getattr(cr, "req_ids", []) or []):
+        if save_on:
+            resumed = cr.resumed_req_ids
+            new_bids = cr.new_block_ids
+            ncts = cr.num_computed_tokens
+            for i, req_id in enumerate(cr.req_ids):
                 sched.on_cached_request(
                     req_id,
                     new_bids[i] if i < len(new_bids) else None,
@@ -1412,7 +1388,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # forward read unrestored state would commit wrong data.
         hw.raise_load_poison()
         hw.loads_drained_check()
-        if not hw.save_enabled():
+        if not save_enabled():
             return
         metadata = self._metadata()
         if os.getenv("KVSHRINK_DEBUG_LOG"):
@@ -1425,11 +1401,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         hw.debug_dump_state()
 
     def shutdown(self) -> None:
-        """Release the store backend (Record flush, writer lease)."""
+        """Release the worker (Record flush, writer lease)."""
         if self._worker is not None:
             self._worker.shutdown()
-        elif self._backend is not None:
-            self._backend.close()
 
     def get_finished(
         self, finished_req_ids: set[str]
