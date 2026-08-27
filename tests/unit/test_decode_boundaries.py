@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo, ReqGroupState, ReqState
-from kvshrink.scheduler import HybridRequestScheduler
+from conftest import HybridRequestScheduler
 
 
 def _sched(block_size=16):

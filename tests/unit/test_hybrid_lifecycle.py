@@ -15,10 +15,8 @@ Rulings under test:
 
 import pytest
 
-from conftest import FakeBlocks, make_spec
-from kvshrink.backend import lookup_boundary
-from kvshrink.kvshrink_connector import CacheKey, GroupInfo
-from kvshrink.scheduler import HybridRequestScheduler
+from conftest import FakeBlocks, HybridRequestScheduler, make_spec
+from kvshrink.kvshrink_connector import CacheKey, GroupInfo, lookup_boundary
 
 PAGE = 64 * 1024
 
@@ -152,23 +150,10 @@ def test_progress_regression_without_resumed_flag_rolls_back():
 # ------------------------------------------------------------------
 
 def _sched_side_connector(sched):
-    """The real connector facade in its scheduler role, with the hybrid
-    plan builder injected. Construction is bypassed on purpose: these
-    tests cover the dispatch contract, not engine startup.
-
-    Skipped when the compiled iaxl extension is unavailable (the facade
-    imports it for the pure-attention path); every other test in this
-    file is pure logic and always runs.
-    """
-    pytest.importorskip(
-        "iaxl", reason="kvshrink_connector imports the built iaxl extension")
-    from kvshrink.kvshrink_connector import KVShrinkConnector
-
-    conn = object.__new__(KVShrinkConnector)
-    conn._sched = sched
-    conn._worker = None
-    conn._groups = list(sched._groups)
-    return conn
+    """The scheduler-role connector facade. Since the scheduler/worker
+    merge, the scheduler-side methods live on KVShrinkConnector itself,
+    so the plan builder IS the facade."""
+    return sched
 
 
 def test_request_finished_returns_false_and_clears_state():

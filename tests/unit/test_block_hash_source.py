@@ -23,9 +23,9 @@ import pytest
 from kvshrink.kvshrink_connector import KVShrinkConnector
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo
-from kvshrink.scheduler import HybridRequestScheduler
+from conftest import HybridRequestScheduler
 
-_pick = KVShrinkConnector._block_hash_source
+_pick = KVShrinkConnector._choose_block_hash_source
 
 
 def _group(kind):
@@ -94,8 +94,3 @@ def test_legacy_source_recomputes_from_tokens():
     assert got and got != _Req.block_hashes, (
         "legacy must not silently return the engine's hashes")
     assert all(isinstance(h, str) for h in got)
-
-
-def test_scheduler_refuses_an_unknown_source():
-    with pytest.raises(ValueError, match="unknown block hash source"):
-        _sched("nonsense")

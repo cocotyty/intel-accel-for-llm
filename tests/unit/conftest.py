@@ -48,6 +48,63 @@ class FakeBlocks:
         return self._ids
 
 
+def HybridRequestScheduler(groups, store, hash_block_size, namespace,
+                           tp_size, rank, async_load_config=None,
+                           block_hash_source="vllm"):
+    """Scheduler-side connector instance without the vLLM config stack.
+
+    The scheduler-side methods live on KVShrinkConnector; this factory
+    builds one with just the fields they touch. Same signature the
+    pre-merge HybridRequestScheduler class had.
+    """
+    from kvshrink.kvshrink_connector import KVShrinkConnector
+
+    conn = object.__new__(KVShrinkConnector)
+    conn._groups = list(groups)
+    conn.kvstore = store
+    conn._hash_block_size = hash_block_size
+    conn._namespace = namespace
+    conn.tp_size = tp_size
+    conn._rank = rank
+    conn._async_load_layer_config = async_load_config
+    conn._block_hash_source = block_hash_source
+    conn._attention_layers = tuple(
+        ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
+    conn._req_states = {}
+    conn._async_load_pending = set()
+    return conn
+
+
+def HybridWorker(groups, layer_infos, namespace, canonicalizer,
+                 rank, tp_size):
+    """Worker-side connector instance without the vLLM config stack.
+
+    Same signature the pre-merge HybridWorker class had.
+    """
+    from kvshrink.kvshrink_connector import KVShrinkConnector, group_label
+
+    conn = object.__new__(KVShrinkConnector)
+    conn._groups = list(groups)
+    conn._layer_infos = layer_infos
+    conn._canon = canonicalizer
+    conn._rank = rank
+    conn.tp_size = tp_size
+    conn._labels = [
+        group_label(namespace, g.group_idx, rank) for g in groups]
+    conn.kvstore = None
+    conn._layer_names = []
+    conn._load_tasks = {}
+    conn._step_attn_saves = {}
+    conn._async_loads = {}
+    conn._attn_layer_group = {
+        ln: g.group_idx for g in groups if g.kind != "mamba"
+        for ln in g.layer_names}
+    conn._mamba_layers = frozenset()
+    conn._attn_order = ()
+    conn._connector_metadata = None
+    return conn
+
+
 def make_spec(kind: str, block_size: int):
     """A real vLLM KVCacheSpec for one group.
 

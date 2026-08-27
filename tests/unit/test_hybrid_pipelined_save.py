@@ -9,11 +9,9 @@ fake canonicalizer -- no GPU, no disk, no model.
 """
 
 import os
-from types import SimpleNamespace
-
-from kvshrink.worker import HybridWorker
-from conftest import make_spec
+from conftest import HybridWorker, make_spec
 from kvshrink.kvshrink_connector import (
+    KVShrinkConnectorMetadata,
     RequestMetadata,
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
 
@@ -65,7 +63,7 @@ def _save_meta():
         gpu_block_ids=(20,))
     saves = RequestMetadata()
     saves.add_request("r1", group_ops=(attn_ops, mamba_ops))
-    return SimpleNamespace(reqs_to_save=saves)
+    return KVShrinkConnectorMetadata(reqs_to_save=saves)
 
 
 def _worker():
@@ -73,8 +71,7 @@ def _worker():
               _group(1, "mamba", ["m0"])]
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
                      "ns", _FakeCanon(), rank=0, tp_size=1)
-    w.store = _FakeStore()
-    w._kv_caches_ref = object()  # truthy: kv caches registered
+    w.kvstore = _FakeStore()
     return w
 
 
@@ -87,23 +84,26 @@ def _env_off(monkeypatch_env=None):
 def test_pipelined_attention_submits_during_forward():
     _env_off()
     c = _worker()
-    # forward: vLLM calls save_kv_layer on exit of each attention layer
-    c.save_kv_layer("a0", _save_meta())
-    c.save_kv_layer("a1", _save_meta())
-    submits_during_fwd = list(c.store.submits)
+    # forward: vLLM binds the step metadata, then calls save_kv_layer
+    # on exit of each attention layer
+    meta = _save_meta()
+    c.bind_connector_metadata(meta)
+    c.save_kv_layer("a0", None, None)
+    c.save_kv_layer("a1", None, None)
+    submits_during_fwd = list(c.kvstore.submits)
     assert len(submits_during_fwd) == 2
     assert submits_during_fwd[0][1] == ["a0"]  # one layer per call
     assert submits_during_fwd[1][1] == ["a1"]
 
     c.wait_save(_save_meta())
     # attention layers were NOT re-submitted; mamba submitted at wait
-    submit_layers = [sorted(v) for _g, v, _l in c.store.submits]
+    submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
     # every group was written and waited for
-    assert {l for l, _ls, _b in c.store.submits} == {
+    assert {l for l, _ls, _b in c.kvstore.submits} == {
         "ns_g0_r0", "ns_g1_r0"}
-    assert c.store.waits > 0
+    assert c.kvstore.waits > 0
 
 
 def test_fallback_when_hook_never_fired():
@@ -112,7 +112,7 @@ def test_fallback_when_hook_never_fired():
     _env_off()
     c = _worker()
     _pages, nbound = c.wait_save(_save_meta())  # no save_kv_layer first
-    submit_layers = [sorted(v) for _g, v, _l in c.store.submits]
+    submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
     assert ["a0"] in submit_layers and ["a1"] in submit_layers
     assert ["m0"] in submit_layers
     assert nbound == 2
@@ -123,8 +123,9 @@ def test_pipelined_disabled_by_env():
     os.environ["KVSHRINK_SAVE_PIPELINED"] = "0"
     try:
         c = _worker()
-        c.save_kv_layer("a0", _save_meta())
-        assert c.store.submits == []  # nothing during forward
+        c.bind_connector_metadata(_save_meta())
+        c.save_kv_layer("a0", None, None)
+        assert c.kvstore.submits == []  # nothing during forward
         assert c.wait_save(_save_meta())[1] == 2
     finally:
         os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
@@ -140,4 +141,4 @@ def test_write_is_the_commit():
     w = _worker()
     pages, boundaries = w.wait_save(_save_meta())
     assert pages > 0 and boundaries > 0
-    assert w.store.waits > 0, "the write was never waited for"
+    assert w.kvstore.waits > 0, "the write was never waited for"
