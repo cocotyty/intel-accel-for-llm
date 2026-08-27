@@ -79,7 +79,7 @@ class _FakeCanon:
 
 def _worker(store):
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in ORDER}, "ns",
+    w = HybridWorker(groups, {ln: None for ln in ORDER},
                      _FakeCanon(), rank=0, tp_size=1)
     w.kvstore = store
     w.register({ln: None for ln in ORDER}, ORDER)
@@ -89,8 +89,7 @@ def _worker(store):
 def _meta(async_layers, req_id="r1"):
     """A load plan covering every layer, split per group."""
     def op(gidx, layers):
-        keys = tuple(CacheKey(namespace="ns", rank=0,
-                              block_hash=7, group_idx=gidx,
+        keys = tuple(CacheKey(block_hash=7, group_idx=gidx,
                               layer_name=ln) for ln in layers)
         return GroupTransferMeta(
             group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers))
@@ -196,8 +195,7 @@ def test_parked_request_still_gets_a_load_plan():
 
     groups = [_group(0, "attention", ATTN)]
     sched = HybridRequestScheduler(
-        groups, _FakeStore(), hash_block_size=16, namespace="ns",
-        tp_size=1, rank=0)
+        groups, _FakeStore(), hash_block_size=16)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
@@ -220,7 +218,7 @@ def test_async_plan_is_emitted_only_once():
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(),
-        hash_block_size=16, namespace="ns", tp_size=1, rank=0)
+        hash_block_size=16)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
@@ -248,8 +246,8 @@ def test_recurrent_models_can_go_async():
 
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
-        _FakeStore(), hash_block_size=16, namespace="ns", tp_size=1,
-        rank=0, async_load_config=_Cfg())
+        _FakeStore(), hash_block_size=16,
+        async_load_config=_Cfg())
     hybrid._req_states["r1"] = ReqState()
     assert hybrid._decide_async("r1", external=64) is True
 
@@ -288,8 +286,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     sched = HybridRequestScheduler(
-        groups, _FakeStore(), hash_block_size=16, namespace="ns",
-        tp_size=1, rank=0)
+        groups, _FakeStore(), hash_block_size=16)
     st = ReqState(
         block_hashes=[1, 2, 3, 4], snapshot_boundary=64,
         groups=(ReqGroupState(block_ids=[1, 2, 3, 4]),
@@ -313,8 +310,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,
-        namespace="ns", tp_size=1, rank=0)
+        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
@@ -352,8 +348,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,
-        namespace="ns", tp_size=1, rank=0)
+        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
     st = ReqState(
         block_hashes=[1, 2], snapshot_boundary=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))

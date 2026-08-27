@@ -82,7 +82,7 @@ def test_unknown_value_is_refused(monkeypatch):
 def _sched(source):
     return HybridRequestScheduler(
         [_group("attention")], store=None, hash_block_size=16,
-        namespace="ns", tp_size=1, rank=0, block_hash_source=source)
+        block_hash_source=source)
 
 
 def test_vllm_source_uses_the_engine_hashes():

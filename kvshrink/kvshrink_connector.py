@@ -85,10 +85,6 @@ logger = logging.getLogger(__name__)
 
 ReqId = str
 
-# Page-layout version: bump on any incompatible layout change so old
-# pages are never read under a new layout (input to compute_namespace).
-SCHEMA_VERSION = 4
-
 
 @dataclass
 class ReqMeta:
@@ -239,15 +235,13 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 # - ``tensor_key`` is the layer name, so layers never collide and a
 #   caller can wait for one layer while the others stream.
 # - ``chunk_id`` is the block's content hash.
-# - ``label`` is the namespace, and it is where everything the store does
-#   not otherwise know about must go. It carries the model namespace, the
-#   KV cache group and the TP rank: the store's own ``rank`` argument
-#   drives its management port and logs, NOT its keys, so two ranks
-#   sharing a label would overwrite each other's shards. Two groups
-#   sharing a label would be worse -- the same prefix hash exists in both
-#   groups, and the durability record is keyed by ``(label, chunk_id)``
-#   without the layer, so they would be tracked as one unit despite having
-#   different lifetimes.
+# - ``label`` is per KV cache group (``g{idx}``): the same prefix hash
+#   exists in every group, and the durability record is keyed by
+#   ``(label, chunk_id)`` without the layer, so groups sharing a label
+#   would be tracked as one unit despite having different lifetimes and
+#   state kinds. Cross-rank isolation needs no key component: each rank
+#   persists to its own ``{model}_rank{r}`` directory, and the
+#   controller opens only the rank0 one.
 #
 # Why the whole group goes in one call
 # ------------------------------------
@@ -259,14 +253,13 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 # to publish and therefore nothing that can dangle.
 
 
-def group_label(namespace: str, group_idx: int, rank: int) -> str:
-    """Store namespace for one group's block space on one rank.
+def group_label(group_idx: int) -> str:
+    """Store label for one group's block space.
 
-    Underscore-separated because the store validates label components
-    and rejects its own separator; see the section comment above for why
-    all three parts must be present.
+    Colon-free because the store splits full labels on ':'; see the
+    section comment above for why one label per group is required.
     """
-    return f"{namespace}_g{int(group_idx)}_r{int(rank)}"
+    return f"g{int(group_idx)}"
 
 
 def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
@@ -284,8 +277,7 @@ def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
     """
     try:
         present = store.has([key.hash_str],
-                            label=group_label(key.namespace,
-                                              key.group_idx, key.rank))
+                            label=group_label(key.group_idx))
         return bool(present and present[0])
     except Exception:  # pragma: no cover - fail closed to MISS
         logger.exception("lookup error; treating as MISS")
@@ -505,14 +497,12 @@ class CacheKey:
     """Logical key for one page, or for a whole boundary.
 
     A boundary is the same key with ``layer_name == ""``; it names the
-    group's blocks at that hash rather than one layer's page. The
-    namespace already encodes the model identity, cache dtype and TP
-    size (see ``compute_namespace``), so namespace, rank, hash and
-    group are the whole identity -- no two distinct states can share an
-    address.
+    group's blocks at that hash rather than one layer's page. Group,
+    hash and layer are the whole identity: each rank persists to its
+    own store directory, so no rank component is needed (and within
+    one directory, one label per group keeps the two address spaces
+    apart).
     """
-    namespace: str
-    rank: int
     block_hash: object  # int (unit tests) or bytes/str (vLLM)
     group_idx: int
     layer_name: str  # "" addresses the boundary, not one layer
@@ -526,18 +516,17 @@ class CacheKey:
         return str(h)
 
     @property
-    def boundary_key(self) -> tuple[str, int, str, int]:
-        """Isolation-safe identity for a boundary (namespace/rank/hash/group)."""
-        return (self.namespace, self.rank, self.hash_str, self.group_idx)
+    def boundary_key(self) -> tuple[str, int]:
+        """Identity of a boundary: hash and group."""
+        return (self.hash_str, self.group_idx)
 
 
-def make_boundary_key(namespace: str, rank: int,
-                      group_idx: int, block_hash: object) -> "CacheKey":
+def make_boundary_key(group_idx: int,
+                      block_hash: object) -> "CacheKey":
     """A group's key at one block hash, with no layer: the address the
     hit policy asks about and the address the save/load builders expand
     into per-layer page keys."""
     return CacheKey(
-        namespace=namespace, rank=rank,
         block_hash=block_hash, group_idx=group_idx, layer_name="")
 
 
@@ -632,25 +621,6 @@ def validate_codec_env() -> None:
         "GDN/Mamba layers: state pages are stored as opaque bytes, so the "
         "truncation would corrupt the recurrent state itself and produce "
         "wrong output with no error. Set IAXL_KV_LOSSY_TRUNC=0.")
-
-
-def compute_namespace(
-    model_id: str,
-    model_revision: str,
-    tokenizer_revision: str,
-    cache_dtype: str,
-    kv_schema_version: int,
-    tp_size: int,
-) -> str:
-    """Stable cache namespace: sha256 over model identity, cache dtype,
-    schema version and tp size, truncated to 16 hex chars. The schema
-    version is an input so that changing the page layout renames the
-    namespace, rather than reading old pages under the new layout."""
-    raw = "|".join([
-        model_id, model_revision, tokenizer_revision, cache_dtype,
-        str(kv_schema_version), str(tp_size),
-    ])
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def _spec_kind(spec: object) -> str:
@@ -976,7 +946,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     knowledge of which they are serving.
 
     A recurrent group changes nothing about how bytes are stored: every
-    group is a block space in one store, told apart by its namespace.
+    group is a block space in one store, told apart by its label.
     """
 
     @classmethod
@@ -1015,7 +985,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Scheduler-side planning state (harmless on the worker role,
         # which never receives scheduler hooks). Everything planned
-        # against -- groups, namespaces, hash granularity -- is built
+        # against -- groups, labels, hash granularity -- is built
         # once in _init_kv_stack; mutating bookkeeping starts empty.
         self._req_states: dict[str, ReqState] = {}
         # Async requests whose load plan has not been emitted yet. See
@@ -1084,10 +1054,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # other's shards.
             rank = pc.rank
         else:
-            # Scheduler-side keys are always rank 0; each worker verifies
-            # its own shard through its own store.
+            # Scheduler keys carry no rank: each process talks to its
+            # own per-rank store directory, and the controller opens
+            # the rank0 one.
             rank = 0
-        cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
         # Block-hash granularity, per v0.23.0's resolve_kv_cache_block_sizes:
@@ -1097,15 +1067,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                               for g in kv_cache_config.kv_cache_groups})
         hash_block_size = math.gcd(*block_sizes)
         self._hash_block_size = hash_block_size
-        self._namespace = compute_namespace(
-            model_id=model_config.model,
-            model_revision=model_config.revision or "",
-            tokenizer_revision=str(
-                model_config.tokenizer_revision or ""),
-            cache_dtype=cache_config.cache_dtype,
-            kv_schema_version=SCHEMA_VERSION,
-            tp_size=tp_size,
-        )
         # Fail-closed: a lossy codec would corrupt GDN state (see the
         # function for why this path cannot tolerate what the
         # attention-only path is designed to).
@@ -1161,11 +1122,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self._canon = Canonicalizer(layer_infos, num_blocks)
-            # Store namespace per group (see the lookup-vocabulary
-            # section for why group and rank must be part of it).
-            self._labels = [
-                group_label(self._namespace, g.group_idx, rank)
-                for g in groups]
+            # One store label per group (see the lookup-vocabulary
+            # section for why groups cannot share one).
+            self._labels = [group_label(g.group_idx) for g in groups]
             # layer_name -> group idx, every cached layer.
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -1176,10 +1135,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, %d groups, %d layers, "
-            "hash_block_size=%d, namespace=%s, tp=%d rank=%d)",
+            "hash_block_size=%d, tp=%d rank=%d)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            len(groups), len(layer_infos), hash_block_size,
-            self._namespace, tp_size, rank)
+            len(groups), len(layer_infos), hash_block_size, tp_size, rank)
         logger.info(
             "kvshrink groups: %s",
             [(g.group_idx, g.kind, g.block_size) for g in groups])
@@ -2123,23 +2081,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
-        """This rank's boundary key for one group at one block hash."""
-        return make_boundary_key(self._namespace, self._rank,
-                                 group.group_idx, block_hash)
+        """Boundary key for one group at one block hash."""
+        return make_boundary_key(group.group_idx, block_hash)
 
     def _present(self, group_idx: int, block_hash: object) -> bool:
         """Store-presence predicate handed to the hit policy, which
         plans against boundary addresses without seeing store details."""
         return lookup_boundary(
             self.kvstore,
-            make_boundary_key(self._namespace, self._rank,
-                              group_idx, block_hash))
+            make_boundary_key(group_idx, block_hash))
 
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
-        """Expand a boundary key to ONE layer's page key: same
-        namespace/rank/hash/group as the boundary, plus the layer
-        name. This is the exact page address the worker must move."""
+        """Expand a boundary key to ONE layer's page key: same hash and
+        group as the boundary, plus the layer name. This is the exact
+        page address the worker must move."""
         return replace(boundary_key, layer_name=layer_name)
 
     ############################################################
@@ -2283,7 +2239,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._mamba_save_segments = segments
         logger.info(
             "kvshrink hybrid worker registered: %d layers, %d attention "
-            "hook points, %d recurrent layers (namespace tp=%d rank=%d)",
+            "hook points, %d recurrent layers (tp=%d rank=%d)",
             len(self._layer_infos), len(self._attn_order),
             len(self._mamba_layers), self.tp_size, self._rank)
 
@@ -2295,15 +2251,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 f"{type(metadata).__name__}; expected "
                 "KVShrinkConnectorMetadata")
         return metadata
-
-    def _worker_key(self, key: CacheKey) -> CacheKey:
-        """Remap a scheduler-built key (rank 0) to this worker's own
-        rank: each TP rank persists and loads its OWN shard under its
-        own rank path. Without this, TP>1 workers overwrite each
-        other's pages under the shared rank-0 key."""
-        if key.rank == self._rank:
-            return key
-        return replace(key, rank=self._rank)
 
     # ------------------------------------------------------------------
     # store transfers
@@ -2545,11 +2492,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> dict[tuple[str, int, int, str, int], _SaveCandidate]:
         """Batch-level boundary candidates with cross-request dedup.
         Returns boundary_key -> accumulated per-layer pages."""
-        candidates: dict[tuple[str, int, int, str, int], _SaveCandidate] = {}
+        candidates: dict[tuple[str, int], _SaveCandidate] = {}
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
-                    key = self._worker_key(key)
                     cand = candidates.get(key.boundary_key)
                     if cand is None:
                         cand = _SaveCandidate(op.group_idx)
@@ -2682,7 +2628,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
         for bkey, cand in candidates.items():
-            _, _, blk_hash, g_idx = bkey
+            blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
             if sorted(cand.pages) != expected:
                 # A partial boundary is skipped (the scheduler's
