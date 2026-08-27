@@ -427,6 +427,5 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     assert len(mamba_op.keys) == 2, mamba_op
     assert all(k.block_hash == 0 for k in mamba_op.keys)
     assert set(mamba_op.gpu_block_ids) == {8}
-    assert mamba_op.snapshot_boundary_tokens == 544
 
 

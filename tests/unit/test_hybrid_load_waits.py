@@ -91,14 +91,13 @@ def _worker(store=None, order=ORDER, gdn=None):
     return w
 
 
-def _load_meta(layers, group_idx, boundary=None, req_id="r1"):
+def _load_meta(layers, group_idx, req_id="r1"):
     """One load op covering ``layers`` for a single block."""
     keys = tuple(CacheKey(namespace="ns", tp_size=1, rank=0,
                           block_hash=7, group_idx=group_idx,
                           layer_name=ln) for ln in layers)
     op = GroupTransferMeta(group_idx=group_idx, keys=keys,
-                           gpu_block_ids=(5,) * len(layers),
-                           snapshot_boundary_tokens=boundary)
+                           gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
     md.add_request(req_id, group_ops=(op,))
     return type("M", (), {"reqs_to_load": md})
@@ -139,7 +138,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
     that reaches forward unrestored is silent output corruption."""
     be = _FakeStore()
     w = _worker(be)
-    w.start_load(_load_meta(GDN, 1, boundary=16))
+    w.start_load(_load_meta(GDN, 1))
     assert sorted(be.submitted) == sorted(GDN), be.submitted
     assert sorted(be.waited) == sorted(GDN), be.waited
     assert w._load_tasks == {}
@@ -152,7 +151,7 @@ def test_attention_pages_stay_pipelined():
     w = _worker(be)
     meta = _load_meta(ATTN, 0)
     meta.reqs_to_load.requests.update(
-        _load_meta(GDN, 1, boundary=16, req_id="r2").reqs_to_load.requests)
+        _load_meta(GDN, 1, req_id="r2").reqs_to_load.requests)
     w.start_load(meta)
     # GDN waited already; no attention layer has been waited yet
     assert sorted(be.waited) == sorted(GDN), be.waited
@@ -174,4 +173,4 @@ def test_failed_blocking_wait_raises():
     be.get_wait = _boom
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
-        w.start_load(_load_meta(GDN, 1, boundary=16))
+        w.start_load(_load_meta(GDN, 1))

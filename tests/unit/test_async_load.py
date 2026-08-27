@@ -93,8 +93,7 @@ def _meta(async_layers, req_id="r1"):
                               block_hash=7, group_idx=gidx,
                               layer_name=ln) for ln in layers)
         return GroupTransferMeta(
-            group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers),
-            snapshot_boundary_tokens=64 if gidx == 1 else None)
+            group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
     md.add_request(req_id, group_ops=(op(0, ATTN), op(1, GDN)),
                    is_async=True, async_load_layers=async_layers)
