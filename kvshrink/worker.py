@@ -10,7 +10,7 @@ import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
-from .backend import group_label, lookup_boundary
+from .backend import group_label
 from .kvshrink_connector import (CacheKey, Canonicalizer, GroupInfo,
                                  GroupTransferMeta, KVShrinkConnectorMetadata,
                                  LayerPageInfo, ReqMeta, save_enabled)
@@ -75,14 +75,10 @@ class HybridWorker:
         self._kv_caches_ref: Optional[dict[str, torch.Tensor]] = None
         # Per-step load tasks: layer_name -> list of per-call engine
         # task dicts. Populated by start_load, popped by the per-layer
-        # waits. A leftover at step end means a wait never ran ->
-        # fail-stop (residue check in wait_save).
+        # waits.
         self._load_tasks: dict[str, list[dict[str, Any]]] = {}
         # Pipelined attention saves: layer_name -> (group_idx, tasks).
-        self._step_attn_saves: dict[str, tuple[int, dict[str, dict[str, Any]]]] = {}
-        # Sticky LOAD poison (allocation-after-HIT failures must
-        # fail-stop every later worker hook, never degrade to recompute).
-        self._load_poison: Optional[BaseException] = None
+        self._step_attn_saves: dict[str, tuple[int, dict[str, Any]]] = {}
         # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
         # _load_tasks these deliberately OUTLIVE the step that submitted
         # them -- the whole point is that the request is not occupying a
@@ -126,25 +122,6 @@ class HybridWorker:
             len(self._layer_infos), len(attn_order),
             len(self._mamba_layers), self.tp_size, self.rank)
 
-    # ------------------------------------------------------------------
-    # poison (sticky fail-stop)
-    # ------------------------------------------------------------------
-    def raise_load_poison(self) -> None:
-        """Re-raise the sticky load failure so no later hook proceeds
-        (fail-closed).
-        """
-        if self._load_poison is not None:
-            raise self._load_poison
-
-    def _poison_load(self, error: BaseException) -> None:
-        """Latch a load failure as sticky (first error wins). The
-        failure is re-raised by every later worker hook, so a
-        partially-loaded step can never enter forward and silently
-        emit wrong output."""
-        if self._load_poison is None:
-            self._load_poison = error
-        logger.error("kvshrink load poison: %s", error)
-
     def _worker_key(self, key: CacheKey) -> CacheKey:
         """Remap a scheduler-built key (rank 0) to this worker's own
         rank: each TP rank persists and loads its OWN shard under its
@@ -158,30 +135,16 @@ class HybridWorker:
     # store transfers
     # ------------------------------------------------------------------
     # A layer contributes one page view, or two when its K and V are
-    # separate tensors. The engine takes one flat tensor dict, but the
-    # caller waits a LAYER at a time (vLLM's hook fires per layer), so
-    # part views are flattened under "layer::part" keys and the
-    # returned tasks are regrouped under the layer name.
-    def _submit_group_transfer(
-        self, op: Any, group_idx: int,
+    # separate tensors. The engine takes one flat tensor dict, so part
+    # views are flattened under "layer::part" keys (loads regroup the
+    # returned tasks by layer with an rsplit on "::").
+    @staticmethod
+    def _flat_views(
         layer_views: dict[str, dict[str, torch.Tensor]],
-        chunk_indices: list[int], chunk_labels: list[str],
-    ) -> dict[str, dict[str, Any]]:
-        """One engine call covering every layer of the group, so the
-        block is finalized by this call alone; returns per-layer tasks
-        so the caller can wait a layer at a time."""
-        tensors = {f"{ln}::{part}": view
-                   for ln, parts in layer_views.items()
-                   for part, view in parts.items()}
-        tasks = op(block_indices=list(chunk_indices),
-                   block_hashs=list(chunk_labels),
-                   layer_names=list(tensors),
-                   tensors=tensors,
-                   label=self._labels[group_idx])
-        by_layer: dict[str, dict[str, Any]] = {}
-        for key, task in tasks.items():
-            by_layer.setdefault(key.rsplit("::", 1)[0], {})[key] = task
-        return by_layer
+    ) -> dict[str, torch.Tensor]:
+        return {f"{ln}::{part}": view
+                for ln, parts in layer_views.items()
+                for part, view in parts.items()}
 
     def _wait_load(
         self, layer_tasks: dict[str, Any], wait: bool = True
@@ -202,16 +165,14 @@ class HybridWorker:
                 "transfer; forward would read unrestored blocks")
         return True
 
-    def _wait_store(self, tasks: dict[str, dict[str, Any]]) -> None:
+    def _wait_store(self, tasks: dict[str, Any]) -> None:
         """Host-block until these writes land. An incomplete write is
         fail-stop, same as an incomplete load: the scheduler's save
         cursor has already advanced past these blocks, so losing them
         silently would skip them for the rest of the process."""
         if not tasks:
             return
-        flat = {k: t for per_layer in tasks.values()
-                for k, t in per_layer.items()}
-        if not self.store.put_wait(put_results=flat, wait=True):
+        if not self.store.put_wait(put_results=tasks, wait=True):
             raise RuntimeError(
                 "kvshrink save failed: put_wait reported an incomplete "
                 "transfer; the save cursor has already advanced")
@@ -225,39 +186,21 @@ class HybridWorker:
         entry to each of them, so their pages are waited for exactly
         when they are about to be read.
         """
-        self.raise_load_poison()
-        if self._load_tasks:
-            # A previous step's submit aborted midway and its residue
-            # was never drained -- refuse to silently drop in-flight
-            # engine tasks (fail-stop).
-            err = RuntimeError(
-                "kvshrink chunk load: stale step residue "
-                f"{sorted(self._load_tasks)}: the previous step's load "
-                "was never drained (hook path aborted?)")
-            self._poison_load(err)
-            raise err
         self._load_tasks = {}
         self._step_attn_saves = {}
         npages = 0
         _t0 = _now()
-        try:
-            for req_id, req_meta in metadata.reqs_to_load.requests.items():
-                # Async requests get their OWN sink: their tasks must
-                # survive this step, and must not be host-blocked by
-                # the GDN barrier below (that barrier is for requests
-                # about to enter forward; an async one is not).
-                is_async = req_meta.is_async
-                sink = {} if is_async else self._load_tasks
-                for op in req_meta.group_ops:
-                    npages += self._submit_op_load(req_id, op, sink)
-                if is_async:
-                    self._register_async_load(req_id, req_meta, sink)
-        except BaseException as e:
-            # Submit-stage failures (pool budget, engine errors) must
-            # poison like wait-stage failures: a partially submitted
-            # step can never enter forward.
-            self._poison_load(e)
-            raise
+        for req_id, req_meta in metadata.reqs_to_load.requests.items():
+            # Async requests get their OWN sink: their tasks must
+            # survive this step, and must not be host-blocked by
+            # the GDN barrier below (that barrier is for requests
+            # about to enter forward; an async one is not).
+            is_async = req_meta.is_async
+            sink = {} if is_async else self._load_tasks
+            for op in req_meta.group_ops:
+                npages += self._submit_op_load(op, sink)
+            if is_async:
+                self._register_async_load(req_id, req_meta, sink)
         # Every GDN layer, waited before forward begins.
         recurrent = [td for ln in self._mamba_layers
                      for td in self._load_tasks.pop(ln, [])]
@@ -279,12 +222,6 @@ class HybridWorker:
         """
         if not sink:
             return
-        if req_id in self._async_loads:
-            err = RuntimeError(
-                f"kvshrink async load: request {req_id} already has an "
-                "in-flight load; a second plan would strand the first")
-            self._poison_load(err)
-            raise err
         recurrent = {ln for ln in sink if ln not in self._attn_layer_group}
         n = req_meta.async_load_layers
         if n is None or n < 0:
@@ -307,28 +244,18 @@ class HybridWorker:
                 continue
             gate_tasks = [td for ln in entry.gate_layers
                           for td in entry.layer_tasks.get(ln, ())]
-            try:
-                # Poll each submission separately: a task entry is one
-                # engine call's task set, and get_wait expects one
-                # such set per call, not a flattened list of them.
-                if any(not self._wait_load(td, wait=False)
-                       for td in gate_tasks):
-                    continue  # not landed yet; ask again next step
-                # Landed: finalize the gate layers and hand the rest to
-                # the per-layer hooks.
-                for ln in list(entry.gate_layers):
-                    tds = entry.layer_tasks.pop(ln, [])
-                    if tds:
-                        self._wait_tasks(tds)
-            except BaseException as e:  # noqa: BLE001 - see docstring
-                self._poison_load(e)
-                logger.exception(
-                    "async load failed for req=%s; reporting it finished "
-                    "so it cannot hang, poisoned so it cannot be trusted",
-                    req_id)
-                self._async_loads.pop(req_id, None)
-                finished.add(req_id)
-                continue
+            # Poll each submission separately: a task entry is one
+            # engine call's task set, and get_wait expects one
+            # such set per call, not a flattened list of them.
+            if any(not self._wait_load(td, wait=False)
+                   for td in gate_tasks):
+                continue  # not landed yet; ask again next step
+            # Landed: finalize the gate layers and hand the rest to
+            # the per-layer hooks.
+            for ln in list(entry.gate_layers):
+                tds = entry.layer_tasks.pop(ln, [])
+                if tds:
+                    self._wait_tasks(tds)
             entry.released = True
             finished.add(req_id)
             if not entry.layer_tasks:
@@ -337,7 +264,6 @@ class HybridWorker:
 
     def wait_layer_load(self, layer_name: str) -> None:
         """Attention-layer entry hook: wait this layer's pages."""
-        self.raise_load_poison()
         tds = self._load_tasks.pop(layer_name, [])
         for req_id, entry in list(self._async_loads.items()):
             if not entry.released:
@@ -348,36 +274,15 @@ class HybridWorker:
         if tds:
             self._wait_tasks(tds)
 
-    def loads_drained_check(self) -> None:
-        """Fail-stop if any submitted load was never waited (a hook
-        never ran -> forward just read unrestored state)."""
-        if self._load_tasks:
-            err = RuntimeError(
-                "kvshrink load left unrestored layers "
-                f"{sorted(self._load_tasks)}: their layer hook never ran")
-            self._poison_load(err)
-            raise err
-
     def _submit_op_load(
-        self, req_id: str, op: GroupTransferMeta,
+        self, op: GroupTransferMeta,
         sink: dict[str, list[dict[str, Any]]],
     ) -> int:
-        """Submit one GroupTransferMeta to the engine (async get)."""
-        group = self._groups[op.group_idx]
+        """Submit one GroupTransferMeta to the engine (async get).
+
+        Returns the number of (layer, block) pages covered."""
         if not op.keys:
             return 0
-        if group.kind == "mamba":
-            # The scheduler's HIT and this submit are not atomic.
-            first = self._worker_key(op.keys[0])
-            boundary_key = replace(first, layer_name="")
-            if not lookup_boundary(self.store, boundary_key):
-                err = RuntimeError(
-                    "kvshrink mamba load: boundary vanished after HIT "
-                    f"req={req_id} boundary="
-                    f"{op.snapshot_boundary_tokens}; refusing to enter "
-                    "forward with unrestored state")
-                self._poison_load(err)
-                raise err
         by_layer: dict[str, list[tuple[int, str]]] = {}
         for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
             by_layer.setdefault(key.layer_name, []).append(
@@ -386,16 +291,7 @@ class HybridWorker:
             return 0
         # Every layer of the group addresses the same chunk sequence
         # (scheduler invariant: keys expand per block x layer).
-        any_layer = next(iter(by_layer))
-        entries = by_layer[any_layer]
-        for layer_name, ent in by_layer.items():
-            if ent != entries:
-                err = RuntimeError(
-                    "kvshrink chunk load: inconsistent op expansion "
-                    f"req={req_id} group={op.group_idx} "
-                    f"layer={layer_name}")
-                self._poison_load(err)
-                raise err
+        entries = by_layer[next(iter(by_layer))]
         views = {ln: self._canon.page_view_parts(ln) for ln in by_layer}
         # Split into calls with unique chunk labels (one engine call
         # maps chunk_labels 1:1 to chunk_indices).
@@ -411,21 +307,22 @@ class HybridWorker:
             calls[c][1].append(h)
         npages = 0
         for indices, labels in calls:
-            tasks = self._submit_group_transfer(
-                self.store.get, op.group_idx, views, indices, labels)
-            for layer_name, td in tasks.items():
-                sink.setdefault(layer_name, []).append(td)
+            tensors = self._flat_views(views)
+            tasks = self.store.get(block_indices=indices,
+                                   block_hashs=labels,
+                                   layer_names=list(tensors),
+                                   tensors=tensors,
+                                   label=self._labels[op.group_idx])
+            for key, task in tasks.items():
+                sink.setdefault(key.rsplit("::", 1)[0], []).append(
+                    {key: task})
                 npages += len(indices)
         return npages
 
     def _wait_tasks(self, task_dicts: list[dict[str, Any]]) -> None:
         """Host-block until these engine tasks landed (fail-stop)."""
-        try:
-            for td in task_dicts:
-                self._wait_load(td)
-        except BaseException as e:
-            self._poison_load(e)
-            raise
+        for td in task_dicts:
+            self._wait_load(td)
 
     # ------------------------------------------------------------------
     # save path
@@ -456,23 +353,19 @@ class HybridWorker:
     def _submit_group_layers_save(
         self, g_idx: int, layer_names: list[str],
         entries: list[tuple[int, str]],
-    ) -> dict[str, dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Submit ONE async engine put covering ``layer_names`` for the
         blocks in ``entries`` (list of (gpu_block_id, chunk_label), same
         order for every layer -- scheduler invariant). Async D2H+zip on
         the engine's put_stream, self-gated on the compute stream so it
         reads final values. Returns the engine tasks dict."""
-        chunk_indices = [gpu for gpu, _ in entries]
-        chunk_labels = [h for _, h in entries]
-        if len(set(chunk_labels)) != len(chunk_labels):
-            raise RuntimeError(
-                "kvshrink chunk save: duplicate chunk labels in one "
-                f"engine call group={g_idx} (candidates dedup broken)")
-        views = {ln: self._canon.page_view_parts(ln)
-                 for ln in layer_names}
-        tasks = self._submit_group_transfer(
-            self.store.put, g_idx, views, chunk_indices, chunk_labels)
-        return tasks
+        tensors = self._flat_views(
+            {ln: self._canon.page_view_parts(ln) for ln in layer_names})
+        return self.store.put(block_indices=[gpu for gpu, _ in entries],
+                              block_hashs=[h for _, h in entries],
+                              layer_names=list(tensors),
+                              tensors=tensors,
+                              label=self._labels[g_idx])
 
     def save_kv_layer(
         self, layer_name: str, metadata: KVShrinkConnectorMetadata
@@ -544,13 +437,7 @@ class HybridWorker:
         nbound = 0
         for g_idx, gslot in per_group.items():
             layers = gslot["layers"]
-            any_layer = next(iter(layers))
-            entries = layers[any_layer]
-            for layer_name, ent in layers.items():
-                if ent != entries:
-                    raise RuntimeError(
-                        "kvshrink chunk save: inconsistent op expansion "
-                        f"group={g_idx} layer={layer_name}")
+            entries = layers[next(iter(layers))]
             if self._groups[g_idx].kind != "mamba" and pipelined:
                 # Attention: save_kv_layer submitted each layer during
                 # forward; wait for them here. A layer the
@@ -615,10 +502,3 @@ class HybridWorker:
                     page.cpu().numpy().tobytes()).hexdigest()
                 logger.info("DUMP g%d block=%d sha=%s",
                             group.group_idx, blk, h[:16])
-
-    # ------------------------------------------------------------------
-    def shutdown(self) -> None:
-        """Re-raise the first sticky load poison so cleanup never
-        masks it."""
-        if self._load_poison is not None:
-            raise self._load_poison

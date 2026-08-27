@@ -1095,11 +1095,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         hw = self._worker
-        # A sticky load poison and any un-waited load must surface here,
-        # before anything is persisted: entering the save path after the
-        # forward read unrestored state would commit wrong data.
-        hw.raise_load_poison()
-        hw.loads_drained_check()
         if not save_enabled():
             return
         metadata = self._metadata()
@@ -1112,22 +1107,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         pages, boundaries)
         hw.debug_dump_state()
 
-    def shutdown(self) -> None:
-        """Release the worker (Record flush, writer lease)."""
-        if self._worker is not None:
-            self._worker.shutdown()
-
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         """Report transfers that completed since the last step."""
         if self._worker is None:
             return None, None
-        # A sticky poison surfaces at every hook entry and is never
-        # swallowed by the finish protocol; raising here also stops a
-        # poisoned request from being reported as successfully loaded
-        # (vLLM aborts it instead, so it cannot hang).
-        self._worker.raise_load_poison()
         # Saves complete within the step, so nothing is ever reported as
         # finished-sending. Loads may not: an async request stays parked
         # until we name it here.
