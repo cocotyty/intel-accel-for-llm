@@ -94,13 +94,19 @@ def HybridWorker(groups, layer_infos, namespace, canonicalizer,
     conn.kvstore = None
     conn._layer_names = []
     conn._load_tasks = {}
-    conn._step_attn_saves = {}
     conn._async_loads = {}
+    conn._layer_group = {
+        ln: g.group_idx for g in groups for ln in g.layer_names}
     conn._attn_layer_group = {
         ln: g.group_idx for g in groups if g.kind != "mamba"
         for ln in g.layer_names}
     conn._mamba_layers = frozenset()
     conn._attn_order = ()
+    conn._mamba_save_segments = {}
+    conn._saved_layers = set()
+    conn._step_save_pages = 0
+    conn._current_put_tasks = {}
+    conn._deferred_finished_req_ids = set()
     conn._connector_metadata = None
     return conn
 
