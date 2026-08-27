@@ -38,9 +38,6 @@ git -C "$FULL" show main:README.md > README.md
 git -C "$FULL" show main:doc/design/kvshrink.md > doc/design/kvshrink.md
 
 python3 "$FULL/dev/trim_docstrings.py" \
-    kvshrink/backend.py \
-    kvshrink/kvshrink_connector.py \
-    kvshrink/scheduler.py \
-    kvshrink/worker.py
+    kvshrink/kvshrink_connector.py
 
 echo "slim tree regenerated at $SLIM"
