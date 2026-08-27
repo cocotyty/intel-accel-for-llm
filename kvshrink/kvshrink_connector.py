@@ -2710,8 +2710,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._metadata()
         segment = self._mamba_save_segments.get(layer_name)
         if segment:
-            self._submit_layers_save(
-                self._layer_group[segment[0]], list(segment), metadata)
+            # A segment mixes groups (execution order interleaves the
+            # three mamba groups); each group's layers go under their
+            # own store label.
+            by_group: dict[int, list[str]] = {}
+            for ln in segment:
+                by_group.setdefault(self._layer_group[ln], []).append(ln)
+            for seg_g_idx, seg_layers in by_group.items():
+                self._submit_layers_save(seg_g_idx, seg_layers, metadata)
         self._submit_layers_save(
             self._attn_layer_group[layer_name], [layer_name], metadata)
 
