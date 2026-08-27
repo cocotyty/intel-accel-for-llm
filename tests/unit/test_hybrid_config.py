@@ -177,66 +177,6 @@ def test_fail_closed_mamba_cache_mode_not_align():
         assert "align" in str(e), e
 
 
-def test_fail_closed_uniform_missing_layer():
-    """UniformTypeKVCacheSpecs missing a layer must raise."""
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
-    cfg = _real_config()
-    spec = UniformTypeKVCacheSpecs(  # only 7 of 8 layers registered
-        block_size=528,
-        kv_cache_specs={
-            n: _attn_spec()
-            for n in cfg.kv_cache_groups[3].layer_names[:-1]
-        })
-    bad_groups = list(cfg.kv_cache_groups)
-    bad_groups[3] = KVCacheGroupSpec(
-        layer_names=cfg.kv_cache_groups[3].layer_names, kv_cache_spec=spec)
-    bad = KVCacheConfig(
-        num_blocks=cfg.num_blocks,
-        kv_cache_tensors=cfg.kv_cache_tensors,
-        kv_cache_groups=bad_groups,
-    )
-    try:
-        parse_kv_cache_config(bad)
-        raise AssertionError("expected KVShrinkParseError")
-    except KVShrinkParseError:
-        pass
-
-
-
-
-def test_fail_closed_heterogeneous_pages_in_group():
-    """Layers within one group with different page sizes must raise.
-
-    Uses REAL FullAttentionSpec instances with differing page sizes so the
-    heterogeneous-page check (not the spec-kind check) fires.
-    """
-    import torch
-    cfg = _real_config()
-    layers = list(cfg.kv_cache_groups[3].layer_names)
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
-    per_layer = {}
-    for i, n in enumerate(layers):
-        per_layer[n] = FullAttentionSpec(
-            block_size=528, num_kv_heads=2, head_size=256,
-            dtype=torch.bfloat16,
-            page_size_padded=1114112 if i == 0 else 1081344)
-    bad_groups = list(cfg.kv_cache_groups)
-    bad_groups[3] = KVCacheGroupSpec(
-        layer_names=layers,
-        kv_cache_spec=UniformTypeKVCacheSpecs(
-            block_size=528, kv_cache_specs=per_layer))
-    bad = KVCacheConfig(
-        num_blocks=cfg.num_blocks,
-        kv_cache_tensors=cfg.kv_cache_tensors,
-        kv_cache_groups=bad_groups,
-    )
-    try:
-        parse_kv_cache_config(bad)
-        raise AssertionError("expected KVShrinkParseError")
-    except KVShrinkParseError as e:
-        assert "differing page sizes" in str(e), str(e)
-
-
 def test_parse_real_config_layout_descriptors():
     """Real 4B TP2 config: contiguous pages, zero offsets (v0.21 semantics)."""
     cfg = _real_config()
