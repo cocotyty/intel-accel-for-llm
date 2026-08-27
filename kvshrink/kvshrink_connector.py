@@ -743,9 +743,12 @@ class _AsyncLoad:
 @dataclass
 class _SaveCandidate:
     """One boundary's pages accumulated across this step's save plans
-    (cross-request dedup by boundary key)."""
+    (cross-request dedup by boundary key). ``req_ids`` tracks every
+    contributing request: the put reads their GPU blocks, so their
+    block freeing is deferred until the write lands."""
     group_idx: int
     pages: dict[str, tuple[CacheKey, int]] = field(default_factory=dict)
+    req_ids: set[str] = field(default_factory=set)
 
 
 ############################################################
@@ -826,8 +829,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # waited and popped per layer -- GDN layers as one barrier in
         # start_load, attention layers at their forward-entry hooks.
         self._load_tasks: dict[str, Task] = {}
-        # Pipelined attention saves: layer_name -> (group_idx, tasks).
-        self._step_attn_saves: dict[str, tuple[int, dict[str, Task]]] = {}
         # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
         # _load_tasks these deliberately OUTLIVE the step that submitted
         # them -- the whole point is that the request is not occupying a
@@ -836,6 +837,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # schedule the request again) and then drained (its remaining
         # layers waited by the per-layer hooks during that forward).
         self._async_loads: dict[str, "_AsyncLoad"] = {}
+        # layer_name -> group idx, every cached layer.
+        self._layer_group: dict[str, int] = {}
         # attention layer_name -> group idx (mamba layers map out).
         self._attn_layer_group: dict[str, int] = {}
         # All GDN layer names, waited as one barrier in start_load
@@ -845,6 +848,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Attention layers in model execution order, used by the async
         # release gate ("the first N layers" means nothing otherwise).
         self._attn_order: tuple[str, ...] = ()
+        # Save pipelining (see the Worker Side banner): attention layer
+        # -> the mamba layers that precede it since the previous
+        # attention layer, submitted at that layer's save hook.
+        self._mamba_save_segments: dict[str, tuple[str, ...]] = {}
+        # Layers whose save was already submitted this step.
+        self._saved_layers: set[str] = set()
+        self._step_save_pages: int = 0
+        # Async save lifecycle (same shape as main): put tasks per
+        # contributing request, drained in get_finished; finished
+        # requests are held until their loads AND saves have landed.
+        self._current_put_tasks: dict[str, list[dict[str, Task]]] = {}
+        self._deferred_finished_req_ids: set[str] = set()
 
         if kv_cache_config is not None:
             self._init_kv_stack(vllm_config, role, kv_cache_config)
@@ -947,6 +962,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._labels = [
                 group_label(self._namespace, g.group_idx, rank)
                 for g in groups]
+            self._layer_group = {
+                ln: g.group_idx for g in groups for ln in g.layer_names}
             self._attn_layer_group = {
                 ln: g.group_idx for g in groups if g.kind != "mamba"
                 for ln in g.layer_names}
@@ -1352,15 +1369,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        # Saves are SYNCHRONOUS (wait_for_save writes every page
-        # inside the step), so no in-flight job
-        # can still reference these blocks and vLLM may free them
-        # immediately. Returning True would promise a get_finished()
-        # ack that never comes -- a deterministic block leak.
-        # Committed boundaries are content-addressed and outlive the
-        # request; they are never deleted here.
+        # True = defer freeing to get_finished(): async puts (and an
+        # in-flight async load) may still be reading these blocks, so
+        # the worker names the request in finished_sending once they
+        # land. Committed boundaries are content-addressed and outlive
+        # the request; they are never deleted here.
         self.on_request_finished(request.request_id)
-        return False, None
+        return True, None
 
     def request_finished_all_groups(
         self,
@@ -1749,13 +1764,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     # runs before start_load_kv, so a CURR write during forward is always
     # safe and a PREV write would be dead work.
     #
-    # Save path
-    # ---------
-    # Attention groups save PIPELINED: ``save_kv_layer`` submits each
-    # layer's async D2H+zip at that layer's exit (the layer's pages for
-    # this step are final then). GDN groups save in ``wait_save`` (their
-    # state is final only post-forward). Waiting for every write happens
-    # in ``wait_save``.
+    # Save path (async lifecycle, same shape as main)
+    # ------------------------------------------------
+    # Puts are submitted as soon as the data is final and NEVER waited
+    # inside the step: attention layers (and the mamba segment preceding
+    # them) submit at the ``save_kv_layer`` hook, the trailing mamba
+    # segment and any unhooked layers submit in ``wait_for_save``, and
+    # every write drains in ``get_finished``. ``request_finished``
+    # defers block freeing until the worker reports the request there,
+    # so a block is never reused while a put is still reading it.
+    # Correctness of reading mamba state mid-forward: the put is
+    # self-gated on the compute stream, and in align mode a boundary
+    # slot is never rewritten by its owner afterwards (the curr pointer
+    # advances to the next slot).
     #
     # Fail-stop contract: any load/save anomaly raises (EngineCore
     # fatal). Silently dropping a save would lose a boundary permanently
@@ -1829,6 +1850,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             for ln in g.layer_names)
         self._attn_order = tuple(
             ln for ln in execution_order if ln in self._attn_layer_group)
+        # Save pipelining segments: the mamba layers between attention
+        # layer i-1 and attention layer i are final when i's save hook
+        # fires, so they ride that hook (the trailing segment is
+        # submitted by wait_for_save).
+        segments: dict[str, tuple[str, ...]] = {}
+        pending: list[str] = []
+        for ln in execution_order:
+            if ln in self._mamba_layers:
+                pending.append(ln)
+            elif ln in self._attn_layer_group and pending:
+                segments[ln] = tuple(pending)
+                pending = []
+        self._mamba_save_segments = segments
         logger.info(
             "kvshrink hybrid worker registered: %d layers, %d attention "
             "hook points, %d recurrent layers (namespace tp=%d rank=%d)",
@@ -1877,18 +1911,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 "kvshrink load failed: get_wait reported an incomplete "
                 "transfer; forward would read unrestored blocks")
 
-    def _wait_store(self, tasks: dict[str, Task]) -> None:
-        """Host-block until these writes land. An incomplete write is
-        fail-stop, same as an incomplete load: the scheduler's save
-        cursor has already advanced past these blocks, so losing them
-        silently would skip them for the rest of the process."""
-        if not tasks:
-            return
-        if not self.kvstore.put_wait(put_results=tasks, wait=True):
-            raise RuntimeError(
-                "kvshrink save failed: put_wait reported an incomplete "
-                "transfer; the save cursor has already advanced")
-
     # ------------------------------------------------------------------
     # load path
     # ------------------------------------------------------------------
@@ -1908,7 +1930,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         when they are about to be read.
         """
         self._load_tasks = {}
-        self._step_attn_saves = {}
+        self._saved_layers = set()
+        self._step_save_pages = 0
         npages = 0
         _t0 = _now()
         # Sync loads merge per group into ONE engine call per step;
@@ -2067,7 +2090,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Batch-level boundary candidates with cross-request dedup.
         Returns boundary_key -> accumulated per-layer pages."""
         candidates: dict[tuple[str, int, int, str, int], _SaveCandidate] = {}
-        for req_meta in metadata.reqs_to_save.requests.values():
+        for req_id, req_meta in metadata.reqs_to_save.requests.items():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     key = self._worker_key(key)
@@ -2076,6 +2099,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         cand = _SaveCandidate(op.group_idx)
                         candidates[key.boundary_key] = cand
                     cand.pages[key.layer_name] = (key, gpu_block_id)
+                    cand.req_ids.add(req_id)
         return candidates
 
     def _submit_group_layers_save(
@@ -2095,6 +2119,41 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                 tensors=tensors,
                                 label=self._labels[g_idx])
 
+    def _track_put(self, tasks: dict[str, Task], req_ids: set[str]) -> None:
+        """Attribute one submitted put to every request whose GPU blocks
+        it reads; get_finished defers those requests' block freeing
+        until the write lands (same contract as main)."""
+        for rid in req_ids:
+            self._current_put_tasks.setdefault(rid, []).append(tasks)
+
+    def _submit_layers_save(
+        self, g_idx: int, layer_names: list[str],
+        metadata: KVShrinkConnectorMetadata,
+    ) -> None:
+        """Submit ONE async engine put covering ``layer_names`` of one
+        group for this step's complete boundary candidates. No waiting:
+        the tasks join ``_current_put_tasks`` and drain in
+        get_finished. Partial-boundary candidates are skipped here
+        exactly as submit_saves skips them."""
+        expected = sorted(self._groups[g_idx].layer_names)
+        entries: list[tuple[int, str]] = []
+        req_ids: set[str] = set()
+        for cand in self._gather_save_candidates(metadata).values():
+            if cand.group_idx != g_idx:
+                continue
+            if sorted(cand.pages) != expected:
+                continue  # partial boundary: skipped at submit time too
+            key, gpu_block_id = cand.pages[layer_names[0]]
+            entries.append((gpu_block_id, key.hash_str))
+            req_ids |= cand.req_ids
+        if not entries:
+            return
+        tasks = self._submit_group_layers_save(g_idx, layer_names,
+                                               entries)
+        self._track_put(tasks, req_ids)
+        self._saved_layers.update(layer_names)
+        self._step_save_pages += len(entries) * len(layer_names)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -2102,8 +2161,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """Pipelined attention save. vLLM calls this on exit of EVERY
-        attention layer during forward (kv_transfer_utils decorator).
+        """Pipelined save. vLLM calls this on exit of EVERY attention
+        layer during forward (kv_transfer_utils decorator).
         """
         if self._connector_metadata is None:
             return
@@ -2112,23 +2171,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not save_enabled():
             return
         metadata = self._metadata()
-        g_idx = self._attn_layer_group[layer_name]
-        expected = sorted(self._groups[g_idx].layer_names)
-        entries: list[tuple[int, str]] = []
-        for _bkey, cand in self._gather_save_candidates(metadata).items():
-            if cand.group_idx != g_idx:
-                continue
-            if sorted(cand.pages) != expected:
-                continue  # partial boundary: skipped at commit time too
-            if layer_name not in cand.pages:
-                continue
-            key, gpu_block_id = cand.pages[layer_name]
-            entries.append((gpu_block_id, key.hash_str))
-        if not entries:
-            return
-        tasks = self._submit_group_layers_save(g_idx, [layer_name],
-                                               entries)
-        self._step_attn_saves[layer_name] = (g_idx, tasks)
+        segment = self._mamba_save_segments.get(layer_name)
+        if segment:
+            self._submit_layers_save(
+                self._layer_group[segment[0]], list(segment), metadata)
+        self._submit_layers_save(
+            self._attn_layer_group[layer_name], [layer_name], metadata)
 
     def wait_for_save(self) -> None:
         if self.kvstore is None:
@@ -2140,25 +2188,24 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info("wait_for_save worker: reqs_to_save=%d",
                         len(metadata.reqs_to_save.requests))
-        pages, boundaries = self.wait_save(metadata)
+        pages, boundaries = self.submit_saves(metadata)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info("chunk_save: %d pages, %d boundaries",
                         pages, boundaries)
         self.debug_dump_state()
 
-    def wait_save(
+    def submit_saves(
         self, metadata: KVShrinkConnectorMetadata
     ) -> tuple[int, int]:
-        """Post-forward save: GDN groups submit here; attention groups
-        collect their pipelined tasks; then wait for the writes,
-        write every page of every group.
-        Fail-stop on any anomaly (the scheduler already advanced its
-        incremental indices). Returns (pages, boundaries)."""
-        _t0 = _now()
+        """Post-forward save SUBMISSION: every layer not already
+        pipelined through save_kv_layer (trailing mamba segment,
+        attention layers whose hook never fired) goes out here, one
+        engine put per group. Nothing is waited: the writes drain in
+        get_finished, which is also where finished requests' blocks are
+        released (the deferred-freeing contract, same as main).
+        Returns (pages, boundaries) submitted this step."""
         candidates = self._gather_save_candidates(metadata)
-        pipelined = os.getenv("KVSHRINK_SAVE_PIPELINED", "1") != "0"
-        # group the complete candidates for one engine put per group
-        per_group: dict[int, dict[str, list[tuple[int, str]]]] = {}
+        per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
         for bkey, cand in candidates.items():
             namespace, tp_size, rank, blk_hash, g_idx = bkey
@@ -2175,55 +2222,36 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     set(expected) ^ set(cand.pages))
                 continue
             nbound += 1
-            layers = per_group.setdefault(g_idx, {})
-            for layer_name in expected:
-                key, gpu_block_id = cand.pages[layer_name]
-                layers.setdefault(layer_name, []).append(
-                    (gpu_block_id, key.hash_str))
-        npages = 0
-        for g_idx, layers in per_group.items():
-            entries = layers[next(iter(layers))]
-            if self._groups[g_idx].kind != "mamba" and pipelined:
-                # Attention: save_kv_layer submitted each layer during
-                # forward; wait for them here. A layer the
-                # decorator never fired for is submitted now -- the
-                # plan must be fully covered either way.
-                for layer_name in layers:
-                    stashed = self._step_attn_saves.pop(layer_name, None)
-                    tasks = (stashed[1] if stashed is not None
-                             else self._submit_group_layers_save(
-                                 g_idx, [layer_name], entries))
-                    self._wait_store(tasks)
-            else:
-                tasks = self._submit_group_layers_save(
-                    g_idx, list(layers), entries)
-                self._wait_store(tasks)
-            chunk_indices = [gpu for gpu, _ in entries]
-            npages += len(chunk_indices) * len(layers)
+            blob = per_group.setdefault(g_idx, {"entries": [],
+                                                "req_ids": set()})
+            # entries are identical across a group's layers (same gpu
+            # block and hash per boundary, expanded per layer)
+            key, gpu_block_id = cand.pages[expected[0]]
+            blob["entries"].append((gpu_block_id, key.hash_str))
+            blob["req_ids"] |= cand.req_ids
+        for g_idx, blob in per_group.items():
+            remaining = [ln for ln in self._groups[g_idx].layer_names
+                         if ln not in self._saved_layers]
+            if not remaining:
+                continue
+            tasks = self._submit_group_layers_save(
+                g_idx, remaining, blob["entries"])
+            self._track_put(tasks, blob["req_ids"])
+            self._saved_layers.update(remaining)
+            self._step_save_pages += len(blob["entries"]) * len(remaining)
             # A block is finalized by its own write, with every layer of
-            # the group in one call, so it is committed the moment the
-            # write lands. There is no second phase to publish and
-            # therefore nothing that can outlive its data.
-        if self._step_attn_saves:
-            # Layers whose submit was never consumed by a group above
-            # (plan changed mid-step): wait them so pinned staging is
-            # released, then drop. Their data is identical to what the
-            # group path stored (same labels), so nothing is lost.
-            logger.warning(
-                "chunk_save: %d stashed layer saves unconsumed (%s); "
-                "draining", len(self._step_attn_saves),
-                sorted(self._step_attn_saves))
-            for _ln, (_g, tasks) in self._step_attn_saves.items():
-                self._wait_store(tasks)
-            self._step_attn_saves.clear()
-        if npages:
+            # the group accounted for in one step's submissions, so it
+            # is committed the moment the writes land. There is no
+            # second phase to publish and therefore nothing that can
+            # outlive its data.
+        if self._step_save_pages:
             # Counterpart of the start_load_kv line: without it a run
             # that saves nothing looks exactly like a healthy one.
             logger.info(
-                "chunk_save: %d pages stored, %d boundaries committed "
-                "elapsed_ms=%.3f (rank %d/%d)", npages, nbound,
-                (_now() - _t0) * 1e3, self._rank, self.tp_size)
-        return npages, nbound
+                "chunk_save: %d pages submitted, %d boundaries "
+                "(rank %d/%d)", self._step_save_pages, nbound,
+                self._rank, self.tp_size)
+        return self._step_save_pages, nbound
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -2231,11 +2259,36 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Report transfers that completed since the last step."""
         if self.kvstore is None:
             return None, None
-        # Saves complete within the step, so nothing is ever reported as
-        # finished-sending. Loads may not: an async request stays parked
-        # until we name it here.
-        recving = self.poll_finished_loads()
-        return None, (recving or None)
+        finished_recving = self.poll_finished_loads()
+
+        self._deferred_finished_req_ids.update(finished_req_ids)
+        completed: set[str] = set()
+        for req_id in self._deferred_finished_req_ids:
+            entry = self._async_loads.get(req_id)
+            if entry is not None:
+                # A request that finished with an async load still in
+                # flight: the blocks stay deferred until the transfer
+                # lands and is drained here (its layer hooks will never
+                # fire again).
+                tasks = entry.layer_tasks
+                if tasks and not self.kvstore.get_wait(
+                        get_results=tasks, wait=False):
+                    continue
+                self._wait_load(tasks)
+                self._async_loads.pop(req_id, None)
+
+            tasks = self._current_put_tasks.get(req_id)
+            if tasks is None:
+                completed.add(req_id)
+                continue
+            while tasks and self.kvstore.put_wait(tasks[0], wait=False):
+                tasks.pop(0)
+            if not tasks:
+                del self._current_put_tasks[req_id]
+                completed.add(req_id)
+
+        self._deferred_finished_req_ids.difference_update(completed)
+        return (completed or None), (finished_recving or None)
 
     # ------------------------------------------------------------------
     # debug dump
