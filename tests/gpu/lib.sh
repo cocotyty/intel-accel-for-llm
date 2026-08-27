@@ -166,14 +166,23 @@ gate_stop() {
 # exposes POST /v1/cache/persist per rank).
 gate_persist_cache() {
     local base="${IAXL_API_WORKER_BASE_PORT:-18800}"
-    local r
+    local r attempt resp
     for ((r = 0; r < GATE_TP; r++)); do
-        curl -sf -X POST "http://127.0.0.1:$((base + r))/v1/cache/persist" \
-            -H 'Content-Type: application/json' \
-            -d '{"count": 100000000}' >/dev/null || {
-            log "persist failed on rank $r"
-            return 1
-        }
+        # Saves are async (submitted in the step, landed by the engine
+        # afterwards, same lifecycle as main): give the in-flight puts a
+        # grace window, then keep persisting until a call reports nothing
+        # new, meaning staging has quiesced.
+        sleep 5
+        for ((attempt = 0; attempt < 30; attempt++)); do
+            resp=$(curl -sf -X POST "http://127.0.0.1:$((base + r))/v1/cache/persist" \
+                -H 'Content-Type: application/json' \
+                -d '{"count": 100000000}') || {
+                log "persist failed on rank $r"
+                return 1
+            }
+            [[ "$(sed -n 's/.*"persisted": \([0-9]*\).*/\1/p' <<<"$resp")" == "0" ]] && break
+            sleep 1
+        done
     done
 }
 

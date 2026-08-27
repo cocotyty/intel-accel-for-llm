@@ -46,7 +46,7 @@ FIRST_OUT="$(gate_completion "$PROMPT" "$MAX_TOKENS")"
 check "hybrid path active" \
     grep -q "kvshrink hybrid path enabled" "$LOG"
 check "first request saved boundaries" \
-    grep -qE "chunk_save: [1-9][0-9]* pages stored, [1-9][0-9]* boundaries" "$LOG"
+    grep -qE "chunk_save: [1-9][0-9]* pages submitted, [1-9][0-9]* boundaries" "$LOG"
 check "first request produced output" test -n "$FIRST_OUT"
 
 # --------------------------------------------- drop vLLM's own cache

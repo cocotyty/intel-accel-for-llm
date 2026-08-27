@@ -86,11 +86,11 @@ COLD_LOG="$GATE_LAST_LOG"
 check "hybrid path active" \
     grep -q "kvshrink hybrid path enabled" "$COLD_LOG"
 check "cold batched run saved boundaries" \
-    grep -qE "chunk_save: [1-9][0-9]* pages stored, [1-9][0-9]* boundaries" "$COLD_LOG"
+    grep -qE "chunk_save: [1-9][0-9]* pages submitted, [1-9][0-9]* boundaries" "$COLD_LOG"
 
 # The point of the gate: a step that commits more than one boundary.
 # Without this the run degenerated to sequential and proves nothing.
-if grep -qE "chunk_save: [1-9][0-9]* pages stored, ([2-9]|[1-9][0-9]+) boundaries" "$COLD_LOG"; then
+if grep -qE "chunk_save: [1-9][0-9]* pages submitted, ([2-9]|[1-9][0-9]+) boundaries" "$COLD_LOG"; then
     pass "a single step committed multiple boundaries (batching reached the save path)"
 else
     fail "no step committed more than one boundary: requests did not actually batch"
