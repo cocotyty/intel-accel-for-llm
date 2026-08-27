@@ -73,7 +73,7 @@ def _save_meta():
         keys=(_key("m0", blk_hash=888, g_idx=1),),
         gpu_block_ids=(20,))
     saves = RequestMetadata()
-    saves.add_request("r1", group_ops=(attn_ops, mamba_ops))
+    saves.requests["r1"] = ReqMeta(group_ops=(attn_ops, mamba_ops))
     return KVShrinkConnectorMetadata(reqs_to_save=saves)
 
 
@@ -187,7 +187,7 @@ def test_mamba_segment_splits_by_group():
         group_idx=2, keys=(_key("m1", blk_hash=999, g_idx=2),),
         gpu_block_ids=(21,))
     saves = RequestMetadata()
-    saves.add_request("r1", group_ops=(attn_ops, m0_ops, m1_ops))
+    saves.requests["r1"] = ReqMeta(group_ops=(attn_ops, m0_ops, m1_ops))
     c.bind_connector_metadata(KVShrinkConnectorMetadata(reqs_to_save=saves))
     c.save_kv_layer("a0", None, None)
     by_label = {l: layers for l, layers, _h in c.kvstore.submits}

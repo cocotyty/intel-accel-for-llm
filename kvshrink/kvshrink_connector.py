@@ -42,6 +42,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
@@ -198,21 +199,6 @@ class ReqState:
 @dataclass
 class RequestMetadata:
     requests: dict[ReqId, ReqMeta] = field(default_factory=dict)
-
-    def add_request(
-        self,
-        req_id: ReqId,
-        group_ops: tuple[GroupTransferMeta, ...] = (),
-        external_hit_tokens: int = 0,
-        is_async: bool = False,
-        async_load_layers: int = -1,
-    ) -> None:
-        self.requests[req_id] = ReqMeta(
-            group_ops,
-            external_hit_tokens,
-            is_async,
-            async_load_layers,
-        )
 
 
 @dataclass
@@ -374,15 +360,14 @@ class Canonicalizer:
                     0, dtype=torch.int8, device=raw.device
                 ).set_(raw.untyped_storage())
 
-            # FlashAttention split-K/V layout fix: a pure
-            # attention kv_cache is shaped [2, N, block_size, H, D] whose
-            # physical storage is [K block0..N-1][V block0..N-1]. A logical
-            # block's K and V are NOT contiguous, so a single flat
-            # (num_blocks, page_size) view with stride=page_size strides
-            # over TWO ADJACENT K blocks instead of block b's K+V. Detect
-            # the physical dim that holds num_blocks (same algorithm as
-            # vLLM's offloading worker) and, when K and V are split, keep a
-            # (k_view, v_view) pair of (num_blocks, half_page) views; each
+            # Split-K/V layout guard: when num_blocks lives in a
+            # NON-leading physical dim, a logical block's K and V are
+            # not adjacent in storage and a single flat
+            # (num_blocks, page_size) view with stride=page_size would
+            # stride over the WRONG bytes. Detect the physical dim that
+            # carries num_blocks (same algorithm as vLLM's offloading
+            # worker) and, when K and V are split, keep a (k_view,
+            # v_view) pair of (num_blocks, half_page) views; each
             # logical page is then K||V.
             if (not isinstance(raw, (list, tuple))
                     and self._is_split_kv_layout(raw, info)):
@@ -423,32 +408,21 @@ class Canonicalizer:
     def _is_split_kv_layout(
         raw: torch.Tensor, info: LayerPageInfo
     ) -> bool:
-        """True when num_blocks lives in a non-leading physical dim, i.e.
-        the K/V-split [2, N, ...] FlashAttention layout. Mirrors the
-        physical-to-logical stride mapping in vLLM's offloading worker."""
+        """True when num_blocks lives in a non-leading physical dim
+        (K/V-split layout). Mirrors the physical-to-logical stride
+        mapping in vLLM's offloading worker."""
         if raw.dim() < 2 or raw.shape[0] != 2:
             return False
         # logical num_blocks dim: find which logical dim equals num_blocks
         strides = raw.stride()
         physical_to_logical = sorted(
             range(len(strides)), key=lambda i: strides[i], reverse=True)
-        # the logical dim carrying num_blocks is dim 1 in [2, N, ...]
         try:
             logical_nb_dim = list(raw.shape).index(info.num_blocks)
         except ValueError:
             return False
         physical_pos = physical_to_logical.index(logical_nb_dim)
         return physical_pos != 0
-
-    def _page_parts(
-        self, layer_name: str, block_id: int
-    ) -> tuple[torch.Tensor, ...]:
-        """Physical tensor(s) holding logical block ``block_id``: a single
-        view for contiguous layouts, or (K, V) halves for split layouts."""
-        v = self._views[layer_name]
-        if isinstance(v, tuple):
-            return (v[0][block_id], v[1][block_id])
-        return (v[block_id],)
 
     def page_view_parts(self, layer_name: str) -> dict[str, torch.Tensor]:
         """Full-pool canonical page views for the KVFlow chunk engine.
@@ -459,24 +433,14 @@ class Canonicalizer:
         ``{"k": k_view, "v": v_view}`` (logical page = K||V); contiguous
         layouts (mamba state, packed attention) yield ``{"page": view}``.
 
-        This is the ONLY interface the KVFlow put/get path
-        needs -- the engine chunks along dim 0 with
-        ``chunk_indices = gpu block ids`` and writes/reads rows directly.
+        This is the ONLY interface the KVFlow put/get path needs -- the
+        engine chunks along dim 0 with ``chunk_indices = gpu block ids``
+        and writes/reads rows directly.
         """
         v = self._views[layer_name]
         if isinstance(v, tuple):
             return {"k": v[0], "v": v[1]}
         return {"page": v}
-
-    def get_page(self, layer_name: str, block_id: int) -> torch.Tensor:
-        """Single tensor for one logical page: the canonical view row,
-        or a concatenated K||V view for split-K/V layers. Used by the
-        read/zero paths."""
-        parts = self._page_parts(layer_name, block_id)
-        if len(parts) == 1:
-            return parts[0]
-        # split-K/V: return a concatenated K||V view for read/zero paths
-        return torch.cat([p.reshape(-1) for p in parts])
 
 def storage_size_bytes(t: torch.Tensor | list[torch.Tensor]) -> int:
     """Bytes of the underlying untyped storage for a kv_cache entry;
@@ -826,13 +790,6 @@ def save_enabled() -> bool:
             or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
 
 
-def _now() -> float:
-    """Monotonic clock for step-latency accounting: immune to NTP
-    steps, so measured durations are never negative."""
-    import time as _t
-    return _t.monotonic()
-
-
 # ======================================================================
 # longest-hit policy
 # ======================================================================
@@ -1107,8 +1064,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # attention layer_name -> group idx (mamba layers map out).
         self._attn_layer_group: dict[str, int] = {}
         # All GDN layer names, waited as one barrier in start_load
-        # before any attention layer runs (populated in
-        # _register_layer_caches).
+        # before any attention layer runs (populated in register).
         self._mamba_layers: frozenset[str] = frozenset()
         # Attention layers in model execution order, used by the async
         # release gate ("the first N layers" means nothing otherwise).
@@ -1731,11 +1687,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.num_computed_tokens + num_external_tokens)
         state.pending_load_tokens = num_external_tokens
         all_block_ids = blocks.get_block_ids()
-        for g_idx, group in enumerate(self._groups):
-            if g_idx >= len(all_block_ids):
-                continue
-            ids = list(all_block_ids[g_idx])
-            state.groups[g_idx].block_ids = ids
+        for g_idx, ids in enumerate(all_block_ids):
+            state.groups[g_idx].block_ids = list(ids)
         if (state.is_async and not state.async_plan_emitted
                 and num_external_tokens > 0):
             # This is the ONLY moment we hear about an async request.
@@ -2275,54 +2228,44 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     raise RuntimeError("FlashInfer is not supported")
                 break
 
-        if self._canon is not None:
-            self._register_layer_caches(kv_caches)
-
-            # The store is handed the canonical page views, not the raw
-            # tensors: every view is a (num_blocks, page_bytes) int8
-            # array whose dim-0 rows are blocks, which is the shape the
-            # transfer path uses for both attention and GDN. Raw tensors
-            # would not do -- a GDN layer is two tensors of different
-            # shape and dtype, and the engine requires one shape per
-            # call. Views are keyed per part because a split-K/V
-            # attention layer contributes two.
-            views = {
-                f"{ln}#{part}": view
-                for ln in self._layer_names
-                for part, view in self._canon.page_view_parts(ln).items()
-            }
-            self.kvstore = KVStore(
-                model_name=os.path.basename(self.model_config.model),
-                block_dim=0,
-                kv_caches=views,
-                # _rank, not self.rank: the latter comes from the world
-                # group, which reports 0 on every TP rank because the
-                # connector is built before distributed init. Two ranks
-                # claiming rank 0 collide on the management port and
-                # would overwrite each other's shards.
-                rank=self._rank,
-                tp_size=self.tp_size,
-            )
-            logger.info("Registered %d KV cache layers (%d page views)",
-                        len(kv_caches), len(views))
-
-    def _register_layer_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
-    ) -> None:
-        """Bind canonical page views, in model execution order.
-
-        The order matters to the async release gate, which holds a
-        request until its FIRST N layers have landed -- a statement
-        about position, not about names. The ``kv_caches`` dict does not
-        carry it: v0.23.0 builds it group by group
-        (``_kv_cache_spec_attn_group_iterator``), so mamba and attention
-        layers arrive in separate runs. We recover the order the way
-        vLLM's own ``bind_kv_cache`` does, from the layer index in the
-        layer name.
-        """
         from vllm.model_executor.models.utils import extract_layer_index
 
-        self.register(kv_caches, sorted(kv_caches, key=extract_layer_index))
+        # Execution order matters to the async release gate, which holds
+        # a request until its FIRST N layers have landed -- a statement
+        # about position, not about names. The ``kv_caches`` dict does
+        # not carry it: v0.23.0 builds it group by group
+        # (``_kv_cache_spec_attn_group_iterator``), so mamba and
+        # attention layers arrive in separate runs. We recover the order
+        # the way vLLM's own ``bind_kv_cache`` does, from the layer
+        # index in the layer name.
+        self.register(kv_caches,
+                      sorted(kv_caches, key=extract_layer_index))
+
+        # The store is handed the canonical page views, not the raw
+        # tensors: every view is a (num_blocks, page_bytes) int8
+        # array whose dim-0 rows are blocks, which is the shape the
+        # transfer path uses for both attention and GDN. Raw tensors
+        # would not do -- a GDN layer is two tensors of different
+        # shape and dtype, and the engine requires one shape per
+        # call. Views are keyed per part because a split-K/V
+        # attention layer contributes two.
+        views = self._flat_views(
+            {ln: self._canon.page_view_parts(ln)
+             for ln in self._layer_names})
+        self.kvstore = KVStore(
+            model_name=os.path.basename(self.model_config.model),
+            block_dim=0,
+            kv_caches=views,
+            # _rank, not self.rank: the latter comes from the world
+            # group, which reports 0 on every TP rank because the
+            # connector is built before distributed init. Two ranks
+            # claiming rank 0 collide on the management port and
+            # would overwrite each other's shards.
+            rank=self._rank,
+            tp_size=self.tp_size,
+        )
+        logger.info("Registered %d KV cache layers (%d page views)",
+                    len(kv_caches), len(views))
 
     def register(
         self,
@@ -2433,7 +2376,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._saved_layers = set()
         self._step_save_pages = 0
         npages = 0
-        _t0 = _now()
+        _t0 = time.monotonic()
         # Sync loads merge per group into ONE engine call per step;
         # duplicate labels across requests (two requests loading the
         # same external block into different GPU blocks) are fine --
@@ -2476,7 +2419,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 "start_load_kv: %d pages loaded "
                 "elapsed_ms=%.3f (rank %d/%d)", npages,
-                (_now() - _t0) * 1e3, self._rank, self.tp_size)
+                (time.monotonic() - _t0) * 1e3, self._rank, self.tp_size)
         return npages
 
     def _register_async_load(
@@ -2861,8 +2804,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if group.kind != "mamba":
                 continue
             ln = group.layer_names[0]
+            page_view = self._canon.page_view_parts(ln)["page"]
             for blk in range(10):
-                page = self._canon.get_page(ln, blk)
+                page = page_view[blk]
                 h = hashlib.sha256(
                     page.cpu().numpy().tobytes()).hexdigest()
                 logger.info("DUMP g%d block=%d sha=%s",
