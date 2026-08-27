@@ -83,7 +83,7 @@ def _worker(store=None, order=ORDER, gdn=None):
               _group(1, "mamba", gdn if gdn is not None
                      else [ln for ln in order if ln in GDN])]
     layer_infos = {ln: None for ln in order}
-    w = HybridWorker(groups, layer_infos, "ns",
+    w = HybridWorker(groups, layer_infos,
                      _FakeCanon(), rank=0, tp_size=1)
     w.kvstore = store or _FakeStore()
     w.register({ln: None for ln in order}, order)
@@ -92,8 +92,7 @@ def _worker(store=None, order=ORDER, gdn=None):
 
 def _load_meta(layers, group_idx, req_id="r1"):
     """One load op covering ``layers`` for a single block."""
-    keys = tuple(CacheKey(namespace="ns", rank=0,
-                          block_hash=7, group_idx=group_idx,
+    keys = tuple(CacheKey(block_hash=7, group_idx=group_idx,
                           layer_name=ln) for ln in layers)
     op = GroupTransferMeta(group_idx=group_idx, keys=keys,
                            gpu_block_ids=(5,) * len(layers))

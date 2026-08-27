@@ -68,34 +68,37 @@ Store 里每份数据有三个坐标 (label, chunk_id, tensor_key)：
 
 - `chunk_id` 是块的内容 hash；
 - `tensor_key` 是层名；
-- `label` 是命名空间，格式 `{namespace}_g{组号}_r{rank}`。
+- `label` 是组号，格式 `g{N}`。
 
-label 为什么必须有 namespace 和 g{组号}？不加 namespace，fp16 的缓
-存会被 bf16 当命中读走；不加组号，同一个前缀 hash 在 attention 组和
-mamba 组里代表不同状态，会被互相冒名顶替。r{rank} 的性质不同——跨
-rank 隔离其实靠的是别的东西（每个进程一个 store 实例、持久化目录和
-管理端口按构造参数 rank 分开），把它编进 label 是为了让"调度侧问的
-地址"和"worker 写的地址"由构造保证逐字节相等：controller 只打开
-rank0 那本账，所以查询永远落在 r0 标签上；worker 执行前把自己的
-rank 映射回去读写自己的账。
+为什么 label 必须带组号？因为存在性台账（Record）按 `(label,
+chunk_id)` 记账、不带层名：attention 组和三个 mamba 组住在同一本账
+里，同一个前缀 hash 在每个组都各有一份，不分组成一次落账会把别的组
+的存在性也标记成"有"，命中判定直接失真。而层与层之间不用分——数据
+键自带全模型唯一的层名。跨 rank 不需要任何键成分：每个 rank 持久化
+到自己的 `{model}_rank{r}` 目录，controller 只开 rank0 那本；同标签
+天然读写一致，连重映射函数都不需要。
 
-namespace 本身是 sha256(model, dtype, schema 版本, tp)[:16]。改动原
-因：以前还拼了个 pp_size 参数，但 pipeline 并行压根不支持（见下面
-PP 拒绝），这个参数永远是 1，纯误导。现在签名里没它了，取而代之的
-是在 `_init_kv_stack` 开头加了一刀：谁敢配 PP!=1 直接 RuntimeError。
-这不是多余检查——PP 会把模型的层切开到不同 rank，每个 rank 只有一
-半页面的字节，却拿着完整的 key 存取。不炸、不报错、静默错数据，正
-是原则 2 必须拦的那类事。speculative decoding 的拒绝也是同理同款。
+这个寻址方案是"对齐 main"的最终形态：main 用裸 basename 进目录、
+默认 "kv" 标签、零命名空间，我们只是把"一个默认标签"换成"每组一个
+标签"。曾经有一套 sha256 的 compute_namespace（把 model/dtype/tp/
+schema 版本拌进每个键），随同名独立 HybridStore 机制引入、机制删除后
+成了孤儿，最终整个删掉——它防御的 dtype/tp 串味场景 main 一直裸奔，
+单独给 hybrid 加锁不是本分支的职责。
+
+PP!=1 依然在 `_init_kv_stack` 开头显式拒绝（PP 把模型的层切开到不
+同 rank，每个 rank 只握半个模型的页却拿着完整的 key）。speculative
+decoding 同理同款。
 
 `lookup_boundary` 是"这个边界在不在店里"的一问。唯一一次故意吞异常
 发生在这里，而且方向想清楚了才吞的：**错的 hit 会污染输出（大锅），
 错的 miss 只赔一次重算（小钱）**，所以 store 打个喷嚏就一律当 MISS。
 别的任何地方出错都是直接炸。
 
-`CacheKey` 近期瘦了一圈：删掉了 tp_size 字段。tp 已经拌在 namespace
-的哈希里了，不同 tp 在 namespace 就分家了，key 里再带一份是不变的常
-量，白白让每个构造点多传个参数。身份就是四个真正区分东西的维度：
-(namespace, rank, hash, group)。
+`CacheKey` 最终形态：(block_hash, group_idx, layer_name)。曾经还有
+namespace / tp_size / rank 字段——namespace 整个机制删了见上；
+tp_size 是 namespace 哈希的恒常量影子；rank 编进 label 的唯一作用是
+让调度侧和 worker 的字符串在两边目录里各自相等，纯属自娱自乐，删掉
+后 worker 端的重映射函数 `_worker_key` 也一起陪葬了。
 
 --------------------------------------------------------------------
 ## 4. 解析和校验：把 vLLM 的配置翻译成我们的结构
@@ -252,8 +255,8 @@ get_finished（步骤间隙，每步一次，逐个检查写完了没）。任�
 | 手抄的视图平铺推导 | 和 _flat_views 一模一样，留一份 |
 | 注册三层委托 | 中间层纯粹转手，两层足够 |
 | split-K/V 注释里的旧布局 | v0.23 不是 [2,N,...]；算法本身没动 |
-| compute_namespace 的 pp_size 参数 | 恒为 1；PP 不支持则另有显式拒绝兜底 |
-| CacheKey.tp_size 字段 | tp 已在 namespace 里；恒常量字段无身份作用 |
+| compute_namespace 整个函数 | sha256 命名空间是已删 HybridStore 的孤儿；main 对 dtype/tp 串味裸奔，单独给 hybrid 上锁超出 GDN 范围 |
+| CacheKey 的 namespace/tp_size/rank 字段 | tp 已在 namespace 里；恒常量字段无身份作用；rank 编进 label 是两边目录各自相等的自娱自乐，连 _worker_key 一起删 |
 | __init__ 占位双写字段 | 每字段单一赋值点；构造缺 config 立刻在最短路径炸 |
 
 一句话总结删的标准：**没有一条删除碰到了"防静默错数据"的防线；被

@@ -53,55 +53,34 @@ build_resumed_load_meta    （预占恢复）
 
 这是全部分支改动最根本的部分，其余一切从这里长出来。
 
-## 1.1 store 键从两维变四维
+## 1.1 store 键从一维加一维：group label
 
-**main 怎么做**：键是 `(model_name, chunk_hash)` 层面的事——
-KVStore 默认 label + 内容 hash 就够了。同一个前缀 hash 全 engine 只有
-一份数据，`store.has(hash)` 就是问"这个前缀存过没"。
+**main 怎么做**：键是 `("kv", chunk_hash)` 层面的事——KVStore 默认
+label + 内容 hash 就够了。同一个前缀 hash 全 engine 只有一份数据，
+`store.has(hash)` 就是问"这个前缀存过没"。
 
-**我们怎么改**：每个 key 变成四维身份 `(namespace, rank, group_idx,
-hash)`，label 相应变成 `{namespace}_g{组}_r{rank}` 三段式。
+**我们怎么改**：label 变成 `g{组号}`，键 = (组, hash, 层名)。模型
+basename 进目录的方式与 main 逐字相同（裸 basename），没有 namespace。
 
-**为什么必须改**：
-- 同一个前缀 hash 在 attention 组和 mamba 组是**两种物理实体**——
-  一串 KV 页 vs 一个递归快照。不进 identity，两组互为冒名顶替者，
-  load 会把 mamba 快照写进 attention 页的位置，静默错数据。
-- durability 台账以 (label, chunk) 为单位记账，两组共 label 意味着
-  两份寿命不同的东西被当成一份管理。
-- namespace 把 model/dtype/schema 版本/tp 拌进哈希：fp16 写的页 bf16
-  不能当命中读、tp=2 和 tp=4 不能互读、layout 升级靠改名自动失效旧页。
+**为什么必须改**：唯一硬需求是"分组"。一本 store 账里现在住着四个
+组——一个 attention 加三个 mamba，同一个前缀 hash 在每个组各有一份
+实体；而存在性台账（Record）按 `(label, chunk)` 记账、**不带层名**，
+共享 label 时一组落账会把别的组的存在性也标成"有"，命中判定直接失
+真。层之间不用分：数据键自带全模型唯一的层名。跨 rank 同样不用分：
+每 rank 持久化到自己的 `{model}_rank{r}` 目录、controller 只开
+rank0 那本，同标签天然读写一致。
 
-**先回答一个自然的疑问：main 连自定义 label 都没有（用默认 "kv"），
-它凭什么没事？** 因为跨 rank 的隔离从来不靠键的内容，靠的是三个
-结构性机制，而 main 和我们用的是同一套：
+**为什么没有 namespace**：曾有，删了。sha256(model/dtype/tp/schema)
+拌进每个键的 compute_namespace 是随同名 HybridStore 机制引入的，机
+制后来整个删除，namespace 成了孤儿。main 对 dtype/tp 串味一直是裸
+奔姿态且被接受为既有取舍——单独给 hybrid 上锁不在 GDN 支持范围内；
+这是"最小增量"纪律的直接体现。中途还走过两个弯路也都拆掉了：
+`_worker_key` rank 重映射（两边目录不同，各自相等即可，函数纯多余）
+和 label 里的 r{rank} 段（同上，自娱自乐）。PP != 1 仍在创建期显式
+拒绝（PP 把层切开到 rank，页字节只剩半个模型的），speculative 同理。
 
-1. 每个进程一个 store 实例——易失层是进程内内存池，两个 rank 的键
-   物理上碰不到一起；
-2. KVStore 构造参数 `rank` 决定持久化目录 `{model}_rank{r}` 和管理
-   端口（kvstore.py:89-91）；
-3. v0.23 在分布式初始化完成之后才构造 worker 侧 connector
-   （gpu_worker.py 的 initialize_from_config -> ensure_kv_transfer_
-   initialized），所以 main 里取到的 world rank 是真值，第 2 条真的
-   能把两个 rank 分进不同目录。
-
-在此之上再加一个事实：纯 attention 只有一个组，一本账里只有一种地
-址空间，默认 label 不可能歧义。所以 main 的省略完全站得住。
-
-那我们 label 里的两段各自是什么性质？
-- `g{组}` 是**硬需求**：同一个 store 实例现在住多个组，hash 会数值
-  相撞，必须在键里分开。
-- `r{rank}` 不是防覆盖的墙——墙是上面第 2 条目录分割。它的作用是
-  **跨进程对账**：controller 固定只打开 `{model}_rank0` 这本账，
-  调度侧查询用的标签必须和 rank0 worker 落笔时的标签逐字节相等才行
-  （由构造保证，不靠巧合）；worker 执行计划前再用 `_worker_key`
-  把 rank 映射回自己、读写自己的目录。顺带说一句丢脸的历史：早期版
-  本按错误认知写了"把所有 rank 的 label 都查一遍"的循环，以为 peer
-  台账可查；后来才修正为固定问 key 自己 rank 的标签——也就是今天
-  "controller 只见 rank0 台账"这条注释的由来。
-
-**不改会怎样**：纯 attention 单组单 dtype 的世界里 main 确实不需要
-改——这不是 main 的疏漏。一旦一本账里住进两种实体（组），不分组就
-是静默输出污染，没有任何报警点。
+**不改会怎样**：不分组，一本账里住进两种状态实体，存在性互串，命
+中判定失真——这是仅有的必须改的一处；其余维度与 main 完全对齐。
 
 ## 1.2 存在性查询从批量 bool 变成"任意异常 = MISS"
 
@@ -113,9 +92,7 @@ hash)`，label 相应变成 `{namespace}_g{组}_r{rank}` 三段式。
 输出，错的 miss 赔一次重算**，所以任何异常折成 MISS（fail-closed）。
 全文件唯一一处故意吞异常，方向是故意的。
 
-还有一个 rank 维度的微妙差别写在 docstring：controller 只跟 rank0
-共享台账，所以查询永远用 key 自带 rank 的 label，peer ledger 压根查
-不到；TP 锁步保存使"rank0 有 = 大家都有"，个别 diverge 的 rank 会在
+TP 锁步保存使"rank0 有 = 大家都有"；个别 diverge 的 rank 会在 load
 load 时被 native 断言爆出来。main 的 has() 同样是 rank0 视角，但它
 不需要解释这件事，因为它没有多 rank 一致性可以失去。
 
@@ -430,7 +407,7 @@ bool）：poll 时检查 gate 是否齐 -> 齐 = released 上报;剩余楼层由
 ====================================================================
 # 附：一句话总结每个核心差异
 
-- 寻址：二维变四维——分组是新维度，namespace 挡配置窜味
+- 寻址：标签加组号——一本账住进四个组，存在性台账不带层名必须分账页
 - 命中：一条扫描线变定点迭代——递归状态的命中方向天生和 attention 相反
 - 视图：原生张量变字节平面——引擎只吃同形张量，GDN 天生不同形
 - 组装：alloc 时算区间变 boundary 钉死——除法落不到合法快照边界上

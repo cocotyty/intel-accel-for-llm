@@ -12,8 +12,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from kvshrink.kvshrink_connector import (
-    parse_kv_cache_config, compute_namespace, KVShrinkParseError)
-from kvshrink.kvshrink_connector import SCHEMA_VERSION
+    parse_kv_cache_config, KVShrinkParseError)
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixture_kvconfig_4b_tp2.json")
@@ -185,14 +184,6 @@ def test_parse_real_config_layout_descriptors():
     info = layer_infos["language_model.model.layers.0.linear_attn"]
     assert info.page_size_bytes == 1081344
     assert "language_model.model.layers.3.self_attn.attn" in layer_infos
-
-
-def test_namespace_stability():
-    a = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2)
-    b = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2)
-    c = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 4)
-    assert a == b
-    assert a != c
 
 
 def test_fail_closed_lossy_truncation_rejected(monkeypatch):

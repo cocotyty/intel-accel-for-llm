@@ -3,12 +3,11 @@
 
 """Boundary presence check.
 
-The check runs under the key's own rank label: each rank keeps its own
-presence record, and the controller process shares one with the rank-0
-worker only, so peer ledgers are not queryable at lookup time. TP ranks
-save in lockstep, so rank 0 present stands for all; a rank that
-diverged anyway fails loudly at load time (the native layer raises on
-a missing key).
+Each rank persists to its own store directory, and the controller
+process opens only the rank0 one; presence is keyed by group label
+within a directory. TP ranks save in lockstep, so rank 0 present
+stands for all; a rank that diverged anyway fails loudly at load time
+(the native layer raises on a missing key).
 
 A store error reads as a MISS: a wrong hit silently corrupts output,
 a wrong miss costs one recompute.
@@ -23,12 +22,11 @@ from kvshrink.kvshrink_connector import CacheKey
 
 
 def _key(group_idx=0):
-    return CacheKey(namespace="ns", rank=0,
-                    block_hash=12345, group_idx=group_idx, layer_name="")
+    return CacheKey(block_hash=12345, group_idx=group_idx, layer_name="")
 
 
 class _FakeStore:
-    """Answers presence per namespace label."""
+    """Answers presence per group label."""
 
     def __init__(self, present_labels, blow_up=False):
         self.present = set(present_labels)
@@ -44,19 +42,17 @@ class _FakeStore:
 
 def test_present_is_hit():
     assert lookup_boundary(
-        _FakeStore([group_label("ns", 0, 0)]), _key()) is True
+        _FakeStore([group_label(0)]), _key()) is True
 
 
 def test_missing_is_miss():
     assert lookup_boundary(_FakeStore([]), _key()) is False
 
 
-def test_queries_own_rank_label_only():
-    """The controller can only see the ledger it shares with the
-    rank-0 worker, so that is the only label it may ask about."""
-    store = _FakeStore([group_label("ns", 0, 0)])
+def test_queries_the_boundary_group_label_only():
+    store = _FakeStore([group_label(0)])
     assert lookup_boundary(store, _key()) is True
-    assert store.asked == [group_label("ns", 0, 0)]
+    assert store.asked == [group_label(0)]
 
 
 def test_store_error_fails_closed_to_miss():
@@ -67,9 +63,9 @@ def test_store_error_fails_closed_to_miss():
 
 
 def test_groups_do_not_alias_each_other():
-    """The same prefix hash exists in every group, so the group must be
-    part of the namespace or one group's data would answer for another.
+    """The same prefix hash exists in every group, so the label must
+    carry the group or one group's data would answer for another.
     """
-    store = _FakeStore([group_label("ns", 0, 0)])
+    store = _FakeStore([group_label(0)])
     assert lookup_boundary(store, _key(group_idx=0)) is True
     assert lookup_boundary(store, _key(group_idx=1)) is False

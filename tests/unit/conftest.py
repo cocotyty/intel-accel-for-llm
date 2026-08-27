@@ -48,8 +48,8 @@ class FakeBlocks:
         return self._ids
 
 
-def HybridRequestScheduler(groups, store, hash_block_size, namespace,
-                           tp_size, rank, async_load_config=None,
+def HybridRequestScheduler(groups, store, hash_block_size,
+                           async_load_config=None,
                            block_hash_source="vllm"):
     """Scheduler-side connector instance without the vLLM config stack.
 
@@ -63,9 +63,6 @@ def HybridRequestScheduler(groups, store, hash_block_size, namespace,
     conn._groups = list(groups)
     conn.kvstore = store
     conn._hash_block_size = hash_block_size
-    conn._namespace = namespace
-    conn.tp_size = tp_size
-    conn._rank = rank
     conn._async_load_layer_config = async_load_config
     conn._block_hash_source = block_hash_source
     conn._attention_layers = tuple(
@@ -75,11 +72,11 @@ def HybridRequestScheduler(groups, store, hash_block_size, namespace,
     return conn
 
 
-def HybridWorker(groups, layer_infos, namespace, canonicalizer,
-                 rank, tp_size):
+def HybridWorker(groups, layer_infos, canonicalizer,
+                 rank=0, tp_size=1):
     """Worker-side connector instance without the vLLM config stack.
 
-    Same signature the pre-merge HybridWorker class had.
+    Same signature shape the pre-merge HybridWorker class had.
     """
     from kvshrink.kvshrink_connector import KVShrinkConnector, group_label
 
@@ -89,8 +86,7 @@ def HybridWorker(groups, layer_infos, namespace, canonicalizer,
     conn._canon = canonicalizer
     conn._rank = rank
     conn.tp_size = tp_size
-    conn._labels = [
-        group_label(namespace, g.group_idx, rank) for g in groups]
+    conn._labels = [group_label(g.group_idx) for g in groups]
     conn.kvstore = None
     conn._layer_names = []
     conn._load_tasks = {}

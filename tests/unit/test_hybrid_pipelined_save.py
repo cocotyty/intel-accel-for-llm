@@ -25,8 +25,7 @@ def _group(g_idx, kind, layers):
 
 
 def _key(layer_name, blk_hash=777, g_idx=0):
-    return CacheKey(namespace="ns", rank=0,
-                    block_hash=blk_hash, group_idx=g_idx,
+    return CacheKey(block_hash=blk_hash, group_idx=g_idx,
                     layer_name=layer_name)
 
 
@@ -81,7 +80,7 @@ def _worker():
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"])]
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
-                     "ns", _FakeCanon(), rank=0, tp_size=1)
+                     _FakeCanon(), rank=0, tp_size=1)
     w.kvstore = _FakeStore()
     return w
 
@@ -112,8 +111,7 @@ def test_pipelined_attention_submits_during_forward():
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
     # every group was submitted; nothing waited inside the step
-    assert {l for l, _ls, _b in c.kvstore.submits} == {
-        "ns_g0_r0", "ns_g1_r0"}
+    assert {l for l, _ls, _b in c.kvstore.submits} == {"g0", "g1"}
     assert c.kvstore.waits == 0
     # the drain is what waits, and it releases the finished request
     sending, _ = c.get_finished({"r1"})
@@ -173,7 +171,7 @@ def test_mamba_segment_splits_by_group():
               _group(1, "mamba", ["m0"]),
               _group(2, "mamba", ["m1"])]
     c = HybridWorker(groups, {ln: None for ln in ("a0", "a1", "m0", "m1")},
-                     "ns", _FakeCanon(), rank=0, tp_size=1)
+                     _FakeCanon(), rank=0, tp_size=1)
     c.kvstore = _FakeStore()
     c._mamba_save_segments = {"a0": ("m0", "m1")}
     attn_ops = GroupTransferMeta(
@@ -191,9 +189,9 @@ def test_mamba_segment_splits_by_group():
     c.bind_connector_metadata(KVShrinkConnectorMetadata(reqs_to_save=saves))
     c.save_kv_layer("a0", None, None)
     by_label = {l: layers for l, layers, _h in c.kvstore.submits}
-    assert by_label["ns_g1_r0"] == ["m0"]
-    assert by_label["ns_g2_r0"] == ["m1"]
-    assert by_label["ns_g0_r0"] == ["a0"]
+    assert by_label["g1"] == ["m0"]
+    assert by_label["g2"] == ["m1"]
+    assert by_label["g0"] == ["a0"]
 
 
 def test_write_is_the_commit():

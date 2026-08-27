@@ -51,8 +51,7 @@ class _HitStore:
 
 
 def _sched(groups, store=None):
-    return HybridRequestScheduler(groups, store or _MissStore(),
-                                  16, "ns", 1, 0)
+    return HybridRequestScheduler(groups, store or _MissStore(), 16)
 
 
 def _setup_attn_req(sched, hashes, ids, tokens=0):
@@ -192,7 +191,7 @@ def test_abort_keeps_committed_boundary_hittable():
     sched.on_request_finished("r1")  # abort
     # a fresh lookup for the same hashes still hits
     assert lookup_boundary(
-        store, CacheKey("ns", 0, 0, 0, "")) == True
+        store, CacheKey(0, 0, "")) == True
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():
@@ -257,8 +256,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
                   block_size=544,
                   mamba_align_size=544, spec=make_spec("mamba", 544)),
     ]
-    sched = HybridRequestScheduler(groups, _HitStore(committed),
-                                   16, "ns", 1, 0)
+    sched = HybridRequestScheduler(groups, _HitStore(committed), 16)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
     sched._track_new_request("r1", block_hashes=hashes, num_computed_tokens=0)
     sched._req_states["r1"].snapshot_boundary = 544
