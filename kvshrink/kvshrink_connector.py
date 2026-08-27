@@ -1130,7 +1130,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     #
     #   A save op pairs them: keys[k] <-> gpu_block_ids[k].
 
-    def on_new_request(
+    def _track_new_request(
         self, req_id: str, block_hashes: list[int],
         num_computed_tokens: int,
         request: Optional["Request"] = None,
@@ -1260,7 +1260,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if num_computed_tokens >= request.num_tokens:
             return 0, False
         block_hashes = self._request_block_hashes(request)
-        self.on_new_request(
+        self._track_new_request(
             request.request_id, block_hashes,
             num_computed_tokens, request=request)
         policy = HybridHitPolicy(
@@ -1316,7 +1316,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         req_id = request.request_id
         state = self._req_states.get(req_id)
         if state is None:
-            self.on_new_request(
+            self._track_new_request(
                 req_id, self._request_block_hashes(request), 0,
                 request=request)
             state = self._req_states[req_id]
