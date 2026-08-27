@@ -936,10 +936,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # decode path reads all of those columns, but an external
         # snapshot only ever restores column 0 (the block holding this
         # step's last scheduled token). Serving a hit would let the
-        # kernel read unrestored speculative slots.
-        for g in kv_cache_config.kv_cache_groups:
-            spec_blocks = int(
-                g.kv_cache_spec.num_speculative_blocks)
+        # kernel read unrestored speculative slots. The field exists
+        # only on MambaSpec, so only mamba groups are checked.
+        for g, parsed in zip(kv_cache_config.kv_cache_groups, groups):
+            if parsed.kind != "mamba":
+                continue
+            spec_blocks = g.kv_cache_spec.num_speculative_blocks
             if spec_blocks:
                 raise RuntimeError(
                     "kvshrink hybrid: speculative decoding is not "
@@ -1210,36 +1212,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         (``_kv_cache_spec_attn_group_iterator``), so mamba and attention
         layers arrive in separate runs. We recover the order the way
         vLLM's own ``bind_kv_cache`` does, from the layer index in the
-        layer name, and fail closed if the names do not yield a unique
-        order rather than gate on an arbitrary prefix.
+        layer name.
         """
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
         from vllm.model_executor.models.utils import extract_layer_index
 
-        missing = [ln for ln in self._worker._layer_infos
-                   if ln not in kv_caches]
-        if missing:
-            raise RuntimeError(
-                f"kvshrink hybrid: layers {sorted(missing)} are in the KV "
-                "cache config but absent from kv_caches; refusing to start")
-
-        indexed: dict[int, str] = {}
-        for layer_name in kv_caches:
-            try:
-                idx = extract_layer_index(layer_name)
-            except Exception as exc:
-                raise RuntimeError(
-                    "kvshrink hybrid: cannot derive the execution index of "
-                    f"layer {layer_name!r} ({exc}); refusing to start"
-                    ) from exc
-            if idx in indexed:
-                raise RuntimeError(
-                    "kvshrink hybrid: layers "
-                    f"{indexed[idx]!r} and {layer_name!r} share execution "
-                    f"index {idx}; the execution order is ambiguous")
-            indexed[idx] = layer_name
-        order = [indexed[i] for i in sorted(indexed)]
+        order = sorted(kv_caches, key=extract_layer_index)
 
         self._layer_names = order
         self._worker.register(kv_caches, order)
@@ -1281,7 +1260,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # call. Views are keyed per part because a split-K/V
             # attention layer contributes two.
             views = {
-                f"{ln}::{part}": view
+                f"{ln}#{part}": view
                 for ln in self._layer_names
                 for part, view in self._canon.page_view_parts(ln).items()
             }

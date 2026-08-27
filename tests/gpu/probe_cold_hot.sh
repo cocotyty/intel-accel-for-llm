@@ -39,6 +39,7 @@ gate_reset_cache
 log "cold run: empty cache, everything computed and persisted"
 gate_serve cold_hot_cold || { fail "cold engine startup"; gate_summary; exit 1; }
 COLD_OUT="$(gate_completion "$PROMPT" "$MAX_TOKENS")"
+gate_persist_cache || { fail "cold run persist"; gate_summary; exit 1; }
 gate_stop
 
 COLD_LOG="$GATE_LAST_LOG"

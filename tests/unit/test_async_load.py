@@ -57,7 +57,7 @@ class _FakeStore:
         return {ln: f"task:{ln}" for ln in layer_names}
 
     def get_wait(self, get_results, wait=True):
-        layers = {k.rsplit("::", 1)[0] for k in get_results}
+        layers = {k.rsplit("#", 1)[0] for k in get_results}
         if layers & self.fail_on:
             raise RuntimeError(
                 f"transfer failed: {sorted(layers & self.fail_on)}")

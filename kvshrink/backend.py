@@ -57,31 +57,23 @@ def group_label(namespace: str, group_idx: int, rank: int) -> str:
 
 
 def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
-    """Is this boundary readable, on every rank?
+    """Is this boundary present in the store?
 
-    Under TP each rank writes its own shard with no cross-rank
-    transaction, so a boundary present here but missing on a peer
-    must be a MISS: half a restore is worse than none. The peer that
-    is missing heals on the request's own re-save, because writing a
-    block again is idempotent.
+    The check runs under the key's own rank label: each rank keeps its
+    own presence record, and the controller process shares one with the
+    rank-0 worker only, so peer ledgers are not queryable here. TP
+    ranks save in lockstep, so rank 0 present stands for all; a rank
+    that diverged anyway fails loudly at load time (the native layer
+    raises on a missing key).
 
     Any error is a MISS. A wrong hit silently corrupts output; a
     wrong miss costs one recompute.
     """
-    chunk_id = key.hash_str
     try:
-        for r in range(key.tp_size):
-            present = store.has([chunk_id],
-                                label=group_label(key.namespace,
-                                                  key.group_idx, r))
-            if not present or not present[0]:
-                if r != key.rank:
-                    logger.info(
-                        "boundary %s g%d present on rank %d but not on "
-                        "rank %d; MISS (recompute re-saves all ranks)",
-                        chunk_id[:12], key.group_idx, key.rank, r)
-                return False
-        return True
+        present = store.has([key.hash_str],
+                            label=group_label(key.namespace,
+                                              key.group_idx, key.rank))
+        return bool(present and present[0])
     except Exception:  # pragma: no cover - fail closed to MISS
         logger.exception("lookup error; treating as MISS")
         return False

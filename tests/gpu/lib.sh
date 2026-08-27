@@ -158,6 +158,25 @@ gate_stop() {
     fi
 }
 
+# Flush every worker rank's DDR-resident chunks to disk. Restart gates
+# must call this before gate_stop: saves land in the DDR pool with
+# persisted=0, and a fresh worker's Record startup deletes unpersisted
+# rows, so without an explicit persist the next engine sees an empty
+# cache. Persistence is operator-triggered by design (the engine
+# exposes POST /v1/cache/persist per rank).
+gate_persist_cache() {
+    local base="${IAXL_API_WORKER_BASE_PORT:-18800}"
+    local r
+    for ((r = 0; r < GATE_TP; r++)); do
+        curl -sf -X POST "http://127.0.0.1:$((base + r))/v1/cache/persist" \
+            -H 'Content-Type: application/json' \
+            -d '{"count": 100000000}' >/dev/null || {
+            log "persist failed on rank $r"
+            return 1
+        }
+    done
+}
+
 # Block until the GPUs are actually released.
 #
 # Killing the `vllm` process does not immediately reclaim anything: the
