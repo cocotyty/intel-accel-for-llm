@@ -186,10 +186,12 @@ chunk_dim/block_dim 参数的方向一致——视图归一化了那些参数就
 副产品：字节平面视图让 mamba 快照也获得了"按块读写"的能力，这就是
 为什么 store 层面对的仍然是熟悉的 put/get 而无需知道底下是什么模型。
 
-顺带处理了 split-K/V：某些布局 K/V 不相邻，平铺 stride 会跳到错误
-字节——探测到就保留 k/v 两个半页视图，读侧拼接。main 对此的处理是
-那个 `shape[1]==2` 的 if 加信赖于 iaxl 内部处理，够不够取决于布局永
-不变化；我们遇到了实际变化的布局，就显式化了。
+split-K/V 分支是给"块维不在 dim0"的布局准备的（老版本 [2,N,...]
+K 在最外层，如今仅 ROCM_ATTN 后端仍如此；v0.23 默认后端一律
+(num_blocks, 2, ...) 块内交错、页连续，探测恒不触发）。vLLM hybrid
+路径还会用 as_strided_ 把 attention 页重排成与 mamba 页一致的布局
+（gpu_model_runner._update_hybrid_attention_mamba_layout），这正是
+"各组统一 page_size、页内连续"前提的官方出处。
 
 ## 2.2 存储尺寸预检（storage_size_bytes）
 
