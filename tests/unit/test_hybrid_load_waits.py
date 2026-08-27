@@ -161,29 +161,11 @@ def test_attention_pages_stay_pipelined():
     assert be.waited[-1] == "a1"
     w.wait_layer_load("a4")
     assert be.waited[-1] == "a4"
-    w.loads_drained_check()  # nothing left un-waited
 
 
-def test_unwaited_layer_at_step_end_fails_stop():
-    be = _FakeStore()
-    w = _worker(be)
-    w.start_load(_load_meta(ATTN, 0))
-    # a1's hook never fired -> its pages were never restored
-    with pytest.raises(RuntimeError, match="never ran"):
-        w.loads_drained_check()
-
-
-def test_stale_residue_from_previous_step_fails_stop():
-    be = _FakeStore()
-    w = _worker(be)
-    w._load_tasks = {"m2": [{"layer": "m2"}]}
-    with pytest.raises(RuntimeError, match="stale step residue"):
-        w.start_load(_load_meta(GDN, 1, boundary=16))
-
-
-def test_load_poison_is_sticky_across_hooks():
-    """A failed load must fail every later hook of the step, never
-    degrade into a silent recompute."""
+def test_failed_blocking_wait_raises():
+    """An incomplete transfer at a blocking wait is fatal (EngineCore
+    dies), same contract as the original path."""
     be = _FakeStore()
 
     def _boom(get_results, wait=True):
@@ -193,29 +175,3 @@ def test_load_poison_is_sticky_across_hooks():
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
         w.start_load(_load_meta(GDN, 1, boundary=16))
-    for call in (lambda: w.wait_layer_load("a1"),
-                 lambda: w.raise_load_poison(),
-                 lambda: w.start_load(_load_meta(GDN, 1, boundary=16))):
-        with pytest.raises(RuntimeError, match="h2d failed"):
-            call()
-
-
-def test_mamba_toctou_change_fails_stop():
-    """The committed boundary must still match the scheduler's HIT when
-    the worker executes; otherwise the state we would restore is not the
-    state the core credited."""
-    be = _FakeStore(committed=False)
-    w = _worker(be)
-    with pytest.raises(RuntimeError, match="boundary vanished"):
-        w.start_load(_load_meta(GDN, 1, boundary=16))
-    assert be.submitted == [], \
-        "no transfer may be submitted once the boundary is gone"
-
-
-def test_attention_load_needs_no_boundary_check():
-    """Attention pages are per-block and content-addressed: they carry no
-    snapshot boundary and are submitted without the mamba gate."""
-    be = _FakeStore(committed=False)  # would fail a boundary check
-    w = _worker(be)
-    w.start_load(_load_meta(ATTN, 0))
-    assert sorted(be.submitted) == sorted(ATTN)

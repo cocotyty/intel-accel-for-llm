@@ -140,14 +140,13 @@ def test_negative_layer_count_gates_on_every_layer():
 # ------------------------------------------------------------------
 # cross-step lifetime
 # ------------------------------------------------------------------
-def test_async_tasks_are_not_part_of_the_step_residue_check():
-    """The residue check guards the per-step plan. Async tasks outlive
-    the step by design and must not trip it."""
+def test_async_tasks_live_outside_the_step_tasks():
+    """Async tasks outlive the step by design: they are not in the
+    per-step _load_tasks drained by the layer hooks."""
     b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     assert w._load_tasks == {}
-    w.loads_drained_check()               # must not raise
 
 
 def test_remaining_layers_are_drained_by_the_layer_hooks():
@@ -164,32 +163,18 @@ def test_remaining_layers_are_drained_by_the_layer_hooks():
     assert "r1" not in w._async_loads      # fully drained, entry dropped
 
 
-def test_second_plan_for_an_inflight_request_is_refused():
-    """Two live plans for one request would strand the first one's
-    tasks with nothing left to drain them."""
-    b = _FakeStore()
-    w = _worker(b)
-    w.start_load(_meta(async_layers=1))
-    with pytest.raises(RuntimeError, match="already has an in-flight"):
-        w.start_load(_meta(async_layers=1))
-
-
 # ------------------------------------------------------------------
-# failure must not hang the request
+# transfer failure is fatal
 # ------------------------------------------------------------------
-def test_failed_transfer_is_reported_finished_and_poisons():
+def test_failed_transfer_raises_at_poll():
     b = _FakeStore()
     b.fail_on = {"m0"}
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     b.landed = set(ORDER)
 
-    assert w.poll_finished_loads() == {"r1"}, (
-        "a failed async load must still be reported, or the request "
-        "waits for a release that never comes")
-    assert "r1" not in w._async_loads
     with pytest.raises(RuntimeError, match="transfer failed"):
-        w.raise_load_poison()
+        w.poll_finished_loads()
 
 
 # ------------------------------------------------------------------

@@ -185,8 +185,7 @@ def test_request_finished_returns_false_and_clears_state():
 def test_request_finished_pending_async_job_returns_false_none():
     """Committed boundaries are content-addressed and per-boundary (not
     per-request), so a finished request NEVER blocks block freeing:
-    request_finished returns (False, None). A failed store surfaces as
-    sticky poison at the next worker hook, not here."""
+    request_finished returns (False, None)."""
     sched = _sched([_attn()])
     conn = _sched_side_connector(sched)
     req = type("R", (), {"request_id": "r1"})
