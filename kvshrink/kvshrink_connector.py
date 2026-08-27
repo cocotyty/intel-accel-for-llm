@@ -395,7 +395,6 @@ class GroupTransferMeta:
     group_idx: int
     keys: tuple[CacheKey, ...] = ()
     gpu_block_ids: tuple[int, ...] = ()
-    snapshot_boundary_tokens: Optional[int] = None  # mamba restore point
 
 
 # ======================================================================

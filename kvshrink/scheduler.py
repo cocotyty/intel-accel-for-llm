@@ -505,9 +505,7 @@ class HybridRequestScheduler:
                                 gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
-                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids),
-                snapshot_boundary_tokens=boundary if group.kind == "mamba"
-                else None))
+                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
         return ReqMeta(
             external_hit_tokens=boundary - state.num_computed_tokens,
             group_ops=tuple(group_ops),
@@ -533,7 +531,6 @@ class HybridRequestScheduler:
                 continue
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
-            snapshot_boundary: Optional[int] = None
             if group.kind == "attention":
                 num_hash = min(progress // group.block_size, len(ids),
                                len(state.block_hashes))
@@ -570,7 +567,6 @@ class HybridRequestScheduler:
                         if (idx >= gstate.next_stored_chunk_idx
                                 and idx < len(state.block_hashes)):
                             blk_hash = state.block_hashes[idx]
-                            snapshot_boundary = progress
                             for layer_name in group.layer_names:
                                 keys.append(self._page_key(
                                     self._boundary_key(group, blk_hash),
@@ -579,8 +575,7 @@ class HybridRequestScheduler:
                             gstate.next_stored_chunk_idx = idx + 1
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
-                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids),
-                snapshot_boundary_tokens=snapshot_boundary))
+                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
         return ReqMeta(group_ops=tuple(group_ops))
 
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
