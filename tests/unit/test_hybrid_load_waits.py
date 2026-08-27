@@ -98,7 +98,7 @@ def _load_meta(layers, group_idx, req_id="r1"):
     op = GroupTransferMeta(group_idx=group_idx, keys=keys,
                            gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
-    md.add_request(req_id, group_ops=(op,))
+    md.requests[req_id] = ReqMeta(group_ops=(op,))
     return type("M", (), {"reqs_to_load": md})
 
 

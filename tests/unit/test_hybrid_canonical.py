@@ -57,7 +57,7 @@ def test_canonical_attention_view():
     c = Canonicalizer(infos, NUM_BLOCKS)
     kv = {"attn.0": _make_attention_kv()}
     c.register(kv)
-    view = c.get_page("attn.0", 5)
+    view = c.page_view_parts("attn.0")["page"][5]
     assert view.shape == (PAGE,)
     assert view.device == torch.device("cpu")
 
@@ -67,5 +67,5 @@ def test_canonical_mamba_view():
     c = Canonicalizer(infos, NUM_BLOCKS)
     kv = {"mamba.0": _make_mamba_kv()}
     c.register(kv)
-    view = c.get_page("mamba.0", 7)
+    view = c.page_view_parts("mamba.0")["page"][7]
     assert view.shape == (PAGE,)

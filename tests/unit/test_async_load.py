@@ -95,8 +95,9 @@ def _meta(async_layers, req_id="r1"):
         return GroupTransferMeta(
             group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
-    md.add_request(req_id, group_ops=(op(0, ATTN), op(1, GDN)),
-                   is_async=True, async_load_layers=async_layers)
+    md.requests[req_id] = ReqMeta(
+        group_ops=(op(0, ATTN), op(1, GDN)),
+        is_async=True, async_load_layers=async_layers)
     return type("M", (), {"reqs_to_load": md})
 
 
