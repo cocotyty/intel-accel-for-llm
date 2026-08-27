@@ -49,6 +49,12 @@ check "first request saved boundaries" \
     grep -qE "chunk_save: [1-9][0-9]* pages submitted, [1-9][0-9]* boundaries" "$LOG"
 check "first request produced output" test -n "$FIRST_OUT"
 
+# Saves are async (main's lifecycle): the puts submitted during the
+# first request land in the store's record asynchronously, so let the
+# backlog drain before the second request looks it up.
+log "waiting for async saves to land"
+sleep "${GATE_SAVE_SETTLE:-15}"
+
 # --------------------------------------------- drop vLLM's own cache
 # Everything after this mark is the second request, so the load below
 # cannot be credited to the first one.
