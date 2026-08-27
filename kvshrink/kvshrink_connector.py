@@ -224,7 +224,6 @@ class GroupInfo:
 class CacheKey:
     """Logical key for one page, or for a whole boundary."""
     namespace: str
-    tp_size: int
     rank: int
     block_hash: object
     group_idx: int
@@ -239,18 +238,17 @@ class CacheKey:
         return str(h)
 
     @property
-    def boundary_key(self) -> tuple[str, int, int, str, int]:
-        """Isolation-safe identity for a boundary (namespace/tp/rank/hash/group)."""
-        return (self.namespace, self.tp_size, self.rank, self.hash_str,
-                self.group_idx)
+    def boundary_key(self) -> tuple[str, int, str, int]:
+        """Isolation-safe identity for a boundary (namespace/rank/hash/group)."""
+        return (self.namespace, self.rank, self.hash_str, self.group_idx)
 
-def make_boundary_key(namespace: str, tp_size: int, rank: int,
+def make_boundary_key(namespace: str, rank: int,
                       group_idx: int, block_hash: object) -> "CacheKey":
     """A group's key at one block hash, with no layer: the address the
     hit policy asks about and the address the save/load builders expand
     into per-layer page keys."""
     return CacheKey(
-        namespace=namespace, tp_size=tp_size, rank=rank,
+        namespace=namespace, rank=rank,
         block_hash=block_hash, group_idx=group_idx, layer_name="")
 
 @dataclass
@@ -284,15 +282,14 @@ def compute_namespace(
     cache_dtype: str,
     kv_schema_version: int,
     tp_size: int,
-    pp_size: int,
 ) -> str:
     """Stable cache namespace: sha256 over model identity, cache dtype,
-    schema version and tp/pp size, truncated to 16 hex chars. The schema
+    schema version and tp size, truncated to 16 hex chars. The schema
     version is an input so that changing the page layout renames the
     namespace, rather than reading old pages under the new layout."""
     raw = "|".join([
         model_id, model_revision, tokenizer_revision, cache_dtype,
-        str(kv_schema_version), str(tp_size), str(pp_size),
+        str(kv_schema_version), str(tp_size),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -531,37 +528,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.vllm_device: str = vllm_config.device_config.device_type
         self.rank: int = get_world_group().rank if model_parallel_is_initialized() else 0
 
-        self._layer_names: list[str] = []
-
         self._async_load_layer_config: AsyncLoadLayerConfig = (
             load_async_load_layer_config_from_env(
                 num_layers=self.num_layers,
             )
         )
 
-        self._groups: list[GroupInfo] = []
-        self._layer_infos: dict[str, LayerPageInfo] = {}
-        self._rank: int = 0
         self.kvstore: Optional[KVStore] = None
 
-        self._namespace: str = ""
-        self._hash_block_size: int = 0
-        self._block_hash_source: str = "vllm"
-        self._attention_layers: tuple[str, ...] = ()
         self._req_states: dict[str, ReqState] = {}
         self._async_load_pending: set[str] = set()
 
-        self._canon: Optional[Canonicalizer] = None
-        self._labels: list[str] = []
-        self._load_tasks: dict[str, Task] = {}
         self._async_loads: dict[str, "_AsyncLoad"] = {}
-        self._layer_group: dict[str, int] = {}
-        self._attn_layer_group: dict[str, int] = {}
-        self._mamba_layers: frozenset[str] = frozenset()
-        self._attn_order: tuple[str, ...] = ()
-        self._mamba_save_segments: dict[str, tuple[str, ...]] = {}
-        self._saved_layers: set[str] = set()
-        self._step_save_pages: int = 0
         self._current_put_tasks: dict[str, list[dict[str, Task]]] = {}
         self._deferred_finished_req_ids: set[str] = set()
 
@@ -580,6 +558,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Build the hybrid stack for this role."""
         pc = vllm_config.parallel_config
         tp_size = pc.tensor_parallel_size
+        if pc.pipeline_parallel_size != 1:
+            raise RuntimeError(
+                "kvshrink hybrid: pipeline parallelism is not supported "
+                f"(pipeline_parallel_size={pc.pipeline_parallel_size}); "
+                "each rank would persist only its own layers' pages. "
+                "Set pipeline_parallel_size=1 or the KV connector.")
         if role == KVConnectorRole.WORKER:
             rank = pc.rank
         else:
@@ -599,7 +583,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             cache_dtype=cache_config.cache_dtype,
             kv_schema_version=SCHEMA_VERSION,
             tp_size=tp_size,
-            pp_size=1,
         )
         validate_codec_env()
 
@@ -1154,21 +1137,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
         """This rank's boundary key for one group at one block hash."""
-        return make_boundary_key(self._namespace, self.tp_size,
-                                 self._rank, group.group_idx, block_hash)
+        return make_boundary_key(self._namespace, self._rank,
+                                 group.group_idx, block_hash)
 
     def _present(self, group_idx: int, block_hash: object) -> bool:
         """Store-presence predicate handed to the hit policy, which
         plans against boundary addresses without seeing store details."""
         return lookup_boundary(
             self.kvstore,
-            make_boundary_key(self._namespace, self.tp_size, self._rank,
+            make_boundary_key(self._namespace, self._rank,
                               group_idx, block_hash))
 
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
         """Expand a boundary key to ONE layer's page key: same
-        namespace/tp/rank/hash/group as the boundary, plus the layer
+        namespace/rank/hash/group as the boundary, plus the layer
         name. This is the exact page address the worker must move."""
         return replace(boundary_key, layer_name=layer_name)
 
@@ -1546,7 +1529,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
         for bkey, cand in candidates.items():
-            namespace, tp_size, rank, blk_hash, g_idx = bkey
+            _, _, blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
             if sorted(cand.pages) != expected:
                 logger.warning(
