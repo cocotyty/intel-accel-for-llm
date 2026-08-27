@@ -21,21 +21,12 @@ def group_label(namespace: str, group_idx: int, rank: int) -> str:
 
 
 def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
-    """Is this boundary readable, on every rank?"""
-    chunk_id = key.hash_str
+    """Is this boundary present in the store?"""
     try:
-        for r in range(key.tp_size):
-            present = store.has([chunk_id],
-                                label=group_label(key.namespace,
-                                                  key.group_idx, r))
-            if not present or not present[0]:
-                if r != key.rank:
-                    logger.info(
-                        "boundary %s g%d present on rank %d but not on "
-                        "rank %d; MISS (recompute re-saves all ranks)",
-                        chunk_id[:12], key.group_idx, key.rank, r)
-                return False
-        return True
+        present = store.has([key.hash_str],
+                            label=group_label(key.namespace,
+                                              key.group_idx, key.rank))
+        return bool(present and present[0])
     except Exception:  # pragma: no cover - fail closed to MISS
         logger.exception("lookup error; treating as MISS")
         return False
