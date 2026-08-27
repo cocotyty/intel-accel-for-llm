@@ -70,13 +70,38 @@ hash)`，label 相应变成 `{namespace}_g{组}_r{rank}` 三段式。
   两份寿命不同的东西被当成一份管理。
 - namespace 把 model/dtype/schema 版本/tp 拌进哈希：fp16 写的页 bf16
   不能当命中读、tp=2 和 tp=4 不能互读、layout 升级靠改名自动失效旧页。
-- rank 进 label 是因为 store 的 rank 参数只管端口和日志不管键；
-  TP 两 rank 不分家就会互相覆盖对方分片。main 没这个问题吗？有的
-  ——只是 main 的部署从未踩中，我们没有奢侈。
 
-**不改会怎样**：纯 attention 单模型单 dtype 的世界里确实大概率没事
-——这正是 main 敢省的原因。一旦杂交或换配置重跑，错误是静默输出污
-染，没有任何报警点。
+**先回答一个自然的疑问：main 连自定义 label 都没有（用默认 "kv"），
+它凭什么没事？** 因为跨 rank 的隔离从来不靠键的内容，靠的是三个
+结构性机制，而 main 和我们用的是同一套：
+
+1. 每个进程一个 store 实例——易失层是进程内内存池，两个 rank 的键
+   物理上碰不到一起；
+2. KVStore 构造参数 `rank` 决定持久化目录 `{model}_rank{r}` 和管理
+   端口（kvstore.py:89-91）；
+3. v0.23 在分布式初始化完成之后才构造 worker 侧 connector
+   （gpu_worker.py 的 initialize_from_config -> ensure_kv_transfer_
+   initialized），所以 main 里取到的 world rank 是真值，第 2 条真的
+   能把两个 rank 分进不同目录。
+
+在此之上再加一个事实：纯 attention 只有一个组，一本账里只有一种地
+址空间，默认 label 不可能歧义。所以 main 的省略完全站得住。
+
+那我们 label 里的两段各自是什么性质？
+- `g{组}` 是**硬需求**：同一个 store 实例现在住多个组，hash 会数值
+  相撞，必须在键里分开。
+- `r{rank}` 不是防覆盖的墙——墙是上面第 2 条目录分割。它的作用是
+  **跨进程对账**：controller 固定只打开 `{model}_rank0` 这本账，
+  调度侧查询用的标签必须和 rank0 worker 落笔时的标签逐字节相等才行
+  （由构造保证，不靠巧合）；worker 执行计划前再用 `_worker_key`
+  把 rank 映射回自己、读写自己的目录。顺带说一句丢脸的历史：早期版
+  本按错误认知写了"把所有 rank 的 label 都查一遍"的循环，以为 peer
+  台账可查；后来才修正为固定问 key 自己 rank 的标签——也就是今天
+  "controller 只见 rank0 台账"这条注释的由来。
+
+**不改会怎样**：纯 attention 单组单 dtype 的世界里 main 确实不需要
+改——这不是 main 的疏漏。一旦一本账里住进两种实体（组），不分组就
+是静默输出污染，没有任何报警点。
 
 ## 1.2 存在性查询从批量 bool 变成"任意异常 = MISS"
 

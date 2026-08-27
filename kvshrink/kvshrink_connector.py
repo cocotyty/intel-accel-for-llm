@@ -1074,10 +1074,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 "each rank would persist only its own layers' pages. "
                 "Set pipeline_parallel_size=1 or the KV connector.")
         if role == KVConnectorRole.WORKER:
-            # parallel_config.rank, NOT get_world_group(): the connector
-            # is constructed before distributed init in the worker
-            # processes, so the world group would report rank 0 on every
-            # TP rank and the ranks would overwrite each other's shards.
+            # parallel_config.rank is the authoritative identity and
+            # carries no dependency on init order. (In this v0.23 engine
+            # path the connector is actually built after distributed
+            # init, so get_world_group() would also be right here -- the
+            # config value stays correct either way.) Two ranks claiming
+            # the same rank would land in the SAME persist dir and port
+            # (KVStore derives both from this value) and clobber each
+            # other's shards.
             rank = pc.rank
         else:
             # Scheduler-side keys are always rank 0; each worker verifies
@@ -1131,9 +1135,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "speculative decoding or the KV connector.")
         self._groups = groups
         self._layer_infos = layer_infos
-        # Authoritative TP rank. Distinct from self.rank, which is read
-        # from the world group before distributed init has run and is
-        # therefore 0 on every worker.
+        # Authoritative TP rank for addressing/labels. Kept separate from
+        # self.rank (a world-group read guarded on init order) so
+        # rank-sensitive code paths have one stable source.
         self._rank = rank
         # Attention layers in group order, used to size the
         # early-release prefix. Mamba layers are deliberately absent:
@@ -2230,11 +2234,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             model_name=os.path.basename(self.model_config.model),
             block_dim=0,
             kv_caches=views,
-            # _rank, not self.rank: the latter comes from the world
-            # group, which reports 0 on every TP rank because the
-            # connector is built before distributed init. Two ranks
-            # claiming rank 0 collide on the management port and
-            # would overwrite each other's shards.
+            # _rank: the authoritative rank captured in _init_kv_stack.
+            # KVStore derives the per-rank persist dir and management
+            # port from this value -- two ranks claiming one rank would
+            # share both and clobber each other's shards.
             rank=self._rank,
             tp_size=self.tp_size,
         )
