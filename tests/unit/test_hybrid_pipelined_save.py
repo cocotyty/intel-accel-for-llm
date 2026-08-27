@@ -30,6 +30,13 @@ def _key(layer_name, blk_hash=777, g_idx=0):
                     layer_name=layer_name)
 
 
+class _FakeTask:
+    """Engine Task stand-in: put_wait finalizes by clearing ctx."""
+
+    def __init__(self):
+        self.ctx = object()
+
+
 class _FakeStore:
     """Records submit/wait calls."""
 
@@ -41,10 +48,12 @@ class _FakeStore:
             label=None):
         layers = sorted(k.rsplit("#", 1)[0] for k in tensors)
         self.submits.append((label, layers, list(block_hashs)))
-        return {k: f"task:{k}" for k in tensors}
+        return {k: _FakeTask() for k in tensors}
 
     def put_wait(self, put_results, wait=True):
         self.waits += 1
+        for t in put_results.values():
+            t.ctx = None
         return True
 
 

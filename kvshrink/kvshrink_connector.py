@@ -2825,7 +2825,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if tasks is None:
                 completed.add(req_id)
                 continue
-            while tasks and self.kvstore.put_wait(tasks[0], wait=False):
+            while tasks:
+                if all(t.ctx is None for t in tasks[0].values()):
+                    # A boundary shared with another finished request:
+                    # that request's drain already finalized this put
+                    # (put_wait sets ctx None on completion).
+                    tasks.pop(0)
+                    continue
+                if not self.kvstore.put_wait(tasks[0], wait=False):
+                    break
                 tasks.pop(0)
             if not tasks:
                 del self._current_put_tasks[req_id]

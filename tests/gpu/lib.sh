@@ -166,22 +166,29 @@ gate_stop() {
 # exposes POST /v1/cache/persist per rank).
 gate_persist_cache() {
     local base="${IAXL_API_WORKER_BASE_PORT:-18800}"
-    local r attempt resp
+    local r attempt resp zeros
     for ((r = 0; r < GATE_TP; r++)); do
-        # Saves are async (submitted in the step, landed by the engine
-        # afterwards, same lifecycle as main): give the in-flight puts a
-        # grace window, then keep persisting until a call reports nothing
-        # new, meaning staging has quiesced.
+        # Saves are async (submitted in the step, zipped into staging by
+        # the engine afterwards, same lifecycle as main): give in-flight
+        # puts a grace window, then persist until TWO consecutive calls
+        # report nothing new -- under a zip backlog an isolated zero only
+        # means "nothing landed in this interval", not quiescence.
         sleep 5
-        for ((attempt = 0; attempt < 30; attempt++)); do
+        zeros=0
+        for ((attempt = 0; attempt < 60; attempt++)); do
             resp=$(curl -sf -X POST "http://127.0.0.1:$((base + r))/v1/cache/persist" \
                 -H 'Content-Type: application/json' \
                 -d '{"count": 100000000}') || {
                 log "persist failed on rank $r"
                 return 1
             }
-            [[ "$(sed -n 's/.*"persisted": \([0-9]*\).*/\1/p' <<<"$resp")" == "0" ]] && break
-            sleep 1
+            if [[ "$(sed -n 's/.*"persisted": \([0-9]*\).*/\1/p' <<<"$resp")" == "0" ]]; then
+                zeros=$((zeros + 1))
+                ((zeros >= 2)) && break
+            else
+                zeros=0
+            fi
+            sleep 2
         done
     done
 }
