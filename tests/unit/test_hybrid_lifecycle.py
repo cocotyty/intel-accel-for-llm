@@ -4,9 +4,9 @@ Rulings under test:
 1. resume (or any authoritative progress regression) rolls every
    group's incremental save cursor back to floor(N / block_size) --
    emitted-but-unproven boundaries are re-emitted (idempotent, safe);
-2. request_finished returns (False, None) -- the save path is
-   synchronous so blocks free immediately; True would leak blocks
-   (no get_finished ack ever comes);
+2. request_finished returns (True, None) -- block freeing is deferred
+   to get_finished, which acks once every transfer reading the blocks
+   has landed (the async save lifecycle, same as main);
 3. request_finished fail-stops if async store jobs exist;
 4. committed boundaries are content-addressed: abort/finish NEVER
    deletes them; uncommitted pages never hit.
@@ -162,20 +162,21 @@ def test_request_finished_returns_false_and_clears_state():
     conn = _sched_side_connector(sched)
     req = type("R", (), {"request_id": "r1"})
     free, delay = conn.request_finished(req, None)
-    assert (free, delay) == (False, None), \
-        "synchronous save must free blocks immediately"
+    assert (free, delay) == (True, None), \
+        "block freeing is deferred to get_finished"
     assert "r1" not in sched._req_states
 
 
 def test_request_finished_pending_async_job_returns_false_none():
     """Committed boundaries are content-addressed and per-boundary (not
-    per-request), so a finished request NEVER blocks block freeing:
-    request_finished returns (False, None)."""
+    per-request), but a finished request's blocks may still be read by
+    an in-flight put: request_finished defers freeing to get_finished
+    and returns (True, None)."""
     sched = _sched([_attn()])
     conn = _sched_side_connector(sched)
     req = type("R", (), {"request_id": "r1"})
     out = conn.request_finished(req, None)
-    assert out == (False, None), out
+    assert out == (True, None), out
 
 
 # ------------------------------------------------------------------
@@ -230,7 +231,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         assert m.group_ops[0].gpu_block_ids == (10, 11, 12, 13)
         free, delay = conn.request_finished(
             type("R", (), {"request_id": rid}), None)
-        assert (free, delay) == (False, None)
+        assert (free, delay) == (True, None)
     assert len(sched._req_states) == 0
 
 

@@ -1,11 +1,13 @@
-"""Pipelined attention save via save_kv_layer.
+"""Pipelined save via save_kv_layer + async drain in get_finished.
 
 vLLM calls save_kv_layer on exit of every attention layer during
-forward. HybridWorker submits that layer's async put immediately
-(overlapping the remaining layers' compute); wait_save then only
-waits. GDN groups always save in wait_save (their
-state is final only post-forward). These tests use a fake store and
-fake canonicalizer -- no GPU, no disk, no model.
+forward. The connector submits that layer's async put immediately
+(overlapping the remaining layers' compute); the mamba segment
+preceding an attention layer rides the same hook, and the trailing
+segment submits in submit_saves (post-forward). Nothing is waited
+inside the step: writes drain in get_finished, which also releases
+finished requests' blocks (finished_sending). These tests use a fake
+store and fake canonicalizer -- no GPU, no disk, no model.
 """
 
 import os
@@ -95,25 +97,30 @@ def test_pipelined_attention_submits_during_forward():
     assert submits_during_fwd[0][1] == ["a0"]  # one layer per call
     assert submits_during_fwd[1][1] == ["a1"]
 
-    c.wait_save(_save_meta())
-    # attention layers were NOT re-submitted; mamba submitted at wait
+    c.submit_saves(meta)
+    # attention layers were NOT re-submitted; mamba submitted post-forward
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
-    # every group was written and waited for
+    # every group was submitted; nothing waited inside the step
     assert {l for l, _ls, _b in c.kvstore.submits} == {
         "ns_g0_r0", "ns_g1_r0"}
+    assert c.kvstore.waits == 0
+    # the drain is what waits, and it releases the finished request
+    sending, _ = c.get_finished({"r1"})
+    assert sending == {"r1"}
     assert c.kvstore.waits > 0
 
 
 def test_fallback_when_hook_never_fired():
-    """Older vLLM / decorator missing: attention submits at wait time,
+    """Older vLLM / decorator missing: attention submits post-forward,
     commits still correct (idempotent full coverage)."""
     _env_off()
     c = _worker()
-    _pages, nbound = c.wait_save(_save_meta())  # no save_kv_layer first
+    _pages, nbound = c.submit_saves(_save_meta())  # no save_kv_layer first
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
-    assert ["a0"] in submit_layers and ["a1"] in submit_layers
+    # the group's unhooked layers go out in ONE post-forward call
+    assert ["a0", "a1"] in submit_layers
     assert ["m0"] in submit_layers
     assert nbound == 2
 
@@ -126,19 +133,42 @@ def test_pipelined_disabled_by_env():
         c.bind_connector_metadata(_save_meta())
         c.save_kv_layer("a0", None, None)
         assert c.kvstore.submits == []  # nothing during forward
-        assert c.wait_save(_save_meta())[1] == 2
+        assert c.submit_saves(_save_meta())[1] == 2
     finally:
         os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
 
 
+def test_mamba_segment_rides_the_next_attention_hook():
+    """Mamba layers before an attention layer are final when its save
+    hook fires, so they submit there instead of post-forward."""
+    _env_off()
+    c = _worker()
+    c._mamba_save_segments = {"a0": ("m0",)}
+    meta = _save_meta()
+    c.bind_connector_metadata(meta)
+    c.save_kv_layer("a0", None, None)
+    submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
+    assert ["m0"] in submit_layers  # mamba segment piggybacked on the hook
+    assert ["a0"] in submit_layers
+    c.save_kv_layer("a1", None, None)
+    c.submit_saves(meta)
+    # everything submitted during forward; nothing left post-forward
+    assert len(c.kvstore.submits) == 3
+
+
 def test_write_is_the_commit():
     """A block is finalized by its own write, with the group's whole
-    layer set in one call. There is no separate publish step, so there
-    is nothing that can become visible before the data it names -- the
-    failure this file used to guard against cannot be expressed.
+    layer set in one step's submissions. There is no separate publish
+    step, so there is nothing that can become visible before the data
+    it names -- the failure this file used to guard against cannot be
+    expressed. The write is drained (and the request released) in
+    get_finished.
     """
     _env_off()
     w = _worker()
-    pages, boundaries = w.wait_save(_save_meta())
+    pages, boundaries = w.submit_saves(_save_meta())
     assert pages > 0 and boundaries > 0
-    assert w.kvstore.waits > 0, "the write was never waited for"
+    assert w.kvstore.waits == 0, "submission must not block the step"
+    sending, _ = w.get_finished({"r1"})
+    assert sending == {"r1"}
+    assert w.kvstore.waits > 0, "the write was never drained"
