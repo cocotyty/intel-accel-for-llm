@@ -81,7 +81,8 @@ class HybridWorker:
         # register_kv_caches.
         self.store: Optional[KVStore] = None
 
-        self._kv_caches_ref: Optional[dict[str, torch.Tensor]] = None
+        self._kv_caches_ref: Optional[
+            dict[str, torch.Tensor | list[torch.Tensor]]] = None
         # Per-step load tasks, "layer#part" -> engine Task: populated
         # by start_load (one merged engine call per group per step),
         # waited and popped per layer -- GDN layers as one barrier in
@@ -110,7 +111,9 @@ class HybridWorker:
     # registration
     # ------------------------------------------------------------------
     def register(
-        self, kv_caches: dict[str, torch.Tensor], execution_order: list[str]
+        self,
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+        execution_order: list[str],
     ) -> None:
         """Bind canonical page views and record which layers recur."""
         self._kv_caches_ref = kv_caches

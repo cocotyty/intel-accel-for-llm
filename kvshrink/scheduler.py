@@ -228,7 +228,7 @@ class HybridRequestScheduler:
     # ------------------------------------------------------------------
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[Optional[int], bool]:
+    ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
         if num_computed_tokens >= request.num_tokens:
             return 0, False
