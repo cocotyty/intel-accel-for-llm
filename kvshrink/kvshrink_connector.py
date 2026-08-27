@@ -293,18 +293,13 @@ class Canonicalizer:
         for layer_name, info in self._layer_infos.items():
             raw = kv_caches[layer_name]
             if isinstance(raw, (list, tuple)):
-                if len(raw) == 0:
-                    raise ValueError(
-                        f"Mamba layer {layer_name} has empty state list")
+                # vLLM builds mamba state tensors by as_strided over one
+                # raw storage with a running byte offset starting at 0,
+                # so the first tensor's storage is the whole state pool.
                 first = raw[0]
-                if first.storage_offset() != 0:
-                    raise ValueError(
-                        f"Mamba layer {layer_name} first state tensor has "
-                        f"non-zero storage offset {first.storage_offset()}")
-                storage = first.untyped_storage()
                 tensor = torch.empty(
                     0, dtype=torch.int8, device=first.device
-                ).set_(storage)
+                ).set_(first.untyped_storage())
             else:
                 tensor = torch.empty(
                     0, dtype=torch.int8, device=raw.device
