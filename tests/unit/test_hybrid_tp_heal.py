@@ -18,7 +18,7 @@ Pure logic: fake store, no GPU, no disk.
 
 from __future__ import annotations
 
-from kvshrink.backend import group_label, lookup_boundary
+from kvshrink.kvshrink_connector import group_label, lookup_boundary
 from kvshrink.kvshrink_connector import CacheKey
 
 

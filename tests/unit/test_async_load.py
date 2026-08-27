@@ -21,10 +21,9 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import make_spec
+from conftest import HybridWorker, make_spec
 from kvshrink.kvshrink_connector import (
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestMetadata)
-from kvshrink.worker import HybridWorker
 
 PAGE = 4096
 ORDER = ["m0", "a1", "m2", "a3"]
@@ -82,7 +81,7 @@ def _worker(store):
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     w = HybridWorker(groups, {ln: None for ln in ORDER}, "ns",
                      _FakeCanon(), rank=0, tp_size=1)
-    w.store = store
+    w.kvstore = store
     w.register({ln: None for ln in ORDER}, ORDER)
     return w
 
@@ -192,7 +191,7 @@ def test_parked_request_still_gets_a_load_plan():
     "Running: 0 reqs, Waiting: 3, Deferred: 3" with throughput at zero.
     """
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN)]
     sched = HybridRequestScheduler(
@@ -216,7 +215,7 @@ def test_async_plan_is_emitted_only_once():
     """A second plan would submit a second transfer for a request that
     already has one in flight, stranding the first."""
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(),
@@ -240,7 +239,7 @@ def test_recurrent_models_can_go_async():
     test_async_mamba_targets_the_slot_vllm_reads_as_prev.
     """
     from kvshrink.kvshrink_connector import ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     class _Cfg:
         def select(self, concurrency):
@@ -284,7 +283,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
     runs at all, so the slot would be left unrestored while the core
     has already credited the tokens."""
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     sched = HybridRequestScheduler(
@@ -310,7 +309,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     parked or finished, never running) and killed EngineCore.
     """
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,
@@ -349,7 +348,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     returning 500.
     """
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
-    from kvshrink.scheduler import HybridRequestScheduler
+    from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16,

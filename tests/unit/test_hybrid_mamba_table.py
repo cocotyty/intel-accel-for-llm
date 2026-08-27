@@ -13,9 +13,8 @@ so they run in the container test runner).
 from __future__ import annotations
 
 
-from conftest import FakeBlocks, make_spec
+from conftest import FakeBlocks, HybridRequestScheduler, make_spec
 from kvshrink.kvshrink_connector import GroupInfo
-from kvshrink.scheduler import HybridRequestScheduler
 
 
 class _Store:

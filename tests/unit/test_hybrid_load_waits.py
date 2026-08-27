@@ -21,11 +21,10 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import make_spec
+from conftest import HybridWorker, make_spec
 from kvshrink.kvshrink_connector import (
     RequestMetadata,
     CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
-from kvshrink.worker import HybridWorker
 
 PAGE = 4096
 
@@ -86,7 +85,7 @@ def _worker(store=None, order=ORDER, gdn=None):
     layer_infos = {ln: None for ln in order}
     w = HybridWorker(groups, layer_infos, "ns",
                      _FakeCanon(), rank=0, tp_size=1)
-    w.store = store or _FakeStore()
+    w.kvstore = store or _FakeStore()
     w.register({ln: None for ln in order}, order)
     return w
 
