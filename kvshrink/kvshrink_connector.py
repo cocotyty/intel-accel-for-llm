@@ -9,6 +9,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
@@ -83,21 +84,6 @@ class ReqState:
 @dataclass
 class RequestMetadata:
     requests: dict[ReqId, ReqMeta] = field(default_factory=dict)
-
-    def add_request(
-        self,
-        req_id: ReqId,
-        group_ops: tuple[GroupTransferMeta, ...] = (),
-        external_hit_tokens: int = 0,
-        is_async: bool = False,
-        async_load_layers: int = -1,
-    ) -> None:
-        self.requests[req_id] = ReqMeta(
-            group_ops,
-            external_hit_tokens,
-            is_async,
-            async_load_layers,
-        )
 
 @dataclass
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
@@ -187,9 +173,9 @@ class Canonicalizer:
     def _is_split_kv_layout(
         raw: torch.Tensor, info: LayerPageInfo
     ) -> bool:
-        """True when num_blocks lives in a non-leading physical dim, i.e.
-        the K/V-split [2, N, ...] FlashAttention layout. Mirrors the
-        physical-to-logical stride mapping in vLLM's offloading worker."""
+        """True when num_blocks lives in a non-leading physical dim
+        (K/V-split layout). Mirrors the physical-to-logical stride
+        mapping in vLLM's offloading worker."""
         if raw.dim() < 2 or raw.shape[0] != 2:
             return False
         strides = raw.stride()
@@ -202,31 +188,12 @@ class Canonicalizer:
         physical_pos = physical_to_logical.index(logical_nb_dim)
         return physical_pos != 0
 
-    def _page_parts(
-        self, layer_name: str, block_id: int
-    ) -> tuple[torch.Tensor, ...]:
-        """Physical tensor(s) holding logical block ``block_id``: a single
-        view for contiguous layouts, or (K, V) halves for split layouts."""
-        v = self._views[layer_name]
-        if isinstance(v, tuple):
-            return (v[0][block_id], v[1][block_id])
-        return (v[block_id],)
-
     def page_view_parts(self, layer_name: str) -> dict[str, torch.Tensor]:
         """Full-pool canonical page views for the KVFlow chunk engine."""
         v = self._views[layer_name]
         if isinstance(v, tuple):
             return {"k": v[0], "v": v[1]}
         return {"page": v}
-
-    def get_page(self, layer_name: str, block_id: int) -> torch.Tensor:
-        """Single tensor for one logical page: the canonical view row,
-        or a concatenated K||V view for split-K/V layers. Used by the
-        read/zero paths."""
-        parts = self._page_parts(layer_name, block_id)
-        if len(parts) == 1:
-            return parts[0]
-        return torch.cat([p.reshape(-1) for p in parts])
 
 def storage_size_bytes(t: torch.Tensor | list[torch.Tensor]) -> int:
     """Bytes of the underlying untyped storage for a kv_cache entry;
@@ -421,12 +388,6 @@ def save_enabled() -> bool:
     KVSHRINK_DEBUG_AUTOSAVE=1 force-enables it."""
     return (os.getenv("KVSHRINK_SAVE", "1") != "0"
             or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
-
-def _now() -> float:
-    """Monotonic clock for step-latency accounting: immune to NTP
-    steps, so measured durations are never negative."""
-    import time as _t
-    return _t.monotonic()
 
 class _StoreAsBlockPool:
     """The one thing vLLM's matching code needs that we must supply."""
@@ -923,11 +884,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.num_computed_tokens + num_external_tokens)
         state.pending_load_tokens = num_external_tokens
         all_block_ids = blocks.get_block_ids()
-        for g_idx, group in enumerate(self._groups):
-            if g_idx >= len(all_block_ids):
-                continue
-            ids = list(all_block_ids[g_idx])
-            state.groups[g_idx].block_ids = ids
+        for g_idx, ids in enumerate(all_block_ids):
+            state.groups[g_idx].block_ids = list(ids)
         if (state.is_async and not state.async_plan_emitted
                 and num_external_tokens > 0):
             self._async_load_pending.add(req_id)
@@ -1228,31 +1186,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     raise RuntimeError("FlashInfer is not supported")
                 break
 
-        if self._canon is not None:
-            self._register_layer_caches(kv_caches)
-
-            views = {
-                f"{ln}#{part}": view
-                for ln in self._layer_names
-                for part, view in self._canon.page_view_parts(ln).items()
-            }
-            self.kvstore = KVStore(
-                model_name=os.path.basename(self.model_config.model),
-                block_dim=0,
-                kv_caches=views,
-                rank=self._rank,
-                tp_size=self.tp_size,
-            )
-            logger.info("Registered %d KV cache layers (%d page views)",
-                        len(kv_caches), len(views))
-
-    def _register_layer_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
-    ) -> None:
-        """Bind canonical page views, in model execution order."""
         from vllm.model_executor.models.utils import extract_layer_index
 
-        self.register(kv_caches, sorted(kv_caches, key=extract_layer_index))
+        self.register(kv_caches,
+                      sorted(kv_caches, key=extract_layer_index))
+
+        views = self._flat_views(
+            {ln: self._canon.page_view_parts(ln)
+             for ln in self._layer_names})
+        self.kvstore = KVStore(
+            model_name=os.path.basename(self.model_config.model),
+            block_dim=0,
+            kv_caches=views,
+            rank=self._rank,
+            tp_size=self.tp_size,
+        )
+        logger.info("Registered %d KV cache layers (%d page views)",
+                    len(kv_caches), len(views))
 
     def register(
         self,
@@ -1334,7 +1284,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._saved_layers = set()
         self._step_save_pages = 0
         npages = 0
-        _t0 = _now()
+        _t0 = time.monotonic()
         by_group: dict[int, tuple[list[tuple[int, str]], set[str]]] = {}
         for req_id, req_meta in metadata.reqs_to_load.requests.items():
             if req_meta.is_async:
@@ -1368,7 +1318,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 "start_load_kv: %d pages loaded "
                 "elapsed_ms=%.3f (rank %d/%d)", npages,
-                (_now() - _t0) * 1e3, self._rank, self.tp_size)
+                (time.monotonic() - _t0) * 1e3, self._rank, self.tp_size)
         return npages
 
     def _register_async_load(
@@ -1676,8 +1626,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if group.kind != "mamba":
                 continue
             ln = group.layer_names[0]
+            page_view = self._canon.page_view_parts(ln)["page"]
             for blk in range(10):
-                page = self._canon.get_page(ln, blk)
+                page = page_view[blk]
                 h = hashlib.sha256(
                     page.cpu().numpy().tobytes()).hexdigest()
                 logger.info("DUMP g%d block=%d sha=%s",
