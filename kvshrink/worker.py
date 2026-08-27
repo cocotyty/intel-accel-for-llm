@@ -81,8 +81,6 @@ class HybridWorker:
         # register_kv_caches.
         self.store: Optional[KVStore] = None
 
-        self._kv_caches_ref: Optional[
-            dict[str, torch.Tensor | list[torch.Tensor]]] = None
         # Per-step load tasks, "layer#part" -> engine Task: populated
         # by start_load (one merged engine call per group per step),
         # waited and popped per layer -- GDN layers as one barrier in
@@ -116,7 +114,6 @@ class HybridWorker:
         execution_order: list[str],
     ) -> None:
         """Bind canonical page views and record which layers recur."""
-        self._kv_caches_ref = kv_caches
         self._canon.register(kv_caches)
 
         self._mamba_layers = frozenset(
@@ -377,9 +374,7 @@ class HybridWorker:
             return
         if not save_enabled():
             return
-        g_idx = self._attn_layer_group.get(layer_name)
-        if g_idx is None:
-            return  # not an attention layer we serve (fast path)
+        g_idx = self._attn_layer_group[layer_name]
         expected = sorted(self._groups[g_idx].layer_names)
         entries: list[tuple[int, str]] = []
         for _bkey, cand in self._gather_save_candidates(metadata).items():
@@ -405,8 +400,6 @@ class HybridWorker:
         write every page of every group.
         Fail-stop on any anomaly (the scheduler already advanced its
         incremental indices). Returns (pages, boundaries)."""
-        if self._kv_caches_ref is None:
-            return 0, 0
         _t0 = _now()
         candidates = self._gather_save_candidates(metadata)
         pipelined = os.getenv("KVSHRINK_SAVE_PIPELINED", "1") != "0"
@@ -485,8 +478,7 @@ class HybridWorker:
         """KVSHRINK_DEBUG_DUMP=1: log sha256 of the first layer page of
         every mamba group at gpu blocks 0..9, so cold-vs-hot GPU states
         can be compared byte-exactly."""
-        if not os.getenv("KVSHRINK_DEBUG_DUMP") \
-                or self._kv_caches_ref is None:
+        if not os.getenv("KVSHRINK_DEBUG_DUMP"):
             return
         import hashlib
         for group in self._groups:

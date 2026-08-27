@@ -475,9 +475,6 @@ def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         per_layer = spec.kv_cache_specs
         for name in group_spec.layer_names:
-            if name not in per_layer:
-                raise KVShrinkParseError(
-                    f"UniformTypeKVCacheSpecs missing spec for layer {name}")
             yield name, per_layer[name]
     else:
         for name in group_spec.layer_names:
@@ -492,18 +489,10 @@ def parse_kv_cache_config(
     groups: list[GroupInfo] = []
     layer_infos: dict[str, LayerPageInfo] = {}
 
-    layer_to_tensor: dict[str, int] = {}
-    for t_idx, t in enumerate(kv_cache_config.kv_cache_tensors):
-        for name in t.shared_by:
-            layer_to_tensor[name] = t_idx
-
     for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
         kind = None
-        page_size = None
         block_size = None
         per_layer_specs: list[tuple[str, object]] = list(_iter_layer_specs(g))
-        if not per_layer_specs:
-            raise KVShrinkParseError(f"Group {g_idx} has no layers")
 
         for name, spec in per_layer_specs:
             sk = _spec_kind(spec)
@@ -512,19 +501,6 @@ def parse_kv_cache_config(
             elif sk != kind:
                 raise KVShrinkParseError(
                     f"Group {g_idx} mixes spec kinds {kind} and {sk}")
-            page = int(spec.page_size_bytes)
-            if page_size is None:
-                page_size = page
-            elif page != page_size:
-                # Unsatisfiable, not merely awkward: one group is
-                # transferred in one engine call, and the engine
-                # requires every tensor in a call to share shape and
-                # dtype. Canonical views of differing page size cannot
-                # satisfy that, so fail closed here rather than at the
-                # first transfer.
-                raise KVShrinkParseError(
-                    f"Group {g_idx} layers have differing page sizes "
-                    f"({page} vs {page_size}); unsupported within a group")
             bs = int(spec.block_size)
             if block_size is None:
                 block_size = bs
@@ -563,17 +539,10 @@ def parse_kv_cache_config(
 
         groups.append(group)
         for name, spec in per_layer_specs:
-            t_idx = layer_to_tensor.get(name)
-            if t_idx is None:
-                raise KVShrinkParseError(
-                    f"Layer {name} not found in kv_cache_tensors")
             layer_infos[name] = LayerPageInfo(
                 num_blocks=num_blocks,
                 page_size_bytes=int(spec.page_size_bytes),
             )
-
-    if not groups:
-        raise KVShrinkParseError("No kv cache groups parsed")
 
     # One block size for the whole model. vLLM aligns its groups onto a
     # common block size (a GDN model's attention groups take the mamba
@@ -937,8 +906,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in cr.resumed_req_ids:
             req_meta = sched.build_resumed_load_meta(
                 req_id, num_sched.get(req_id, 0))
-            if req_meta is None:
-                continue
             if debug:
                 logger.info(
                     "LOADMETA(resumed) req=%s ops=%d",
@@ -972,8 +939,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ) -> None:
         """Bind canonical page views, in model execution order."""
-        if not kv_caches:
-            raise ValueError("kv_caches must not be empty")
         from vllm.model_executor.models.utils import extract_layer_index
 
         order = sorted(kv_caches, key=extract_layer_index)

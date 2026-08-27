@@ -129,9 +129,7 @@ class HybridRequestScheduler:
         """Load plans for requests vLLM parked, drained exactly once."""
         plans = {}
         for req_id in sorted(self._async_load_pending - already_emitted):
-            state = self._req_states.get(req_id)
-            if state is None:
-                continue
+            state = self._req_states[req_id]
             meta = self._build_load_meta_from_state(
                 req_id, state, scheduled_tokens=0)
             state.async_plan_emitted = True
@@ -176,9 +174,7 @@ class HybridRequestScheduler:
         """vLLM trigger: every scheduling pass, for each running
         (cached) request, via connector.build_connector_meta.
         """
-        state = self._req_states.get(req_id)
-        if state is None:
-            return
+        state = self._req_states[req_id]
         # Adopt block hashes vLLM has appended since we registered
         # (decode completes blocks too; without this, generated tokens
         # are never offloaded). Only ever extends -- hashes are
@@ -263,16 +259,8 @@ class HybridRequestScheduler:
         """
         if external <= 0 or self._async_load_config is None:
             return False
-        state = self._req_states.get(req_id)
-        if state is None:
-            return False
-        try:
-            selected = self._async_load_config.select(len(self._req_states))
-        except Exception:  # pragma: no cover - fail closed to sync
-            logger.exception(
-                "async load policy failed for req=%s; loading synchronously",
-                req_id)
-            return False
+        state = self._req_states[req_id]
+        selected = self._async_load_config.select(len(self._req_states))
         if selected == 0:
             return False
         state.is_async = True
@@ -337,11 +325,9 @@ class HybridRequestScheduler:
 
     def build_resumed_load_meta(
         self, req_id: str, scheduled_tokens: int = 0
-    ) -> Optional[ReqMeta]:
+    ) -> ReqMeta:
         """Build the LOAD ReqMeta for a PREEMPTION-RESUMED request."""
-        state = self._req_states.get(req_id)
-        if state is None:
-            return None
+        state = self._req_states[req_id]
         meta = self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
         if state.pending_load_tokens > 0:
@@ -509,9 +495,7 @@ class HybridRequestScheduler:
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
         """Production save: INCREMENTAL per-group page persistence."""
-        state = self._req_states.get(req_id)
-        if state is None:
-            return ReqMeta()
+        state = self._req_states[req_id]
         progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
                                         progress)
@@ -651,10 +635,6 @@ class HybridHitPolicy:
         """How far this group alone is restorable, in tokens."""
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
         manager_cls = KVCacheSpecRegistry.get_manager_class(group.spec)
-        if manager_cls is None:
-            raise RuntimeError(
-                f"kvshrink: vLLM has no cache-hit rule for "
-                f"{type(group.spec).__name__} (group {group.group_idx})")
         # vLLM indexes the hash list directly out to max_length, so the
         # caller owes it a length its own hashes cover. Its scheduler
         # gets this for free (the bound comes from the same request);
