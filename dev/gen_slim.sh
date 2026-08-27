@@ -33,7 +33,8 @@ rsync -a --delete \
 cd "$SLIM"
 rm -rf tests/unit tests/gpu tests/README.md \
     doc/design/kvshrink-hybrid.md \
-    doc/design/kvshrink-connector-functions.md
+    doc/design/kvshrink-connector-functions.md \
+    doc/design/main-vs-hybrid-diff.md
 
 # Files the hybrid change must leave exactly as main has them.
 git -C "$FULL" show main:README.md > README.md
