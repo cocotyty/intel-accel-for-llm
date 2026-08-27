@@ -22,8 +22,8 @@ from kvshrink.kvshrink_connector import group_label, lookup_boundary
 from kvshrink.kvshrink_connector import CacheKey
 
 
-def _key(group_idx=0, tp_size=2):
-    return CacheKey(namespace="ns", tp_size=tp_size, rank=0,
+def _key(group_idx=0):
+    return CacheKey(namespace="ns", rank=0,
                     block_hash=12345, group_idx=group_idx, layer_name="")
 
 
@@ -55,7 +55,7 @@ def test_queries_own_rank_label_only():
     """The controller can only see the ledger it shares with the
     rank-0 worker, so that is the only label it may ask about."""
     store = _FakeStore([group_label("ns", 0, 0)])
-    assert lookup_boundary(store, _key(tp_size=2)) is True
+    assert lookup_boundary(store, _key()) is True
     assert store.asked == [group_label("ns", 0, 0)]
 
 

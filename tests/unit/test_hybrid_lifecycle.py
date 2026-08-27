@@ -192,7 +192,7 @@ def test_abort_keeps_committed_boundary_hittable():
     sched.on_request_finished("r1")  # abort
     # a fresh lookup for the same hashes still hits
     assert lookup_boundary(
-        store, CacheKey("ns", 1, 0, 0, 0, "")) == True
+        store, CacheKey("ns", 0, 0, 0, "")) == True
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():

@@ -92,7 +92,7 @@ def _worker(store=None, order=ORDER, gdn=None):
 
 def _load_meta(layers, group_idx, req_id="r1"):
     """One load op covering ``layers`` for a single block."""
-    keys = tuple(CacheKey(namespace="ns", tp_size=1, rank=0,
+    keys = tuple(CacheKey(namespace="ns", rank=0,
                           block_hash=7, group_idx=group_idx,
                           layer_name=ln) for ln in layers)
     op = GroupTransferMeta(group_idx=group_idx, keys=keys,

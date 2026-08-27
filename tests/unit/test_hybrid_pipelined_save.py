@@ -25,7 +25,7 @@ def _group(g_idx, kind, layers):
 
 
 def _key(layer_name, blk_hash=777, g_idx=0):
-    return CacheKey(namespace="ns", tp_size=1, rank=0,
+    return CacheKey(namespace="ns", rank=0,
                     block_hash=blk_hash, group_idx=g_idx,
                     layer_name=layer_name)
 

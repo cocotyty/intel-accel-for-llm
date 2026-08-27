@@ -505,12 +505,13 @@ class CacheKey:
     """Logical key for one page, or for a whole boundary.
 
     A boundary is the same key with ``layer_name == ""``; it names the
-    group's blocks at that hash rather than one layer's page. Namespace,
-    tp, rank, hash and group are all part of the identity, so no two
-    distinct states can share an address.
+    group's blocks at that hash rather than one layer's page. The
+    namespace already encodes the model identity, cache dtype and TP
+    size (see ``compute_namespace``), so namespace, rank, hash and
+    group are the whole identity -- no two distinct states can share an
+    address.
     """
     namespace: str
-    tp_size: int
     rank: int
     block_hash: object  # int (unit tests) or bytes/str (vLLM)
     group_idx: int
@@ -525,19 +526,18 @@ class CacheKey:
         return str(h)
 
     @property
-    def boundary_key(self) -> tuple[str, int, int, str, int]:
-        """Isolation-safe identity for a boundary (namespace/tp/rank/hash/group)."""
-        return (self.namespace, self.tp_size, self.rank, self.hash_str,
-                self.group_idx)
+    def boundary_key(self) -> tuple[str, int, str, int]:
+        """Isolation-safe identity for a boundary (namespace/rank/hash/group)."""
+        return (self.namespace, self.rank, self.hash_str, self.group_idx)
 
 
-def make_boundary_key(namespace: str, tp_size: int, rank: int,
+def make_boundary_key(namespace: str, rank: int,
                       group_idx: int, block_hash: object) -> "CacheKey":
     """A group's key at one block hash, with no layer: the address the
     hit policy asks about and the address the save/load builders expand
     into per-layer page keys."""
     return CacheKey(
-        namespace=namespace, tp_size=tp_size, rank=rank,
+        namespace=namespace, rank=rank,
         block_hash=block_hash, group_idx=group_idx, layer_name="")
 
 
@@ -641,15 +641,14 @@ def compute_namespace(
     cache_dtype: str,
     kv_schema_version: int,
     tp_size: int,
-    pp_size: int,
 ) -> str:
     """Stable cache namespace: sha256 over model identity, cache dtype,
-    schema version and tp/pp size, truncated to 16 hex chars. The schema
+    schema version and tp size, truncated to 16 hex chars. The schema
     version is an input so that changing the page layout renames the
     namespace, rather than reading old pages under the new layout."""
     raw = "|".join([
         model_id, model_revision, tokenizer_revision, cache_dtype,
-        str(kv_schema_version), str(tp_size), str(pp_size),
+        str(kv_schema_version), str(tp_size),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -1006,76 +1005,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.vllm_device: str = vllm_config.device_config.device_type
         self.rank: int = get_world_group().rank if model_parallel_is_initialized() else 0
 
-        # Ordered worker-side layer names (populated in
-        # register_kv_caches) for the block store layout.
-        self._layer_names: list[str] = []
-
         self._async_load_layer_config: AsyncLoadLayerConfig = (
             load_async_load_layer_config_from_env(
                 num_layers=self.num_layers,
             )
         )
 
-        self._groups: list[GroupInfo] = []
-        self._layer_infos: dict[str, LayerPageInfo] = {}
-        # Authoritative TP rank, set by _init_kv_stack. Distinct from
-        # self.rank, which is read from the world group before
-        # distributed init has run and is therefore 0 on every worker.
-        self._rank: int = 0
         self.kvstore: Optional[KVStore] = None
 
         # Scheduler-side planning state (harmless on the worker role,
-        # which never receives scheduler hooks).
-        self._namespace: str = ""
-        self._hash_block_size: int = 0
-        # Where a block's cache identity comes from; see
-        # _choose_block_hash_source.
-        self._block_hash_source: str = "vllm"
-        # Attention layers in group order, used to size the
-        # early-release prefix. Mamba layers are deliberately absent:
-        # they are never partially released (see _decide_async).
-        self._attention_layers: tuple[str, ...] = ()
+        # which never receives scheduler hooks). Everything planned
+        # against -- groups, namespaces, hash granularity -- is built
+        # once in _init_kv_stack; mutating bookkeeping starts empty.
         self._req_states: dict[str, ReqState] = {}
         # Async requests whose load plan has not been emitted yet. See
         # update_state_after_alloc for why this cannot be derived from
         # the scheduler output.
         self._async_load_pending: set[str] = set()
 
-        # Worker-side execution state.
-        self._canon: Optional[Canonicalizer] = None
-        # Store namespace per group (see the lookup-vocabulary section
-        # for why group and rank must be part of it).
-        self._labels: list[str] = []
-        # Per-step load tasks, "layer#part" -> engine Task: populated
-        # by start_load (one merged engine call per group per step),
-        # waited and popped per layer -- GDN layers as one barrier in
-        # start_load, attention layers at their forward-entry hooks.
-        self._load_tasks: dict[str, Task] = {}
-        # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
-        # _load_tasks these deliberately OUTLIVE the step that submitted
-        # them -- the whole point is that the request is not occupying a
-        # forward step while its pages arrive. Entries leave in two
-        # stages: released (reported through get_finished, so vLLM may
-        # schedule the request again) and then drained (its remaining
-        # layers waited by the per-layer hooks during that forward).
+        # In-flight ASYNC loads: req_id -> _AsyncLoad. Entries
+        # deliberately OUTLIVE the step that submitted them -- the whole
+        # point is that the request is not occupying a forward step
+        # while its pages arrive. Entries leave in two stages: released
+        # (reported through get_finished, so vLLM may schedule the
+        # request again) and then drained (its remaining layers waited
+        # by the per-layer hooks during that forward).
         self._async_loads: dict[str, "_AsyncLoad"] = {}
-        # layer_name -> group idx, every cached layer.
-        self._layer_group: dict[str, int] = {}
-        # attention layer_name -> group idx (mamba layers map out).
-        self._attn_layer_group: dict[str, int] = {}
-        # All GDN layer names, waited as one barrier in start_load
-        # before any attention layer runs (populated in register).
-        self._mamba_layers: frozenset[str] = frozenset()
-        # Attention layers in model execution order, used by the async
-        # release gate ("the first N layers" means nothing otherwise).
-        self._attn_order: tuple[str, ...] = ()
-        # Save pipelining (see the Worker Side banner): attention layer
-        # -> the mamba layers that precede it since the previous
-        # attention layer, submitted at that layer's save hook.
-        self._mamba_save_segments: dict[str, tuple[str, ...]] = {}
-        # Layers whose save was already submitted this step.
-        self._saved_layers: set[str] = set()
-        self._step_save_pages: int = 0
         # Async save lifecycle (same shape as main): put tasks per
         # contributing request, drained in get_finished; finished
         # requests are held until their loads AND saves have landed.
@@ -1108,6 +1063,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """
         pc = vllm_config.parallel_config
         tp_size = pc.tensor_parallel_size
+        # Fail-closed: pipeline parallelism shards LAYERS across ranks,
+        # so one rank holds half the model's KV and its pages alone name
+        # only half a block. Every key would silently address a partial
+        # state. Nothing here can degrade safely, so refuse at startup.
+        if pc.pipeline_parallel_size != 1:
+            raise RuntimeError(
+                "kvshrink hybrid: pipeline parallelism is not supported "
+                f"(pipeline_parallel_size={pc.pipeline_parallel_size}); "
+                "each rank would persist only its own layers' pages. "
+                "Set pipeline_parallel_size=1 or the KV connector.")
         if role == KVConnectorRole.WORKER:
             # parallel_config.rank, NOT get_world_group(): the connector
             # is constructed before distributed init in the worker
@@ -1136,7 +1101,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             cache_dtype=cache_config.cache_dtype,
             kv_schema_version=SCHEMA_VERSION,
             tp_size=tp_size,
-            pp_size=1,
         )
         # Fail-closed: a lossy codec would corrupt GDN state (see the
         # function for why this path cannot tolerate what the
@@ -1167,7 +1131,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "speculative decoding or the KV connector.")
         self._groups = groups
         self._layer_infos = layer_infos
+        # Authoritative TP rank. Distinct from self.rank, which is read
+        # from the world group before distributed init has run and is
+        # therefore 0 on every worker.
         self._rank = rank
+        # Attention layers in group order, used to size the
+        # early-release prefix. Mamba layers are deliberately absent:
+        # they are never partially released (see _decide_async).
         self._attention_layers = tuple(
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
@@ -1187,11 +1157,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self._canon = Canonicalizer(layer_infos, num_blocks)
+            # Store namespace per group (see the lookup-vocabulary
+            # section for why group and rank must be part of it).
             self._labels = [
                 group_label(self._namespace, g.group_idx, rank)
                 for g in groups]
+            # layer_name -> group idx, every cached layer.
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
+            # attention layer_name -> group idx (mamba layers map out).
             self._attn_layer_group = {
                 ln: g.group_idx for g in groups if g.kind != "mamba"
                 for ln in g.layer_names}
@@ -2146,21 +2120,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
         """This rank's boundary key for one group at one block hash."""
-        return make_boundary_key(self._namespace, self.tp_size,
-                                 self._rank, group.group_idx, block_hash)
+        return make_boundary_key(self._namespace, self._rank,
+                                 group.group_idx, block_hash)
 
     def _present(self, group_idx: int, block_hash: object) -> bool:
         """Store-presence predicate handed to the hit policy, which
         plans against boundary addresses without seeing store details."""
         return lookup_boundary(
             self.kvstore,
-            make_boundary_key(self._namespace, self.tp_size, self._rank,
+            make_boundary_key(self._namespace, self._rank,
                               group_idx, block_hash))
 
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
         """Expand a boundary key to ONE layer's page key: same
-        namespace/tp/rank/hash/group as the boundary, plus the layer
+        namespace/rank/hash/group as the boundary, plus the layer
         name. This is the exact page address the worker must move."""
         return replace(boundary_key, layer_name=layer_name)
 
@@ -2278,11 +2252,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         order. Only the attention layers' order is used, by the async
         release gate -- "the first N layers" means nothing otherwise.
         """
+        # Ordered layer names for the block store layout and the two
+        # order-sensitive derived sets.
         self._layer_names = list(execution_order)
         self._canon.register(kv_caches)
+        # All GDN layers: waited as one barrier in start_load before any
+        # attention layer runs.
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
             for ln in g.layer_names)
+        # Attention layers in model execution order, used by the async
+        # release gate ("the first N layers" means nothing otherwise).
         self._attn_order = tuple(
             ln for ln in execution_order if ln in self._attn_layer_group)
         # Save pipelining segments: the mamba layers between attention
@@ -2372,6 +2352,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         which GDN layer, and no way for a GDN layer to reach forward
         unwaited. Returns the number of (layer, block) pages submitted.
         """
+        # Per-step reset. _load_tasks holds "layer#part" -> engine Task
+        # for this step's sync loads (waited per layer -- GDN as one
+        # barrier here, attention at their forward-entry hooks);
+        # _saved_layers/_step_save_pages track what the save hooks have
+        # submitted.
         self._load_tasks = {}
         self._saved_layers = set()
         self._step_save_pages = 0
@@ -2694,7 +2679,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
         for bkey, cand in candidates.items():
-            namespace, tp_size, rank, blk_hash, g_idx = bkey
+            _, _, blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
             if sorted(cand.pages) != expected:
                 # A partial boundary is skipped (the scheduler's
