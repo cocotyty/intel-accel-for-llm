@@ -282,7 +282,9 @@ class Canonicalizer:
         self._num_blocks: int = num_blocks
         self._views: dict[str, torch.Tensor] = {}
 
-    def register(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ) -> None:
         """Build the canonical (num_blocks, page_size_bytes) int8 views
         over the vLLM kv_caches, handling Mamba list-of-tensors storage
         and split-K/V attention layouts. Raises ValueError on any
@@ -412,7 +414,7 @@ class Canonicalizer:
         # split-K/V: return a concatenated K||V view for read/zero paths
         return torch.cat([p.reshape(-1) for p in parts])
 
-def storage_size_bytes(t: torch.Tensor) -> int:
+def storage_size_bytes(t: torch.Tensor | list[torch.Tensor]) -> int:
     """Bytes of the underlying untyped storage for a kv_cache entry;
     Mamba entries (list/tuple of tensors sharing one storage) report
     the first tensor's storage. Used for descriptor bounds checks."""
@@ -1201,7 +1203,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def _register_layer_caches(
-        self, kv_caches: dict[str, torch.Tensor]
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ) -> None:
         """Bind canonical page views, in model execution order.
 
@@ -1236,7 +1238,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     # Worker Side Methods
     ############################################################
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ) -> None:
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
 
