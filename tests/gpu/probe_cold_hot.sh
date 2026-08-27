@@ -46,7 +46,7 @@ COLD_LOG="$GATE_LAST_LOG"
 check "hybrid path active" \
     grep -q "kvshrink hybrid path enabled" "$COLD_LOG"
 check "cold run saved boundaries" \
-    grep -qE "chunk_save: [1-9][0-9]* pages stored, [1-9][0-9]* boundaries" "$COLD_LOG"
+    grep -qE "chunk_save: [1-9][0-9]* pages submitted, [1-9][0-9]* boundaries" "$COLD_LOG"
 check "cold run produced output" test -n "$COLD_OUT"
 
 # ----------------------------------------------------------------- hot
