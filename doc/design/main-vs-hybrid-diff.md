@@ -171,15 +171,15 @@ block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
 self.kvstore = KVStore(..., block_dim=block_dim, kv_caches=kv_caches, ...)
 ```
 
-**为什么必须改**：传输引擎铁律——一次调用的所有张量必须同形同 dtype。
-纯 attention 天然同形（都是 [2, N, H, D] bf16）。GDN 层天生是一份存
-储上的 conv_state 和 ssm_state 两个异形张量，连 shape 都不一样，直接
-递给引擎是非法调用。
+**为什么必须改**：不是引擎拒收异形张量——put 对 tensors 字典逐条目
+循环、每层独立入账，全端上去也合法。真正的问题是可寻址性：GDN 层天
+生是一份存储上的 conv_state 和 ssm_state 两个异形张量，谁也没法当
+"块表的行"按块号切片搬运。
 
 **我们怎么改**：Canonicalizer 给每层构建统一的
 `(num_blocks, page_bytes)` int8 视图——把"一个逻辑页"重新定义为字
 节平面，conv 在前 ssm 在后拼起来正好一页。dtype 全部坍缩成 int8，
-chunk_dim 全部坍缩为 0，引擎从此见山是山。（这也与后来砍掉引擎
+chunk_dim 全部坍缩为 0，整个引擎接口被拉平。（这也与后来砍掉引擎
 chunk_dim/block_dim 参数的方向一致——视图归一化了那些参数就没有存
 在的意义了。）
 
@@ -302,9 +302,9 @@ main 对 update_state_after_alloc 有 `state is None -> RuntimeError`。
 
 **我们必须加的三件事**：
 
-a) **按组合并**。main 的 sync 批只要 einsum 大 batch 就好，不同层的
-   张量形状一致所以引擎 happy。我们这边一组一次调用（views 同形是在
-   组内成立的，跨组不成立——各组的页面尺寸本来就可以不同）。
+a) **按组合并**。不是引擎吃不下混批——是 label 契约：显式 label 的
+   调用按调用整体记账结算，一次只能结算一个组的全部层，所以调用天然
+   按组发起；一锅端四个组等于结算四本只写了一部分的账页。
 
 b) **GDN host-block 屏障**。vLLM 只对 attention 层调
 wait_for_layer_load，mamba/GDN 层在 forward 里没有任何 hook 经过。所
@@ -409,7 +409,7 @@ bool）：poll 时检查 gate 是否齐 -> 齐 = released 上报;剩余楼层由
 
 - 寻址：标签加组号——一本账住进四个组，存在性台账不带层名必须分账页
 - 命中：一条扫描线变定点迭代——递归状态的命中方向天生和 attention 相反
-- 视图：原生张量变字节平面——引擎只吃同形张量，GDN 天生不同形
+- 视图：原生张量变字节平面——异形 conv/ssm 没法按块号寻址，统一 int8 行把引擎接口拉平
 - 组装：alloc 时算区间变 boundary 钉死——除法落不到合法快照边界上
 - 记账：一片计数变游标回滚——写可能在路上，重发幂等漏发致命
 - 等待：attn 层入口等待变 attn 入口 + GDN 屏障——GDN 没人管，只能开头拦

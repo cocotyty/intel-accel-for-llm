@@ -245,12 +245,20 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 #
 # Why the whole group goes in one call
 # ------------------------------------
-# The engine requires every tensor in a call to share shape and dtype, and
-# a recurrent layer is two tensors of different shape (conv state, ssm
-# state) over one storage. Passing canonical int8 page views satisfies
-# that, and it also makes the call atomic: a block is finalized once, with
-# all of its layers, so presence IS the commit. There is no second phase
-# to publish and therefore nothing that can dangle.
+# Not because the engine forbids mixed shapes -- it iterates the tensor
+# dict and stores each entry independently, so it happily takes
+# everything at once. The real reason is the label contract: an
+# explicit-label call is finalized (Record-committed) as a whole, so a
+# call must carry exactly one group's WHOLE layer set. Submitting all
+# groups in one call would commit four labels' ledgers with data for
+# only some of them. One group per call also makes the write atomic per
+# group: a block is finalized once, with all of its layers, so presence
+# IS the commit. There is no second phase to publish and therefore
+# nothing that can dangle.
+#
+# (The canonical int8 page views are still what makes ANY of this
+# expressible: conv/ssm over one storage become uniform rows the engine
+# can chunk along dim 0, whatever shape the original tensors had.)
 
 
 def group_label(group_idx: int) -> str:
@@ -308,17 +316,16 @@ def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
 class Canonicalizer:
     """Builds canonical (num_blocks, page_size_bytes) int8 views per layer.
 
-    Not a convenience. The transfer engine asserts that every tensor in
-    one call shares shape AND dtype, and a GDN layer is two tensors of
-    different shape (conv_state, ssm_state) over one storage. Handing
-    those to the engine directly is impossible; a uniform int8 page view
-    per layer is what makes the call legal, with chunk_dim collapsing to
-    0 for every layout.
+    A GDN layer is two tensors of different shape (conv_state,
+    ssm_state) over one storage; neither can be addressed as rows of a
+    per-block table. One uniform int8 page view per layer makes the
+    engine surface uniform: every tensor chunks along dim 0 with
+    chunk_indices = gpu block ids, whatever shape the original had.
 
     This is also why ``parse_kv_cache_config`` rejects a group whose
-    layers disagree on page size: within a group the views must be
-    identically shaped, so a mismatch is unsatisfiable rather than
-    merely awkward. Groups may differ from each other because each one
+    layers disagree on page size: within a group one call carries every
+    layer's view for the same blocks, so identically shaped views are
+    required there. Groups may differ from each other because each one
     is transferred in its own call.
     """
 
