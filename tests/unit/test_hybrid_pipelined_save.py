@@ -165,6 +165,37 @@ def test_mamba_segment_rides_the_next_attention_hook():
     assert len(c.kvstore.submits) == 3
 
 
+def test_mamba_segment_splits_by_group():
+    """A segment between two attention layers interleaves the mamba
+    groups; each group's layers must go under their own store label."""
+    _env_off()
+    groups = [_group(0, "attention", ["a0", "a1"]),
+              _group(1, "mamba", ["m0"]),
+              _group(2, "mamba", ["m1"])]
+    c = HybridWorker(groups, {ln: None for ln in ("a0", "a1", "m0", "m1")},
+                     "ns", _FakeCanon(), rank=0, tp_size=1)
+    c.kvstore = _FakeStore()
+    c._mamba_save_segments = {"a0": ("m0", "m1")}
+    attn_ops = GroupTransferMeta(
+        group_idx=0,
+        keys=tuple(_key(ln) for ln in ("a0", "a1")),
+        gpu_block_ids=(10, 10))
+    m0_ops = GroupTransferMeta(
+        group_idx=1, keys=(_key("m0", blk_hash=888, g_idx=1),),
+        gpu_block_ids=(20,))
+    m1_ops = GroupTransferMeta(
+        group_idx=2, keys=(_key("m1", blk_hash=999, g_idx=2),),
+        gpu_block_ids=(21,))
+    saves = RequestMetadata()
+    saves.add_request("r1", group_ops=(attn_ops, m0_ops, m1_ops))
+    c.bind_connector_metadata(KVShrinkConnectorMetadata(reqs_to_save=saves))
+    c.save_kv_layer("a0", None, None)
+    by_label = {l: layers for l, layers, _h in c.kvstore.submits}
+    assert by_label["ns_g1_r0"] == ["m0"]
+    assert by_label["ns_g2_r0"] == ["m1"]
+    assert by_label["ns_g0_r0"] == ["a0"]
+
+
 def test_write_is_the_commit():
     """A block is finalized by its own write, with the group's whole
     layer set in one step's submissions. There is no separate publish
