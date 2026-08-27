@@ -40,10 +40,10 @@ class _AsyncLoad:
     __slots__ = ("layer_tasks", "gate_layers", "released")
 
     def __init__(
-        self, layer_tasks: dict[str, list[dict[str, Task]]],
+        self, layer_tasks: dict[str, Task],
         gate_layers: set[str],
     ):
-        self.layer_tasks: dict[str, list[dict[str, Task]]] = layer_tasks
+        self.layer_tasks: dict[str, Task] = layer_tasks
         self.gate_layers: set[str] = gate_layers
         self.released: bool = False
 
@@ -82,10 +82,11 @@ class HybridWorker:
         self.store: Optional[KVStore] = None
 
         self._kv_caches_ref: Optional[dict[str, torch.Tensor]] = None
-        # Per-step load tasks: layer_name -> list of per-call engine
-        # task dicts. Populated by start_load, popped by the per-layer
-        # waits.
-        self._load_tasks: dict[str, list[dict[str, Task]]] = {}
+        # Per-step load tasks, "layer::part" -> engine Task: populated
+        # by start_load (one merged engine call per group per step),
+        # waited and popped per layer -- GDN layers as one barrier in
+        # start_load, attention layers at their forward-entry hooks.
+        self._load_tasks: dict[str, Task] = {}
         # Pipelined attention saves: layer_name -> (group_idx, tasks).
         self._step_attn_saves: dict[str, tuple[int, dict[str, Task]]] = {}
         # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
@@ -155,24 +156,13 @@ class HybridWorker:
                 for ln, parts in layer_views.items()
                 for part, view in parts.items()}
 
-    def _wait_load(
-        self, layer_tasks: dict[str, Task], wait: bool = True
-    ) -> bool:
-        """Block until the reads land, or with ``wait=False`` report
-        whether they have without consuming them -- the poll used to
-        decide if an async request may be released, which must not stall
-        the step doing the asking.
-        """
-        if not layer_tasks:
-            return True
-        if not wait:
-            return bool(
-                self.store.get_wait(get_results=layer_tasks, wait=False))
-        if not self.store.get_wait(get_results=layer_tasks, wait=True):
+    def _wait_load(self, tasks: dict[str, Task]) -> None:
+        """Host-block until these reads land; an incomplete transfer is
+        fatal -- forward is about to read these blocks."""
+        if tasks and not self.store.get_wait(get_results=tasks, wait=True):
             raise RuntimeError(
                 "kvshrink load failed: get_wait reported an incomplete "
                 "transfer; forward would read unrestored blocks")
-        return True
 
     def _wait_store(self, tasks: dict[str, Task]) -> None:
         """Host-block until these writes land. An incomplete write is
@@ -199,24 +189,40 @@ class HybridWorker:
         self._step_attn_saves = {}
         npages = 0
         _t0 = _now()
+        # Sync loads merge per group into ONE engine call per step;
+        # duplicate labels across requests (two requests loading the
+        # same external block into different GPU blocks) are fine --
+        # the engine transfers each (label, index) pair independently.
+        by_group: dict[int, tuple[list[tuple[int, str]], set[str]]] = {}
         for req_id, req_meta in metadata.reqs_to_load.requests.items():
             if req_meta.is_async:
                 # Async tasks must survive this step and must not be
                 # host-blocked by the GDN barrier below (that barrier
                 # is for requests about to enter forward; an async one
                 # is not): collect them into a private dict.
-                tasks: dict[str, list[dict[str, Task]]] = {}
+                tasks: dict[str, Task] = {}
                 for op in req_meta.group_ops:
-                    npages += self._submit_op_load(op, tasks)
+                    t, n = self._submit_group_load(op)
+                    tasks.update(t)
+                    npages += n
                 self._register_async_load(req_id, req_meta, tasks)
             else:
                 for op in req_meta.group_ops:
-                    npages += self._submit_op_load(op, self._load_tasks)
+                    entries, layers = by_group.setdefault(
+                        op.group_idx, ([], set()))
+                    entries.extend(self._op_entries(op))
+                    layers.update(key.layer_name for key in op.keys)
+        for g_idx, (entries, layers) in by_group.items():
+            tasks, n = self._submit_group_load_entries(
+                g_idx, entries, layers)
+            self._load_tasks.update(tasks)
+            npages += n
         # Every GDN layer, waited before forward begins.
-        recurrent = [td for ln in self._mamba_layers
-                     for td in self._load_tasks.pop(ln, [])]
+        recurrent = {k: self._load_tasks.pop(k)
+                     for k in list(self._load_tasks)
+                     if k.rsplit("::", 1)[0] in self._mamba_layers}
         if recurrent:
-            self._wait_tasks(recurrent)
+            self._wait_load(recurrent)
         if npages:
             logger.info(
                 "start_load_kv: %d pages loaded "
@@ -226,25 +232,26 @@ class HybridWorker:
 
     def _register_async_load(
         self, req_id: str, req_meta: ReqMeta,
-        sink: dict[str, list[dict[str, Task]]],
+        tasks: dict[str, Task],
     ) -> None:
         """Track one request's cross-step load and compute its release
         gate.
         """
-        if not sink:
+        if not tasks:
             return
-        recurrent = {ln for ln in sink if ln not in self._attn_layer_group}
+        layers = {k.rsplit("::", 1)[0] for k in tasks}
+        recurrent = layers - self._attn_layer_group.keys()
         n = req_meta.async_load_layers
         if n is None or n < 0:
-            gate = set(sink)
+            gate = layers
         else:
-            prefix = [ln for ln in self._attn_order if ln in sink][:n]
+            prefix = [ln for ln in self._attn_order if ln in layers][:n]
             gate = recurrent | set(prefix)
-        self._async_loads[req_id] = _AsyncLoad(sink, gate)
+        self._async_loads[req_id] = _AsyncLoad(tasks, gate)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
                 "async load req=%s layers=%d gate=%d (recurrent=%d) "
-                "requested_prefix=%s", req_id, len(sink), len(gate),
+                "requested_prefix=%s", req_id, len(layers), len(gate),
                 len(recurrent), n)
 
     def poll_finished_loads(self) -> set[str]:
@@ -253,20 +260,16 @@ class HybridWorker:
         for req_id, entry in list(self._async_loads.items()):
             if entry.released:
                 continue
-            gate_tasks = [td for ln in entry.gate_layers
-                          for td in entry.layer_tasks.get(ln, ())]
-            # Poll each submission separately: a task entry is one
-            # engine call's task set, and get_wait expects one
-            # such set per call, not a flattened list of them.
-            if any(not self._wait_load(td, wait=False)
-                   for td in gate_tasks):
+            gate = {k: t for k, t in entry.layer_tasks.items()
+                    if k.rsplit("::", 1)[0] in entry.gate_layers}
+            if gate and not self.store.get_wait(get_results=gate,
+                                                wait=False):
                 continue  # not landed yet; ask again next step
             # Landed: finalize the gate layers and hand the rest to
             # the per-layer hooks.
-            for ln in list(entry.gate_layers):
-                tds = entry.layer_tasks.pop(ln, [])
-                if tds:
-                    self._wait_tasks(tds)
+            self._wait_load(gate)
+            for k in gate:
+                del entry.layer_tasks[k]
             entry.released = True
             finished.add(req_id)
             if not entry.layer_tasks:
@@ -275,50 +278,54 @@ class HybridWorker:
 
     def wait_layer_load(self, layer_name: str) -> None:
         """Attention-layer entry hook: wait this layer's pages."""
-        tds = self._load_tasks.pop(layer_name, [])
+        keys = [k for k in self._load_tasks
+                if k.rsplit("::", 1)[0] == layer_name]
+        if keys:
+            self._wait_load({k: self._load_tasks.pop(k) for k in keys})
         for req_id, entry in list(self._async_loads.items()):
             if not entry.released:
                 continue
-            tds += entry.layer_tasks.pop(layer_name, [])
+            keys = [k for k in entry.layer_tasks
+                    if k.rsplit("::", 1)[0] == layer_name]
+            if keys:
+                self._wait_load(
+                    {k: entry.layer_tasks.pop(k) for k in keys})
             if not entry.layer_tasks:
                 self._async_loads.pop(req_id, None)
-        if tds:
-            self._wait_tasks(tds)
 
-    def _submit_op_load(
-        self, op: GroupTransferMeta,
-        sink: dict[str, list[dict[str, Task]]],
-    ) -> int:
-        """Submit one GroupTransferMeta to the engine (async get).
+    @staticmethod
+    def _op_entries(op: GroupTransferMeta) -> list[tuple[int, str]]:
+        """One (gpu_block_id, chunk_label) per block: keys expand per
+        block x layer (scheduler invariant), so collapse by label."""
+        seen: dict[str, int] = {}
+        for key, gpu in zip(op.keys, op.gpu_block_ids):
+            seen.setdefault(key.hash_str, gpu)
+        return [(gpu, h) for h, gpu in seen.items()]
 
-        Returns the number of (layer, block) pages covered."""
-        if not op.keys:
-            return 0
-        by_layer: dict[str, list[tuple[int, str]]] = {}
-        for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
-            by_layer.setdefault(key.layer_name, []).append(
-                (gpu_block_id, key.hash_str))
-        if not by_layer:
-            return 0
-        # Every layer of the group addresses the same chunk sequence
-        # (scheduler invariant: keys expand per block x layer).
-        entries = by_layer[next(iter(by_layer))]
+    def _submit_group_load(
+        self, op: GroupTransferMeta
+    ) -> tuple[dict[str, Task], int]:
+        """Submit one GroupTransferMeta as one engine get; returns the
+        flat tasks dict and the page count."""
+        return self._submit_group_load_entries(
+            op.group_idx, self._op_entries(op),
+            {key.layer_name for key in op.keys})
+
+    def _submit_group_load_entries(
+        self, g_idx: int, entries: list[tuple[int, str]],
+        layer_names: set[str],
+    ) -> tuple[dict[str, Task], int]:
+        """One engine get covering ``layer_names`` for the blocks in
+        ``entries``; returns the flat tasks dict ("layer::part" ->
+        Task) and the page count."""
         tensors = self._flat_views(
-            {ln: self._canon.page_view_parts(ln) for ln in by_layer})
+            {ln: self._canon.page_view_parts(ln) for ln in layer_names})
         tasks = self.store.get(block_indices=[gpu for gpu, _ in entries],
                                block_hashs=[h for _, h in entries],
                                layer_names=list(tensors),
                                tensors=tensors,
-                               label=self._labels[op.group_idx])
-        for key, task in tasks.items():
-            sink.setdefault(key.rsplit("::", 1)[0], []).append(
-                {key: task})
-        return len(entries) * len(tensors)
-
-    def _wait_tasks(self, task_dicts: list[dict[str, Task]]) -> None:
-        """Host-block until these engine tasks landed (fail-stop)."""
-        for td in task_dicts:
-            self._wait_load(td)
+                               label=self._labels[g_idx])
+        return tasks, len(entries) * len(tensors)
 
     # ------------------------------------------------------------------
     # save path
