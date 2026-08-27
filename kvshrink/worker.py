@@ -409,32 +409,17 @@ class HybridWorker:
         # Every layer of the group addresses the same chunk sequence
         # (scheduler invariant: keys expand per block x layer).
         entries = by_layer[next(iter(by_layer))]
-        views = {ln: self._canon.page_view_parts(ln) for ln in by_layer}
-        # Split into calls with unique chunk labels (one engine call
-        # maps chunk_labels 1:1 to chunk_indices).
-        calls: list[tuple[list[int], list[str]]] = []
-        slot_of: dict[str, int] = {}
-        for gpu_block_id, h in entries:
-            c = slot_of.get(h)
-            if c is None:
-                slot_of[h] = len(calls)
-                calls.append(([], []))
-                c = slot_of[h]
-            calls[c][0].append(gpu_block_id)
-            calls[c][1].append(h)
-        npages = 0
-        for indices, labels in calls:
-            tensors = self._flat_views(views)
-            tasks = self.store.get(block_indices=indices,
-                                   block_hashs=labels,
-                                   layer_names=list(tensors),
-                                   tensors=tensors,
-                                   label=self._labels[op.group_idx])
-            for key, task in tasks.items():
-                sink.setdefault(key.rsplit("::", 1)[0], []).append(
-                    {key: task})
-                npages += len(indices)
-        return npages
+        tensors = self._flat_views(
+            {ln: self._canon.page_view_parts(ln) for ln in by_layer})
+        tasks = self.store.get(block_indices=[gpu for gpu, _ in entries],
+                               block_hashs=[h for _, h in entries],
+                               layer_names=list(tensors),
+                               tensors=tensors,
+                               label=self._labels[op.group_idx])
+        for key, task in tasks.items():
+            sink.setdefault(key.rsplit("::", 1)[0], []).append(
+                {key: task})
+        return len(entries) * len(tensors)
 
     def _wait_tasks(self, task_dicts: list[dict[str, Task]]) -> None:
         """Host-block until these engine tasks landed (fail-stop)."""
