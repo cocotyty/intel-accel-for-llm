@@ -52,8 +52,6 @@ logger = logging.getLogger(__name__)
 
 ReqId = str
 
-SCHEMA_VERSION = 4
-
 @dataclass
 class ReqMeta:
     """All transfer instructions for one request in one step."""
@@ -91,16 +89,15 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: RequestMetadata = field(default_factory=RequestMetadata)
     reqs_to_save: RequestMetadata = field(default_factory=RequestMetadata)
 
-def group_label(namespace: str, group_idx: int, rank: int) -> str:
-    """Store namespace for one group's block space on one rank."""
-    return f"{namespace}_g{int(group_idx)}_r{int(rank)}"
+def group_label(group_idx: int) -> str:
+    """Store label for one group's block space."""
+    return f"g{int(group_idx)}"
 
 def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
     """Is this boundary present in the store?"""
     try:
         present = store.has([key.hash_str],
-                            label=group_label(key.namespace,
-                                              key.group_idx, key.rank))
+                            label=group_label(key.group_idx))
         return bool(present and present[0])
     except Exception:
         logger.exception("lookup error; treating as MISS")
@@ -223,8 +220,6 @@ class GroupInfo:
 @dataclass(frozen=True)
 class CacheKey:
     """Logical key for one page, or for a whole boundary."""
-    namespace: str
-    rank: int
     block_hash: object
     group_idx: int
     layer_name: str
@@ -238,17 +233,16 @@ class CacheKey:
         return str(h)
 
     @property
-    def boundary_key(self) -> tuple[str, int, str, int]:
-        """Isolation-safe identity for a boundary (namespace/rank/hash/group)."""
-        return (self.namespace, self.rank, self.hash_str, self.group_idx)
+    def boundary_key(self) -> tuple[str, int]:
+        """Identity of a boundary: hash and group."""
+        return (self.hash_str, self.group_idx)
 
-def make_boundary_key(namespace: str, rank: int,
-                      group_idx: int, block_hash: object) -> "CacheKey":
+def make_boundary_key(group_idx: int,
+                      block_hash: object) -> "CacheKey":
     """A group's key at one block hash, with no layer: the address the
     hit policy asks about and the address the save/load builders expand
     into per-layer page keys."""
     return CacheKey(
-        namespace=namespace, rank=rank,
         block_hash=block_hash, group_idx=group_idx, layer_name="")
 
 @dataclass
@@ -274,24 +268,6 @@ def validate_codec_env() -> None:
         "GDN/Mamba layers: state pages are stored as opaque bytes, so the "
         "truncation would corrupt the recurrent state itself and produce "
         "wrong output with no error. Set IAXL_KV_LOSSY_TRUNC=0.")
-
-def compute_namespace(
-    model_id: str,
-    model_revision: str,
-    tokenizer_revision: str,
-    cache_dtype: str,
-    kv_schema_version: int,
-    tp_size: int,
-) -> str:
-    """Stable cache namespace: sha256 over model identity, cache dtype,
-    schema version and tp size, truncated to 16 hex chars. The schema
-    version is an input so that changing the page layout renames the
-    namespace, rather than reading old pages under the new layout."""
-    raw = "|".join([
-        model_id, model_revision, tokenizer_revision, cache_dtype,
-        str(kv_schema_version), str(tp_size),
-    ])
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 def _spec_kind(spec: object) -> str:
     """Mamba or attention; unknown spec types raise KVShrinkParseError
@@ -568,22 +544,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             rank = pc.rank
         else:
             rank = 0
-        cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
         block_sizes = sorted({int(g.kv_cache_spec.block_size)
                               for g in kv_cache_config.kv_cache_groups})
         hash_block_size = math.gcd(*block_sizes)
         self._hash_block_size = hash_block_size
-        self._namespace = compute_namespace(
-            model_id=model_config.model,
-            model_revision=model_config.revision or "",
-            tokenizer_revision=str(
-                model_config.tokenizer_revision or ""),
-            cache_dtype=cache_config.cache_dtype,
-            kv_schema_version=SCHEMA_VERSION,
-            tp_size=tp_size,
-        )
         validate_codec_env()
 
         groups, layer_infos, num_blocks = parse_kv_cache_config(
@@ -617,9 +583,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self._canon = Canonicalizer(layer_infos, num_blocks)
-            self._labels = [
-                group_label(self._namespace, g.group_idx, rank)
-                for g in groups]
+            self._labels = [group_label(g.group_idx) for g in groups]
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
             self._attn_layer_group = {
@@ -628,10 +592,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, %d groups, %d layers, "
-            "hash_block_size=%d, namespace=%s, tp=%d rank=%d)",
+            "hash_block_size=%d, tp=%d rank=%d)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            len(groups), len(layer_infos), hash_block_size,
-            self._namespace, tp_size, rank)
+            len(groups), len(layer_infos), hash_block_size, tp_size, rank)
         logger.info(
             "kvshrink groups: %s",
             [(g.group_idx, g.kind, g.block_size) for g in groups])
@@ -1136,23 +1099,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
-        """This rank's boundary key for one group at one block hash."""
-        return make_boundary_key(self._namespace, self._rank,
-                                 group.group_idx, block_hash)
+        """Boundary key for one group at one block hash."""
+        return make_boundary_key(group.group_idx, block_hash)
 
     def _present(self, group_idx: int, block_hash: object) -> bool:
         """Store-presence predicate handed to the hit policy, which
         plans against boundary addresses without seeing store details."""
         return lookup_boundary(
             self.kvstore,
-            make_boundary_key(self._namespace, self._rank,
-                              group_idx, block_hash))
+            make_boundary_key(group_idx, block_hash))
 
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
-        """Expand a boundary key to ONE layer's page key: same
-        namespace/rank/hash/group as the boundary, plus the layer
-        name. This is the exact page address the worker must move."""
+        """Expand a boundary key to ONE layer's page key: same hash and
+        group as the boundary, plus the layer name. This is the exact
+        page address the worker must move."""
         return replace(boundary_key, layer_name=layer_name)
 
     def register_kv_caches(
@@ -1211,7 +1172,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._mamba_save_segments = segments
         logger.info(
             "kvshrink hybrid worker registered: %d layers, %d attention "
-            "hook points, %d recurrent layers (namespace tp=%d rank=%d)",
+            "hook points, %d recurrent layers (tp=%d rank=%d)",
             len(self._layer_infos), len(self._attn_order),
             len(self._mamba_layers), self.tp_size, self._rank)
 
@@ -1223,15 +1184,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 f"{type(metadata).__name__}; expected "
                 "KVShrinkConnectorMetadata")
         return metadata
-
-    def _worker_key(self, key: CacheKey) -> CacheKey:
-        """Remap a scheduler-built key (rank 0) to this worker's own
-        rank: each TP rank persists and loads its OWN shard under its
-        own rank path. Without this, TP>1 workers overwrite each
-        other's pages under the shared rank-0 key."""
-        if key.rank == self._rank:
-            return key
-        return replace(key, rank=self._rank)
 
     @staticmethod
     def _flat_views(
@@ -1407,11 +1359,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> dict[tuple[str, int, int, str, int], _SaveCandidate]:
         """Batch-level boundary candidates with cross-request dedup.
         Returns boundary_key -> accumulated per-layer pages."""
-        candidates: dict[tuple[str, int, int, str, int], _SaveCandidate] = {}
+        candidates: dict[tuple[str, int], _SaveCandidate] = {}
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
-                    key = self._worker_key(key)
                     cand = candidates.get(key.boundary_key)
                     if cand is None:
                         cand = _SaveCandidate(op.group_idx)
@@ -1529,7 +1480,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
         for bkey, cand in candidates.items():
-            _, _, blk_hash, g_idx = bkey
+            blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
             if sorted(cand.pages) != expected:
                 logger.warning(
