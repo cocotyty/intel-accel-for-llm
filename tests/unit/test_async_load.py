@@ -89,7 +89,7 @@ def _worker(store):
 def _meta(async_layers, req_id="r1"):
     """A load plan covering every layer, split per group."""
     def op(gidx, layers):
-        keys = tuple(CacheKey(namespace="ns", tp_size=1, rank=0,
+        keys = tuple(CacheKey(namespace="ns", rank=0,
                               block_hash=7, group_idx=gidx,
                               layer_name=ln) for ln in layers)
         return GroupTransferMeta(

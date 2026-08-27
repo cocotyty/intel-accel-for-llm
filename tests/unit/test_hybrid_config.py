@@ -188,9 +188,9 @@ def test_parse_real_config_layout_descriptors():
 
 
 def test_namespace_stability():
-    a = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2, 1)
-    b = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2, 1)
-    c = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 4, 1)
+    a = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2)
+    b = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 2)
+    c = compute_namespace("m", "r", "t", "auto", SCHEMA_VERSION, 4)
     assert a == b
     assert a != c
 
