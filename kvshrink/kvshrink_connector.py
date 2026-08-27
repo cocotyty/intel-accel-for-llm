@@ -532,9 +532,6 @@ class GroupTransferMeta:
       GPU destination -- keys[i] is the external-store identity (which
       chunks to read or write), gpu_block_ids[i] is the GPU block the
       page is loaded into (LOAD) or drained from (SAVE).
-    - snapshot_boundary_tokens: for mamba ops, the token position this
-      snapshot represents, carried so the worker can name it when a
-      load is refused.
 
     GDN loads always target the CURR state slot (see module docstring);
     there is no slot field because there is no choice to make.
@@ -542,7 +539,6 @@ class GroupTransferMeta:
     group_idx: int
     keys: tuple[CacheKey, ...] = ()
     gpu_block_ids: tuple[int, ...] = ()
-    snapshot_boundary_tokens: Optional[int] = None  # mamba restore point
 
 
 # ======================================================================

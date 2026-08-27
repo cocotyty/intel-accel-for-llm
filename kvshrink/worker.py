@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from .backend import group_label
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     import torch
 
     from iaxl import KVStore
+    from iaxl.kvflow.flow import Task
 
 # log under the vllm.* namespace: vLLM only configures the "vllm"
 # logger (handler+level); an unconfigured logger would drop INFO
@@ -96,12 +97,20 @@ class _AsyncLoad:
     __slots__ = ("layer_tasks", "gate_layers", "released")
 
     def __init__(
-        self, layer_tasks: dict[str, list[dict[str, Any]]],
+        self, layer_tasks: dict[str, list[dict[str, Task]]],
         gate_layers: set[str],
     ):
-        self.layer_tasks: dict[str, list[dict[str, Any]]] = layer_tasks
+        self.layer_tasks: dict[str, list[dict[str, Task]]] = layer_tasks
         self.gate_layers: set[str] = gate_layers
         self.released: bool = False
+
+
+@dataclass
+class _SaveCandidate:
+    """One boundary's pages accumulated across this step's save plans
+    (cross-request dedup by boundary key)."""
+    group_idx: int
+    pages: dict[str, tuple[CacheKey, int]] = field(default_factory=dict)
 
 
 class HybridWorker:
@@ -137,9 +146,9 @@ class HybridWorker:
         # Per-step load tasks: layer_name -> list of per-call engine
         # task dicts. Populated by start_load, popped by the per-layer
         # waits.
-        self._load_tasks: dict[str, list[dict[str, Any]]] = {}
+        self._load_tasks: dict[str, list[dict[str, Task]]] = {}
         # Pipelined attention saves: layer_name -> (group_idx, tasks).
-        self._step_attn_saves: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._step_attn_saves: dict[str, tuple[int, dict[str, Task]]] = {}
         # In-flight ASYNC loads: req_id -> _AsyncLoad. Unlike
         # _load_tasks these deliberately OUTLIVE the step that submitted
         # them -- the whole point is that the request is not occupying a
@@ -215,7 +224,7 @@ class HybridWorker:
                 for part, view in parts.items()}
 
     def _wait_load(
-        self, layer_tasks: dict[str, Any], wait: bool = True
+        self, layer_tasks: dict[str, Task], wait: bool = True
     ) -> bool:
         """Block until the reads land, or with ``wait=False`` report
         whether they have without consuming them -- the poll used to
@@ -238,7 +247,7 @@ class HybridWorker:
                 "transfer; forward would read unrestored blocks")
         return True
 
-    def _wait_store(self, tasks: dict[str, Any]) -> None:
+    def _wait_store(self, tasks: dict[str, Task]) -> None:
         """Host-block until these writes land. An incomplete write is
         fail-stop, same as an incomplete load: the scheduler's save
         cursor has already advanced past these blocks, so losing them
@@ -272,16 +281,18 @@ class HybridWorker:
         npages = 0
         _t0 = _now()
         for req_id, req_meta in metadata.reqs_to_load.requests.items():
-            # Async requests get their OWN sink: their tasks must
-            # survive this step, and must not be host-blocked by
-            # the GDN barrier below (that barrier is for requests
-            # about to enter forward; an async one is not).
-            is_async = req_meta.is_async
-            sink = {} if is_async else self._load_tasks
-            for op in req_meta.group_ops:
-                npages += self._submit_op_load(op, sink)
-            if is_async:
-                self._register_async_load(req_id, req_meta, sink)
+            if req_meta.is_async:
+                # Async tasks must survive this step and must not be
+                # host-blocked by the GDN barrier below (that barrier
+                # is for requests about to enter forward; an async one
+                # is not): collect them into a private dict.
+                tasks: dict[str, list[dict[str, Task]]] = {}
+                for op in req_meta.group_ops:
+                    npages += self._submit_op_load(op, tasks)
+                self._register_async_load(req_id, req_meta, tasks)
+            else:
+                for op in req_meta.group_ops:
+                    npages += self._submit_op_load(op, self._load_tasks)
         # Every GDN layer, waited before forward begins.
         recurrent = [td for ln in self._mamba_layers
                      for td in self._load_tasks.pop(ln, [])]
@@ -296,7 +307,7 @@ class HybridWorker:
 
     def _register_async_load(
         self, req_id: str, req_meta: ReqMeta,
-        sink: dict[str, list[dict[str, Any]]],
+        sink: dict[str, list[dict[str, Task]]],
     ) -> None:
         """Track one request's cross-step load and compute its release
         gate.
@@ -382,7 +393,7 @@ class HybridWorker:
 
     def _submit_op_load(
         self, op: GroupTransferMeta,
-        sink: dict[str, list[dict[str, Any]]],
+        sink: dict[str, list[dict[str, Task]]],
     ) -> int:
         """Submit one GroupTransferMeta to the engine (async get).
 
@@ -425,7 +436,7 @@ class HybridWorker:
                 npages += len(indices)
         return npages
 
-    def _wait_tasks(self, task_dicts: list[dict[str, Any]]) -> None:
+    def _wait_tasks(self, task_dicts: list[dict[str, Task]]) -> None:
         """Host-block until these engine tasks landed (fail-stop)."""
         for td in task_dicts:
             self._wait_load(td)
@@ -435,31 +446,25 @@ class HybridWorker:
     # ------------------------------------------------------------------
     def _gather_save_candidates(
         self, metadata: KVShrinkConnectorMetadata
-    ) -> dict[tuple[str, int, int, str, int], dict[str, Any]]:
+    ) -> dict[tuple[str, int, int, str, int], _SaveCandidate]:
         """Batch-level boundary candidates with cross-request dedup.
-        Returns boundary_key -> {"group_idx", "pages": {layer_name:
-        (key, gpu_block_id)}, "boundary_tokens"}."""
-        candidates: dict[tuple[str, int, int, str, int], dict[str, Any]] = {}
+        Returns boundary_key -> accumulated per-layer pages."""
+        candidates: dict[tuple[str, int, int, str, int], _SaveCandidate] = {}
         for req_meta in metadata.reqs_to_save.requests.values():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     key = self._worker_key(key)
                     cand = candidates.get(key.boundary_key)
                     if cand is None:
-                        cand = {"group_idx": op.group_idx,
-                                "pages": {},
-                                "boundary_tokens": None}
+                        cand = _SaveCandidate(op.group_idx)
                         candidates[key.boundary_key] = cand
-                    cand["pages"][key.layer_name] = (key, gpu_block_id)
-                    if op.snapshot_boundary_tokens is not None:
-                        cand["boundary_tokens"] = \
-                            op.snapshot_boundary_tokens
+                    cand.pages[key.layer_name] = (key, gpu_block_id)
         return candidates
 
     def _submit_group_layers_save(
         self, g_idx: int, layer_names: list[str],
         entries: list[tuple[int, str]],
-    ) -> dict[str, Any]:
+    ) -> dict[str, Task]:
         """Submit ONE async engine put covering ``layer_names`` for the
         blocks in ``entries`` (list of (gpu_block_id, chunk_label), same
         order for every layer -- scheduler invariant). Async D2H+zip on
@@ -503,13 +508,13 @@ class HybridWorker:
         expected = sorted(self._groups[g_idx].layer_names)
         entries: list[tuple[int, str]] = []
         for _bkey, cand in self._gather_save_candidates(metadata).items():
-            if cand["group_idx"] != g_idx:
+            if cand.group_idx != g_idx:
                 continue
-            if sorted(cand["pages"]) != expected:
+            if sorted(cand.pages) != expected:
                 continue  # partial boundary: skipped at commit time too
-            if layer_name not in cand["pages"]:
+            if layer_name not in cand.pages:
                 continue
-            key, gpu_block_id = cand["pages"][layer_name]
+            key, gpu_block_id = cand.pages[layer_name]
             entries.append((gpu_block_id, key.hash_str))
         if not entries:
             return
@@ -531,11 +536,12 @@ class HybridWorker:
         candidates = self._gather_save_candidates(metadata)
         pipelined = os.getenv("KVSHRINK_SAVE_PIPELINED", "1") != "0"
         # group the complete candidates for one engine put per group
-        per_group: dict[int, dict] = {}
+        per_group: dict[int, dict[str, list[tuple[int, str]]]] = {}
+        nbound = 0
         for bkey, cand in candidates.items():
             namespace, tp_size, rank, blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
-            if sorted(cand["pages"]) != expected:
+            if sorted(cand.pages) != expected:
                 # A partial boundary is skipped (the scheduler's
                 # incremental cursor has advanced, so it ages out as a
                 # MISS, never wrong data). Log unconditionally: this is
@@ -543,20 +549,17 @@ class HybridWorker:
                 logger.warning(
                     "chunk_save skip commit g%d h=%s: expected %d "
                     "layers, stored %d (%s)", g_idx, blk_hash,
-                    len(expected), len(cand["pages"]),
-                    set(expected) ^ set(cand["pages"]))
+                    len(expected), len(cand.pages),
+                    set(expected) ^ set(cand.pages))
                 continue
-            gslot = per_group.setdefault(g_idx, {"bnds": [],
-                                                 "layers": {}})
-            gslot["bnds"].append((bkey, cand))
+            nbound += 1
+            layers = per_group.setdefault(g_idx, {})
             for layer_name in expected:
-                key, gpu_block_id = cand["pages"][layer_name]
-                gslot["layers"].setdefault(layer_name, []).append(
+                key, gpu_block_id = cand.pages[layer_name]
+                layers.setdefault(layer_name, []).append(
                     (gpu_block_id, key.hash_str))
         npages = 0
-        nbound = 0
-        for g_idx, gslot in per_group.items():
-            layers = gslot["layers"]
+        for g_idx, layers in per_group.items():
             entries = layers[next(iter(layers))]
             if self._groups[g_idx].kind != "mamba" and pipelined:
                 # Attention: save_kv_layer submitted each layer during
@@ -579,7 +582,6 @@ class HybridWorker:
             # the group in one call, so it is committed the moment the
             # write lands. There is no second phase to publish and
             # therefore nothing that can outlive its data.
-            nbound += len(gslot["bnds"])
         if self._step_attn_saves:
             # Layers whose submit was never consumed by a group above
             # (plan changed mid-step): wait them so pinned staging is

@@ -62,8 +62,7 @@ def _save_meta():
     mamba_ops = GroupTransferMeta(
         group_idx=1,
         keys=(_key("m0", blk_hash=888, g_idx=1),),
-        gpu_block_ids=(20,),
-        snapshot_boundary_tokens=544)
+        gpu_block_ids=(20,))
     saves = RequestMetadata()
     saves.add_request("r1", group_ops=(attn_ops, mamba_ops))
     return SimpleNamespace(reqs_to_save=saves)
