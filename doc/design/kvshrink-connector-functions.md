@@ -70,10 +70,14 @@ Store 里每份数据有三个坐标 (label, chunk_id, tensor_key)：
 - `tensor_key` 是层名；
 - `label` 是命名空间，格式 `{namespace}_g{组号}_r{rank}`。
 
-label 为什么三段都不能少？每一段挡一种事故：不加 namespace，
-fp16 的缓存会被 bf16 当命中读走；不加 g{组号}，同一个前缀 hash 在
-attention 组和 mamba 组里代表不同状态，会被互相冒名顶替；不加
-r{rank}，TP 的两个进程写同一片地方互相覆盖。
+label 为什么必须有 namespace 和 g{组号}？不加 namespace，fp16 的缓
+存会被 bf16 当命中读走；不加组号，同一个前缀 hash 在 attention 组和
+mamba 组里代表不同状态，会被互相冒名顶替。r{rank} 的性质不同——跨
+rank 隔离其实靠的是别的东西（每个进程一个 store 实例、持久化目录和
+管理端口按构造参数 rank 分开），把它编进 label 是为了让"调度侧问的
+地址"和"worker 写的地址"由构造保证逐字节相等：controller 只打开
+rank0 那本账，所以查询永远落在 r0 标签上；worker 执行前把自己的
+rank 映射回去读写自己的账。
 
 namespace 本身是 sha256(model, dtype, schema 版本, tp)[:16]。改动原
 因：以前还拼了个 pp_size 参数，但 pipeline 并行压根不支持（见下面
