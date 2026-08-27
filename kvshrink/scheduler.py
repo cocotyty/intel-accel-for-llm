@@ -624,15 +624,7 @@ class HybridRequestScheduler:
            _build_load_meta_from_state).
         """
         req_id = new_req.req_id
-        state = self._req_states.get(req_id)
-        if state is None:
-            # A load plan is only ever asked for after we reported
-            # external tokens for this request, and that report is what
-            # creates the state. No state means the two disagree, and a
-            # plan built on a guess would address the wrong blocks.
-            raise RuntimeError(
-                f"kvshrink: load plan requested for unknown request "
-                f"{req_id}; get_num_new_matched_tokens never ran")
+        state = self._req_states[req_id]
         return self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
 

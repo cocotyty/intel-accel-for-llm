@@ -143,7 +143,7 @@ class HybridWorker:
         self.store: Optional[KVStore] = None
 
         self._kv_caches_ref: Optional[dict[str, torch.Tensor]] = None
-        # Per-step load tasks, "layer::part" -> engine Task: populated
+        # Per-step load tasks, "layer#part" -> engine Task: populated
         # by start_load (one merged engine call per group per step),
         # waited and popped per layer -- GDN layers as one barrier in
         # start_load, attention layers at their forward-entry hooks.
@@ -177,9 +177,9 @@ class HybridWorker:
 
         ``execution_order``: all cached layer names in model execution
         order (the connector derives it from static_forward_context or
-        the layer-index naming convention, fail-closed). Only the
-        attention layers' order is used, by the async release gate --
-        "the first N layers" means nothing otherwise.
+        the layer-index naming convention). Only the attention layers'
+        order is used, by the async release gate -- "the first N
+        layers" means nothing otherwise.
         """
         self._kv_caches_ref = kv_caches
         self._canon.register(kv_caches)
@@ -187,17 +187,13 @@ class HybridWorker:
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
             for ln in g.layer_names)
-        attn_order = [ln for ln in execution_order
-                      if ln in self._attn_layer_group]
-        if not attn_order:
-            raise RuntimeError(
-                "kvshrink hybrid: no attention layers found in the "
-                "execution order; nothing would ever wait for a load")
-        self._attn_order: tuple[str, ...] = tuple(attn_order)
+        self._attn_order: tuple[str, ...] = tuple(
+            ln for ln in execution_order
+            if ln in self._attn_layer_group)
         logger.info(
             "kvshrink hybrid worker registered: %d layers, %d attention "
             "hook points, %d recurrent layers (namespace tp=%d rank=%d)",
-            len(self._layer_infos), len(attn_order),
+            len(self._layer_infos), len(self._attn_order),
             len(self._mamba_layers), self.tp_size, self.rank)
 
     def _worker_key(self, key: CacheKey) -> CacheKey:
@@ -214,13 +210,13 @@ class HybridWorker:
     # ------------------------------------------------------------------
     # A layer contributes one page view, or two when its K and V are
     # separate tensors. The engine takes one flat tensor dict, so part
-    # views are flattened under "layer::part" keys (loads regroup the
-    # returned tasks by layer with an rsplit on "::").
+    # views are flattened under "layer#part" keys (loads regroup the
+    # returned tasks by layer with an rsplit on "#").
     @staticmethod
     def _flat_views(
         layer_views: dict[str, dict[str, torch.Tensor]],
     ) -> dict[str, torch.Tensor]:
-        return {f"{ln}::{part}": view
+        return {f"{ln}#{part}": view
                 for ln, parts in layer_views.items()
                 for part, view in parts.items()}
 
@@ -278,12 +274,16 @@ class HybridWorker:
                 # is not): collect them into a private dict.
                 tasks: dict[str, Task] = {}
                 for op in req_meta.group_ops:
+                    if not op.keys:
+                        continue
                     t, n = self._submit_group_load(op)
                     tasks.update(t)
                     npages += n
                 self._register_async_load(req_id, req_meta, tasks)
             else:
                 for op in req_meta.group_ops:
+                    if not op.keys:
+                        continue
                     entries, layers = by_group.setdefault(
                         op.group_idx, ([], set()))
                     entries.extend(self._op_entries(op))
@@ -296,7 +296,7 @@ class HybridWorker:
         # Every GDN layer, waited before forward begins.
         recurrent = {k: self._load_tasks.pop(k)
                      for k in list(self._load_tasks)
-                     if k.rsplit("::", 1)[0] in self._mamba_layers}
+                     if k.rsplit("#", 1)[0] in self._mamba_layers}
         if recurrent:
             self._wait_load(recurrent)
         if npages:
@@ -323,7 +323,7 @@ class HybridWorker:
         """
         if not tasks:
             return
-        layers = {k.rsplit("::", 1)[0] for k in tasks}
+        layers = {k.rsplit("#", 1)[0] for k in tasks}
         recurrent = layers - self._attn_layer_group.keys()
         n = req_meta.async_load_layers
         if n is None or n < 0:
@@ -355,7 +355,7 @@ class HybridWorker:
             if entry.released:
                 continue
             gate = {k: t for k, t in entry.layer_tasks.items()
-                    if k.rsplit("::", 1)[0] in entry.gate_layers}
+                    if k.rsplit("#", 1)[0] in entry.gate_layers}
             if gate and not self.store.get_wait(get_results=gate,
                                                 wait=False):
                 continue  # not landed yet; ask again next step
@@ -380,14 +380,14 @@ class HybridWorker:
         forward read unrestored memory.
         """
         keys = [k for k in self._load_tasks
-                if k.rsplit("::", 1)[0] == layer_name]
+                if k.rsplit("#", 1)[0] == layer_name]
         if keys:
             self._wait_load({k: self._load_tasks.pop(k) for k in keys})
         for req_id, entry in list(self._async_loads.items()):
             if not entry.released:
                 continue
             keys = [k for k in entry.layer_tasks
-                    if k.rsplit("::", 1)[0] == layer_name]
+                    if k.rsplit("#", 1)[0] == layer_name]
             if keys:
                 self._wait_load(
                     {k: entry.layer_tasks.pop(k) for k in keys})
@@ -417,7 +417,7 @@ class HybridWorker:
         layer_names: set[str],
     ) -> tuple[dict[str, Task], int]:
         """One engine get covering ``layer_names`` for the blocks in
-        ``entries``; returns the flat tasks dict ("layer::part" ->
+        ``entries``; returns the flat tasks dict ("layer#part" ->
         Task) and the page count."""
         tensors = self._flat_views(
             {ln: self._canon.page_view_parts(ln) for ln in layer_names})

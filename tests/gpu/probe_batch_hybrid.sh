@@ -79,6 +79,7 @@ if gate_completions_concurrent "$COLD_DIR" "$MAX_TOKENS" "${PROMPTS[@]}"; then
 else
     fail "cold batched run: at least one request failed"
 fi
+gate_persist_cache || { fail "cold run persist"; gate_summary; exit 1; }
 gate_stop
 COLD_LOG="$GATE_LAST_LOG"
 

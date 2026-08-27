@@ -1,17 +1,17 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""TP partial-commit guard.
+"""Boundary presence check.
 
-Each rank writes its own shard under its own store namespace, and there
-is no cross-rank transaction. A boundary present on one rank but missing
-on another must therefore read as a MISS: restoring half of a
-tensor-parallel state is worse than restoring none, because the output
-is wrong rather than absent.
+The check runs under the key's own rank label: each rank keeps its own
+presence record, and the controller process shares one with the rank-0
+worker only, so peer ledgers are not queryable at lookup time. TP ranks
+save in lockstep, so rank 0 present stands for all; a rank that
+diverged anyway fails loudly at load time (the native layer raises on
+a missing key).
 
-Nothing repairs the gap in the background. The request recomputes and
-its own save writes every rank's shard again, which is safe because
-writing a block twice is idempotent.
+A store error reads as a MISS: a wrong hit silently corrupts output,
+a wrong miss costs one recompute.
 
 Pure logic: fake store, no GPU, no disk.
 """
@@ -28,8 +28,7 @@ def _key(group_idx=0, tp_size=2):
 
 
 class _FakeStore:
-    """Answers presence per namespace, so a test can make one rank
-    disagree with another."""
+    """Answers presence per namespace label."""
 
     def __init__(self, present_labels, blow_up=False):
         self.present = set(present_labels)
@@ -43,39 +42,34 @@ class _FakeStore:
         return [label in self.present]
 
 
-ALL = [group_label("ns", 0, 0), group_label("ns", 0, 1)]
+def test_present_is_hit():
+    assert lookup_boundary(
+        _FakeStore([group_label("ns", 0, 0)]), _key()) is True
 
 
-def test_all_ranks_present_hit():
-    assert lookup_boundary(_FakeStore(ALL), _key()) is True
+def test_missing_is_miss():
+    assert lookup_boundary(_FakeStore([]), _key()) is False
 
 
-def test_other_rank_missing_is_miss():
-    assert lookup_boundary(_FakeStore([group_label("ns", 0, 0)]),
-                           _key()) is False
-
-
-def test_own_rank_missing_is_miss():
-    assert lookup_boundary(_FakeStore([group_label("ns", 0, 1)]),
-                           _key()) is False
-
-
-def test_single_rank_skips_cross_rank_check():
+def test_queries_own_rank_label_only():
+    """The controller can only see the ledger it shares with the
+    rank-0 worker, so that is the only label it may ask about."""
     store = _FakeStore([group_label("ns", 0, 0)])
-    assert lookup_boundary(store, _key(tp_size=1)) is True
+    assert lookup_boundary(store, _key(tp_size=2)) is True
     assert store.asked == [group_label("ns", 0, 0)]
 
 
 def test_store_error_fails_closed_to_miss():
     """A wrong hit silently corrupts output; a wrong miss costs one
     recompute. Errors resolve to the cheap mistake."""
-    assert lookup_boundary(_FakeStore(ALL, blow_up=True), _key()) is False
+    assert lookup_boundary(
+        _FakeStore([], blow_up=True), _key()) is False
 
 
 def test_groups_do_not_alias_each_other():
     """The same prefix hash exists in every group, so the group must be
     part of the namespace or one group's data would answer for another.
     """
-    store = _FakeStore([group_label("ns", 0, 0), group_label("ns", 0, 1)])
+    store = _FakeStore([group_label("ns", 0, 0)])
     assert lookup_boundary(store, _key(group_idx=0)) is True
     assert lookup_boundary(store, _key(group_idx=1)) is False

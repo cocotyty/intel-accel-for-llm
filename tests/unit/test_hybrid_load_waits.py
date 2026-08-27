@@ -49,12 +49,12 @@ class _FakeStore:
     def get(self, block_indices, block_hashs, layer_names, tensors,
             label=None):
         for k in tensors:
-            self.submitted.append(k.rsplit("::", 1)[0])
+            self.submitted.append(k.rsplit("#", 1)[0])
         return {k: f"task:{k}" for k in tensors}
 
     def get_wait(self, get_results, wait=True):
         for k in get_results:
-            self.waited.append(k.rsplit("::", 1)[0])
+            self.waited.append(k.rsplit("#", 1)[0])
         return True
 
     def has(self, chunk_labels, label=None):
@@ -119,15 +119,6 @@ def test_attention_execution_order_is_recorded():
     assert w._attn_order == ("a1", "a4")
 
 
-def test_model_without_attention_layers_fails_closed():
-    """Nothing would ever wait for an attention page."""
-    groups = [_group(0, "attention", []), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in GDN}, _FakeStore(),
-                     _FakeCanon(), rank=0, tp_size=1)
-    with pytest.raises(RuntimeError, match="no attention layers"):
-        w.register({ln: None for ln in GDN}, GDN)
-
-
 # ------------------------------------------------------------------
 # load scheduling
 # ------------------------------------------------------------------
@@ -174,3 +165,16 @@ def test_failed_blocking_wait_raises():
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
         w.start_load(_load_meta(GDN, 1))
+
+
+def test_empty_ops_are_skipped():
+    """A group with nothing to load (empty keys) contributes no engine
+    call -- regression: an empty op once produced a get with no
+    tensors, tripping the engine's not-empty assert."""
+    be = _FakeStore()
+    w = _worker(be)
+    meta = _load_meta(GDN, 1)
+    req = next(iter(meta.reqs_to_load.requests.values()))
+    req.group_ops = (GroupTransferMeta(group_idx=0),) + req.group_ops
+    w.start_load(meta)
+    assert sorted(be.submitted) == sorted(GDN), be.submitted

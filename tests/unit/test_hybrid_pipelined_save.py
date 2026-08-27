@@ -39,7 +39,7 @@ class _FakeStore:
 
     def put(self, block_indices, block_hashs, layer_names, tensors,
             label=None):
-        layers = sorted(k.rsplit("::", 1)[0] for k in tensors)
+        layers = sorted(k.rsplit("#", 1)[0] for k in tensors)
         self.submits.append((label, layers, list(block_hashs)))
         return {k: f"task:{k}" for k in tensors}
 

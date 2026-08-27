@@ -24,11 +24,12 @@ log "first run: populate the cache"
 gate_serve pure_attention_first || {
     fail "engine startup"; gate_summary; exit 1; }
 FIRST_OUT="$(gate_completion "$PROMPT" "$MAX_TOKENS")"
+gate_persist_cache || { fail "first run persist"; gate_summary; exit 1; }
 gate_stop
 
 FIRST_LOG="$GATE_LOG_DIR/pure_attention_first.log"
-check "hybrid path NOT taken on a pure-attention model" \
-    bash -c '! grep -q "kvshrink hybrid path enabled" "$1"' _ "$FIRST_LOG"
+check "pure-attention model served as one attention group" \
+    grep -qF "kvshrink groups: [(0, 'attention'" "$FIRST_LOG"
 check "pure-attention KV store registered" \
     grep -q "Registered .* KV cache layers" "$FIRST_LOG"
 check "first run produced output" test -n "$FIRST_OUT"
@@ -40,6 +41,8 @@ SECOND_OUT="$(gate_completion "$PROMPT" "$MAX_TOKENS")"
 gate_stop
 
 SECOND_LOG="$GATE_LOG_DIR/pure_attention_second.log"
+check "second run hit the external cache" \
+    grep -qE "start_load_kv: [1-9][0-9]* pages loaded" "$SECOND_LOG"
 if [[ "$FIRST_OUT" == "$SECOND_OUT" ]]; then
     pass "output identical across runs"
 else
