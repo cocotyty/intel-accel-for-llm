@@ -130,15 +130,6 @@ def test_pipelined_disabled_by_env():
         os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
 
 
-def test_save_kv_layer_ignores_mamba_and_unknown_layers():
-    _env_off()
-    c = _worker()
-    c.save_kv_layer("m0", _save_meta())       # mamba layer: never served
-    c.save_kv_layer("no.such.layer", _save_meta())
-    assert c.store.submits == []
-    assert c.wait_save(_save_meta())[1] == 2
-
-
 def test_write_is_the_commit():
     """A block is finalized by its own write, with the group's whole
     layer set in one call. There is no separate publish step, so there

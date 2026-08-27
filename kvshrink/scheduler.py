@@ -323,9 +323,7 @@ class HybridRequestScheduler:
         """
         plans = {}
         for req_id in sorted(self._async_load_pending - already_emitted):
-            state = self._req_states.get(req_id)
-            if state is None:
-                continue
+            state = self._req_states[req_id]
             meta = self._build_load_meta_from_state(
                 req_id, state, scheduled_tokens=0)
             state.async_plan_emitted = True
@@ -397,9 +395,7 @@ class HybridRequestScheduler:
         Re-emission is safe (writing a block again is idempotent);
         NOT rolling back permanently skips un-persisted
         boundaries."""
-        state = self._req_states.get(req_id)
-        if state is None:
-            return
+        state = self._req_states[req_id]
         # Adopt block hashes vLLM has appended since we registered
         # (decode completes blocks too; without this, generated tokens
         # are never offloaded). Only ever extends -- hashes are
@@ -512,16 +508,8 @@ class HybridRequestScheduler:
         """
         if external <= 0 or self._async_load_config is None:
             return False
-        state = self._req_states.get(req_id)
-        if state is None:
-            return False
-        try:
-            selected = self._async_load_config.select(len(self._req_states))
-        except Exception:  # pragma: no cover - fail closed to sync
-            logger.exception(
-                "async load policy failed for req=%s; loading synchronously",
-                req_id)
-            return False
+        state = self._req_states[req_id]
+        selected = self._async_load_config.select(len(self._req_states))
         if selected == 0:
             return False
         state.is_async = True
@@ -630,7 +618,7 @@ class HybridRequestScheduler:
 
     def build_resumed_load_meta(
         self, req_id: str, scheduled_tokens: int = 0
-    ) -> Optional[ReqMeta]:
+    ) -> ReqMeta:
         """Build the LOAD ReqMeta for a PREEMPTION-RESUMED request.
 
         vLLM v1 carries resumed requests in
@@ -647,12 +635,8 @@ class HybridRequestScheduler:
         would read
         unrestored KV while num_computed_tokens skips recompute. Raise
         instead of silently emitting wrong tokens.
-        Returns None when the request was never seen by the connector
-        (no external tokens could have been accepted).
         """
-        state = self._req_states.get(req_id)
-        if state is None:
-            return None
+        state = self._req_states[req_id]
         meta = self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
         if state.pending_load_tokens > 0:
@@ -873,9 +857,7 @@ class HybridRequestScheduler:
           a partial tail is not a valid restore point, and snapshots are
           only addressable by boundary hashes.
         """
-        state = self._req_states.get(req_id)
-        if state is None:
-            return ReqMeta()
+        state = self._req_states[req_id]
         progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
                                         progress)
@@ -1037,10 +1019,6 @@ class HybridHitPolicy:
         """
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
         manager_cls = KVCacheSpecRegistry.get_manager_class(group.spec)
-        if manager_cls is None:
-            raise RuntimeError(
-                f"kvshrink: vLLM has no cache-hit rule for "
-                f"{type(group.spec).__name__} (group {group.group_idx})")
         # vLLM indexes the hash list directly out to max_length, so the
         # caller owes it a length its own hashes cover. Its scheduler
         # gets this for free (the bound comes from the same request);

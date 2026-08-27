@@ -325,14 +325,6 @@ def test_resumed_load_meta_without_credit_is_quiet():
     assert all(len(op.keys) == 0 for op in meta.group_ops)
 
 
-def test_resumed_load_meta_unknown_req_returns_none():
-    """A resumed request the connector never saw (no external tokens
-    possible) is skipped, not an error."""
-    sched = _sched([_attn()])
-    assert sched.build_resumed_load_meta("ghost", scheduled_tokens=64) \
-        is None
-
-
 def test_connector_meta_includes_resumed_load():
     """End-to-end at connector level: build_connector_meta must emit the
     resumed request's load meta (scheduled_cached_reqs.resumed_req_ids),
