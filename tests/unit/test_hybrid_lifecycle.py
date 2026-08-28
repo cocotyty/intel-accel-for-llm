@@ -258,7 +258,6 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     sched = HybridRequestScheduler(groups, _HitStore(committed), 16)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
     track_new_request(sched, "r1", block_hashes=hashes, num_computed_tokens=0)
-    sched._req_states["r1"].snapshot_boundary = 544
     attn_ids = list(range(100, 134))  # 34 fresh attention blocks
     mamba_ids = [200, 201]            # CURR slot for this step = idx 1
     sched.update_state_after_alloc(
@@ -287,7 +286,6 @@ def test_resumed_load_meta_without_credit_is_quiet():
     """Resume covered entirely by the LOCAL prefix cache (ext=0, no
     external boundary): empty load meta, no error."""
     sched = _hybrid_resumed_setup(set(range(34)), ext=0)
-    sched._req_states["r1"].snapshot_boundary = 0
     meta = sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     assert meta is not None
     assert all(len(op.keys) == 0 for op in meta.group_ops)

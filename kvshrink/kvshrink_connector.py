@@ -55,7 +55,6 @@ ReqId = str
 class ReqMeta:
     """All transfer instructions for one request in one step."""
     group_ops: tuple[GroupTransferMeta, ...] = ()
-    external_hit_tokens: int = 0
     is_async: bool = False
     async_load_layers: int = -1
 
@@ -75,7 +74,6 @@ class ReqState:
     live_source: list = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
-    snapshot_boundary: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     # External tokens accepted this pass (drives the load plan).
     pending_load_tokens: int = 0
@@ -102,11 +100,9 @@ class RequestMetadata:
         group_ops: tuple[GroupTransferMeta, ...] = (),
         is_async: bool = False,
         async_load_layers: int = -1,
-        external_hit_tokens: int = 0,
     ) -> None:
         self.requests[req_id] = ReqMeta(
             group_ops=group_ops,
-            external_hit_tokens=external_hit_tokens,
             is_async=is_async,
             async_load_layers=async_load_layers,
         )
@@ -474,10 +470,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         boundary = policy.find_longest_cache_hit(
             block_hashes, request.num_tokens)
         state = self._req_states[request.request_id]
-        if boundary and state.block_hashes:
-            state.snapshot_boundary = boundary
-        else:
-            boundary = 0
         external = max(0, boundary - num_computed_tokens)
         # Async when there are external tokens to stream and the
         # concurrency-tuned layer count is nonzero.
@@ -574,7 +566,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "kvshrink resumed request has accepted external "
                     "tokens but no restorable pages (req="
                     f"{req_id} pending={state.pending_load_tokens} "
-                    f"boundary={state.snapshot_boundary} "
+                    f"boundary={state.num_computed_tokens} "
                     f"sched={scheduled_tokens}): refusing to enter "
                     "forward with unrestored state")
         return meta
@@ -583,18 +575,25 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, req_id: str, state: ReqState, scheduled_tokens: int,
     ) -> ReqMeta:
         """Build one request's load plan from its recorded state."""
-        boundary = state.snapshot_boundary
+        ext = state.pending_load_tokens
         group_ops = []
         for g_idx, group in enumerate(self._groups):
             # The group table is always populated by alloc before
-            # scheduling; boundary == 0 makes the body a no-op, and a
-            # missing table with boundary > 0 is a bug that must index
+            # scheduling; ext == 0 makes the body a no-op, and a
+            # missing table with ext > 0 is a bug that must index
             # out of range loudly below, not skip silently.
             ids = state.groups[g_idx].block_ids
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
             if group.kind == "attention":
-                num_hash = boundary // group.block_size
+                # Load only the external range: the core's own
+                # prefix-hit blocks already hold their data (shared
+                # physical pages). The credit landed
+                # num_computed_tokens exactly on the boundary, so
+                # this range is the last ext tokens.
+                start = ((state.num_computed_tokens - ext)
+                         // group.block_size)
+                end = state.num_computed_tokens // group.block_size
                 # No existence re-query or bounds guards: the hit policy
                 # verified and capped these keys at lookup, the tables
                 # only grow, and a real inconsistency must IndexError
@@ -603,20 +602,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for layer_name in group.layer_names:
                     keys.extend(CacheKey(state.block_hashes[i],
                                          group.group_idx, layer_name)
-                                for i in range(num_hash))
-                    gpu_ids.extend(ids[i] for i in range(num_hash))
+                                for i in range(start, end))
+                    gpu_ids.extend(ids[i] for i in range(start, end))
             elif group.kind == "mamba":
                 # Load the snapshot into the CURR state block only
                 # (v0.23 align mode pins execution to column 0 = the
                 # block holding the last scheduled token, for both
                 # prefill and decode).
-                if boundary > 0:
-                    # hash index of the snapshot AT boundary:
-                    # hash[i] covers [i*bs, (i+1)*bs) -> snapshot at
-                    # boundary lives at hash[boundary//bs - 1]. The index
+                if ext > 0:
+                    # hash index of the snapshot: hash[i] covers
+                    # [i*bs, (i+1)*bs) and num_computed_tokens IS the
+                    # boundary after the credit, so the snapshot lives
+                    # at hash[num_computed_tokens//bs - 1]. The index
                     # is always in range: the policy only returns
                     # aligned boundaries capped by the hash list.
-                    idx = boundary // group.block_size - 1
+                    idx = (state.num_computed_tokens
+                           // group.block_size - 1)
                     blk_hash = state.block_hashes[idx]
                     key = CacheKey(blk_hash, group.group_idx, "")
                     bs = group.block_size
@@ -624,8 +625,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     # (num_computed + num_scheduled - 1) // bs.
                     # Kernels gather exactly this one column, so
                     # it is the only slot forward ever reads.
-                    curr_idx = (boundary + scheduled_tokens -
-                                1) // bs
+                    curr_idx = (state.num_computed_tokens +
+                                scheduled_tokens - 1) // bs
 
                     # Fail-closed: a HIT already committed
                     # num_computed_tokens=boundary; a skipped
@@ -641,7 +642,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         raise RuntimeError(
                             "kvshrink mamba external HIT with "
                             "scheduled_tokens=0 "
-                            f"(req={req_id} boundary={boundary}): "
+                            f"(req={req_id} "
+                            f"boundary={state.num_computed_tokens}): "
                             "production hits must schedule >= 1 "
                             "token; refusing to build load meta")
                     if not (0 <= curr_idx < len(ids)
@@ -649,7 +651,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         raise RuntimeError(
                             "kvshrink mamba load curr slot "
                             f"invalid (req={req_id} "
-                            f"boundary={boundary} "
+                            f"boundary={state.num_computed_tokens} "
                             f"sched={scheduled_tokens} "
                             f"table_idx={curr_idx} "
                             f"table={ids}): refusing to enter "
@@ -663,7 +665,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
         return ReqMeta(
-            external_hit_tokens=boundary - state.num_computed_tokens,
             group_ops=tuple(group_ops),
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
@@ -737,10 +738,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for new_req in scheduler_output.scheduled_new_reqs:
             req_meta = self.build_load_meta(
                 new_req, num_sched[new_req.req_id])
-            if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
+            if any(op.keys for op in req_meta.group_ops):
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.group_ops, req_meta.is_async,
-                    req_meta.async_load_layers, req_meta.external_hit_tokens)
+                    req_meta.async_load_layers)
             save_meta = self.build_save_meta(
                 new_req.req_id, num_sched[new_req.req_id])
             if save_meta.group_ops:
@@ -750,6 +751,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # ASYNC requests are parked by vLLM; their plans were
             # emitted at allocation time (update_state_after_alloc).
         # Load plans for requests vLLM parked, drained exactly once.
+        # Every parked request was queued with external tokens
+        # accepted, so its plan always carries pages.
         pending = sorted(self._async_load_pending
                          - set(meta.reqs_to_load.requests))
         for req_id in pending:
@@ -759,15 +762,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.async_plan_emitted = True
             # Downgrade to synchronous once released.
             state.is_async = False
-            if req_meta is None or not req_meta.group_ops:
-                logger.warning(
-                    "async req=%s has no restorable pages; dropping the "
-                    "plan so it is recomputed rather than left waiting",
-                    req_id)
-                continue
             meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
-                req_meta.async_load_layers, req_meta.external_hit_tokens)
+                req_meta.async_load_layers)
         self._async_load_pending -= set(pending)
 
         # PREEMPTION-RESUMED requests ride scheduled_cached_reqs.
@@ -779,10 +776,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in cr.resumed_req_ids:
             req_meta = self.build_resumed_load_meta(
                 req_id, num_sched[req_id])
-            if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
+            if any(op.keys for op in req_meta.group_ops):
                 meta.reqs_to_load.add_request(
-                req_id, req_meta.group_ops, req_meta.is_async,
-                req_meta.async_load_layers, req_meta.external_hit_tokens)
+                    req_id, req_meta.group_ops, req_meta.is_async,
+                    req_meta.async_load_layers)
 
         # Running requests cross boundaries in later steps too (chunked
         # prefill tails, decode-time crossings): sync their tables first,

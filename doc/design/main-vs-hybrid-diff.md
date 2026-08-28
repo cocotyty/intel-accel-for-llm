@@ -279,16 +279,27 @@ unzip_from_mem 会 raise（fail-stop 保留，只是换在更底层的自然位
 此该请求的所有增量边界全部消失，冷静地直到该请求结束都不被发现，
 后期重放命中失败率暴涨。这类 bug 以前真实存在过（略）。
 
-## 3.4 snapshot_boundary：权威恢复点只钉一次
+## 3.4 加载范围：与 main 同一个公式，依据是 credit 恒等式
 
-main 的加载范围可以从 num_external_tokens 除一下 block_size 算出来
-（load_start/end 由 computed 推导——admin 的 view_world 是线性的）。
+main 的加载范围由 num_external_tokens 除以 block_size 推出
+（load_start/end 由 computed 推导）。我们曾经另立 snapshot_boundary
+字段在查询时钉死恢复点，后来证明多余：policy 只返回 0 或
+> num_computed 的边界（hybrid_hit.py 的固定点出口），v0.23 又把
+ext_tokens 原样透传给 update_state_after_alloc（scheduler.py:631→
+788，中间无任何截断），于是 credit 之后恒有
+num_computed_tokens == boundary。加载计划的"边界"直接读
+state.num_computed_tokens：attention 外部段 =
+[num_computed - pending_load_tokens, num_computed)——与 main 一样
+只载外部增量，本地命中的块本来就有数据（共享物理页）；mamba 快照
+的 hash 序号 = num_computed_tokens//bs - 1。miss 判别由
+pending_load_tokens > 0 承担，字段与两处恒真门（group_ops 因每
+group 无条件 append 而永非空）一并删除。
 
-不行，理由有三（docstring 里写了三条，概括如下）：除法不一定落在合
-法 mamba 边界上;每组独立计算会把组装规则复制三份;resumed 请求不在
-scheduled_new_reqs 里而是同一 builder 出来的第三种入口，alloc 时刻
-算计划必然漏掉它们。所以在查询那一刻定死边界数，后续一律引用。
-update_state_after_alloc 从"构造加载清单"退化为"记录事实"。
+计划仍在 build_connector_meta 装配而非 alloc 时刻定死：mamba 快照
+的目的地（CURR 列）需要当步 num_scheduled_tokens，而 chunked
+prefill/token budget 在 scheduler 内部切分，alloc 时刻拿不到——
+build_load_meta 保留 scheduled_tokens 参数。update_state_after_alloc
+依旧只记录事实（credit、pending、块表）。
 
 ## 3.5 request_finished 双入口与延迟释放
 
