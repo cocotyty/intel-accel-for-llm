@@ -104,12 +104,6 @@ def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
         return False
 
 @dataclass(frozen=True)
-class LayerPageInfo:
-    """Canonical page info for one layer (as seen by the connector)."""
-    num_blocks: int
-    page_size_bytes: int
-
-@dataclass(frozen=True)
 class GroupInfo:
     """One vLLM KV cache group: a frozen snapshot of its storage spec."""
 
@@ -162,15 +156,15 @@ class KVShrinkParseError(ValueError):
     pass
 
 def validate_codec_env() -> None:
-    """Refuse to start when the codec is configured to lose bits."""
+    """Warn when the codec is configured to lose bits."""
     lossy = os.getenv("IAXL_KV_LOSSY_TRUNC", "0").strip()
     if lossy in ("", "0"):
         return
-    raise KVShrinkParseError(
-        f"IAXL_KV_LOSSY_TRUNC={lossy!r} is not supported for models with "
-        "GDN/Mamba layers: state pages are stored as opaque bytes, so the "
-        "truncation would corrupt the recurrent state itself and produce "
-        "wrong output with no error. Set IAXL_KV_LOSSY_TRUNC=0.")
+    logger.warning(
+        "IAXL_KV_LOSSY_TRUNC=%s is enabled. On hybrid models the flag "
+        "gates per pool entry: attention layers honor it, while mamba "
+        "state is exempted structurally (lossy bit hard-cleared by "
+        "KVStore).", lossy)
 
 def _spec_kind(spec: object) -> str:
     """Mamba or attention; unknown spec types raise KVShrinkParseError
@@ -198,11 +192,10 @@ def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
 
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
-) -> tuple[list[GroupInfo], dict[str, LayerPageInfo], int]:
-    """Return (groups, layer_infos, num_blocks)."""
+) -> tuple[list[GroupInfo], int]:
+    """Return (groups, num_blocks)."""
     num_blocks = kv_cache_config.num_blocks
     groups: list[GroupInfo] = []
-    layer_infos: dict[str, LayerPageInfo] = {}
 
     for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
         kind = None
@@ -245,11 +238,6 @@ def parse_kv_cache_config(
         )
 
         groups.append(group)
-        for name, spec in per_layer_specs:
-            layer_infos[name] = LayerPageInfo(
-                num_blocks=num_blocks,
-                page_size_bytes=int(spec.page_size_bytes),
-            )
 
     sizes = {g.block_size for g in groups}
     if len(sizes) != 1:
@@ -257,7 +245,7 @@ def parse_kv_cache_config(
             f"KV cache groups have different block sizes {sorted(sizes)}; "
             "the external cache addresses every group with one block hash "
             "and cannot express that")
-    return groups, layer_infos, num_blocks
+    return groups, num_blocks
 
 def save_enabled() -> bool:
     """Production save is ON by default; KVSHRINK_SAVE=0 disables it and
@@ -355,29 +343,6 @@ class HybridHitPolicy:
                 break
         return candidate if candidate > self._num_computed else 0
 
-class _AsyncLoad:
-    """One request's cross-step load."""
-
-    __slots__ = ("layer_tasks", "gate_layers", "released")
-
-    def __init__(
-        self, layer_tasks: dict[str, Task],
-        gate_layers: set[str],
-    ):
-        self.layer_tasks: dict[str, Task] = layer_tasks
-        self.gate_layers: set[str] = gate_layers
-        self.released: bool = False
-
-@dataclass
-class _SaveCandidate:
-    """One boundary's pages accumulated across this step's save plans
-    (cross-request dedup by boundary key). ``req_ids`` tracks every
-    contributing request: the put reads their GPU blocks, so their
-    block freeing is deferred until the write lands."""
-    group_idx: int
-    pages: dict[str, tuple[CacheKey, int]] = field(default_factory=dict)
-    req_ids: set[str] = field(default_factory=set)
-
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     """KVShrink external KV cache connector."""
 
@@ -418,7 +383,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._req_states: dict[str, ReqState] = {}
         self._async_load_pending: set[str] = set()
 
-        self._async_loads: dict[str, "_AsyncLoad"] = {}
+        self._pending_load_tasks: dict[str, dict[str, Task]] = {}
+        self._pending_load_layers: dict[str, int] = {}
+        self._gated_keys: dict[str, frozenset[str]] = {}
+        self._early_promoted_tasks: dict[str, dict[str, Task]] = {}
+        self._active_promoted_tasks: dict[str, dict[str, Task]] = {}
         self._current_put_tasks: dict[str, list[dict[str, Task]]] = {}
         self._deferred_finished_req_ids: set[str] = set()
 
@@ -455,7 +424,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._hash_block_size = hash_block_size
         validate_codec_env()
 
-        groups, layer_infos, num_blocks = parse_kv_cache_config(
+        groups, num_blocks = parse_kv_cache_config(
             kv_cache_config)
 
         for g, parsed in zip(kv_cache_config.kv_cache_groups, groups):
@@ -470,7 +439,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "restores the non-speculative state slot. Disable "
                     "speculative decoding or the KV connector.")
         self._groups = groups
-        self._layer_infos = layer_infos
         self._rank = rank
         self._attention_layers = tuple(
             ln for g in groups if g.kind != "mamba"
@@ -493,10 +461,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for ln in g.layer_names}
 
         logger.info(
-            "kvshrink hybrid path enabled (%s role, %d groups, %d layers, "
+            "kvshrink hybrid path enabled (%s role, %d groups, "
             "hash_block_size=%d, tp=%d rank=%d)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            len(groups), len(layer_infos), hash_block_size, tp_size, rank)
+            len(groups), hash_block_size, tp_size, rank)
         logger.info(
             "kvshrink groups: %s",
             [(g.group_idx, g.kind, g.block_size) for g in groups])
@@ -1067,9 +1035,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 pending = []
         self._mamba_save_segments = segments
         logger.info(
-            "kvshrink hybrid worker registered: %d layers, %d attention "
+            "kvshrink hybrid worker registered: %d attention "
             "hook points, %d recurrent layers (tp=%d rank=%d)",
-            len(self._layer_infos), len(self._attn_order),
+            len(self._attn_order),
             len(self._mamba_layers), self.tp_size, self._rank)
 
     def _metadata(self) -> KVShrinkConnectorMetadata:
@@ -1161,32 +1129,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             prefix = [ln for ln in self._attn_order if ln in layers][:n]
             gate = recurrent | set(prefix)
-        self._async_loads[req_id] = _AsyncLoad(tasks, gate)
+        self._pending_load_tasks[req_id] = dict(tasks)
+        self._pending_load_layers[req_id] = n if n is not None else -1
+        self._gated_keys[req_id] = frozenset(
+            k for k in tasks if k.rsplit("#", 1)[0] in gate)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
                 "async load req=%s layers=%d gate=%d (recurrent=%d) "
                 "requested_prefix=%s", req_id, len(layers), len(gate),
                 len(recurrent), n)
-
-    def poll_finished_loads(self) -> set[str]:
-        """Report async requests whose gate layers have landed."""
-        finished: set[str] = set()
-        for req_id, entry in list(self._async_loads.items()):
-            if entry.released:
-                continue
-            gate = {k: t for k, t in entry.layer_tasks.items()
-                    if k.rsplit("#", 1)[0] in entry.gate_layers}
-            if gate and not self.kvstore.get_wait(get_results=gate,
-                                                  wait=False):
-                continue
-            self._wait_load(gate)
-            for k in gate:
-                del entry.layer_tasks[k]
-            entry.released = True
-            finished.add(req_id)
-            if not entry.layer_tasks:
-                self._async_loads.pop(req_id, None)
-        return finished
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         self.wait_layer_load(layer_name)
@@ -1197,16 +1148,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if k.rsplit("#", 1)[0] == layer_name]
         if keys:
             self._wait_load({k: self._load_tasks.pop(k) for k in keys})
-        for req_id, entry in list(self._async_loads.items()):
-            if not entry.released:
-                continue
-            keys = [k for k in entry.layer_tasks
-                    if k.rsplit("#", 1)[0] == layer_name]
-            if keys:
-                self._wait_load(
-                    {k: entry.layer_tasks.pop(k) for k in keys})
-            if not entry.layer_tasks:
-                self._async_loads.pop(req_id, None)
+        books = [self._early_promoted_tasks, self._active_promoted_tasks]
+        for book in books:
+            for req_id, tasks in list(book.items()):
+                sel = {k: t for k, t in tasks.items()
+                       if k.rsplit("#", 1)[0] == layer_name}
+                if sel:
+                    self._wait_load(sel)
+                    for k in sel:
+                        del tasks[k]
+                if not tasks:
+                    book.pop(req_id, None)
+        self._early_promoted_tasks = {
+            r: t for r, t in self._early_promoted_tasks.items() if t}
 
     @staticmethod
     def _op_entries(op: GroupTransferMeta) -> list[tuple[int, str]]:
@@ -1241,19 +1195,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _gather_save_candidates(
         self, metadata: KVShrinkConnectorMetadata
-    ) -> dict[tuple[str, int, int, str, int], _SaveCandidate]:
-        """Batch-level boundary candidates with cross-request dedup.
-        Returns boundary_key -> accumulated per-layer pages."""
-        candidates: dict[tuple[str, int], _SaveCandidate] = {}
+    ) -> dict[tuple[str, int], dict]:
+        """Batch-level boundary candidates with cross-request dedup."""
+        candidates: dict[tuple[str, int], dict] = {}
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
             for op in req_meta.group_ops:
                 for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
                     cand = candidates.get(key.boundary_key)
                     if cand is None:
-                        cand = _SaveCandidate(op.group_idx)
+                        cand = {"group_idx": op.group_idx,
+                                "pages": {}, "req_ids": set()}
                         candidates[key.boundary_key] = cand
-                    cand.pages[key.layer_name] = (key, gpu_block_id)
-                    cand.req_ids.add(req_id)
+                    cand["pages"][key.layer_name] = (key, gpu_block_id)
+                    cand["req_ids"].add(req_id)
         return candidates
 
     def _submit_group_layers_save(
@@ -1270,13 +1224,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                 layer_names=layer_names,
                                 label=self._labels[g_idx])
 
-    def _track_put(self, tasks: dict[str, Task], req_ids: set[str]) -> None:
-        """Attribute one submitted put to every request whose GPU blocks
-        it reads; get_finished defers those requests' block freeing
-        until the write lands (same contract as main)."""
-        for rid in req_ids:
-            self._current_put_tasks.setdefault(rid, []).append(tasks)
-
     def _submit_layers_save(
         self, g_idx: int, layer_names: list[str],
         metadata: KVShrinkConnectorMetadata,
@@ -1290,18 +1237,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         entries: list[tuple[int, str]] = []
         req_ids: set[str] = set()
         for cand in self._gather_save_candidates(metadata).values():
-            if cand.group_idx != g_idx:
+            if cand["group_idx"] != g_idx:
                 continue
-            if sorted(cand.pages) != expected:
+            if sorted(cand["pages"]) != expected:
                 continue
-            key, gpu_block_id = cand.pages[layer_names[0]]
+            key, gpu_block_id = cand["pages"][layer_names[0]]
             entries.append((gpu_block_id, key.hash_str))
-            req_ids |= cand.req_ids
+            req_ids |= cand["req_ids"]
         if not entries:
             return
         tasks = self._submit_group_layers_save(g_idx, layer_names,
                                                entries)
-        self._track_put(tasks, req_ids)
+        for rid in req_ids:
+            self._current_put_tasks.setdefault(rid, []).append(tasks)
         self._saved_layers.update(layer_names)
         self._step_save_pages += len(entries) * len(layer_names)
 
@@ -1364,7 +1312,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for bkey, cand in candidates.items():
             blk_hash, g_idx = bkey
             expected = sorted(self._groups[g_idx].layer_names)
-            if sorted(cand.pages) != expected:
+            if sorted(cand["pages"]) != expected:
                 logger.warning(
                     "chunk_save skip commit g%d h=%s: expected %d "
                     "layers, stored %d (%s)", g_idx, blk_hash,
@@ -1374,9 +1322,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             nbound += 1
             blob = per_group.setdefault(g_idx, {"entries": [],
                                                 "req_ids": set()})
-            key, gpu_block_id = cand.pages[expected[0]]
+            key, gpu_block_id = cand["pages"][expected[0]]
             blob["entries"].append((gpu_block_id, key.hash_str))
-            blob["req_ids"] |= cand.req_ids
+            blob["req_ids"] |= cand["req_ids"]
         for g_idx, blob in per_group.items():
             remaining = [ln for ln in self._groups[g_idx].layer_names
                          if ln not in self._saved_layers]
@@ -1384,7 +1332,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             tasks = self._submit_group_layers_save(
                 g_idx, remaining, blob["entries"])
-            self._track_put(tasks, blob["req_ids"])
+            for rid in blob["req_ids"]:
+                self._current_put_tasks.setdefault(rid, []).append(tasks)
             self._saved_layers.update(remaining)
             self._step_save_pages += len(blob["entries"]) * len(remaining)
         if self._step_save_pages:
@@ -1400,19 +1349,41 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Report transfers that completed since the last step."""
         if self.kvstore is None:
             return None, None
-        finished_recving = self.poll_finished_loads()
+
+        finished_recving: set[str] = set()
+        for req_id, tasks in list(self._pending_load_tasks.items()):
+            gated = {k: t for k, t in tasks.items()
+                     if k in self._gated_keys[req_id]}
+            if gated and not self.kvstore.get_wait(get_results=gated,
+                                                   wait=False):
+                continue
+            self._wait_load(gated)
+            del self._gated_keys[req_id]
+            finished_recving.add(req_id)
+            if not (tasks_remaining := {
+                    k: t for k, t in tasks.items() if k not in gated}):
+                del self._pending_load_tasks[req_id]
+                del self._pending_load_layers[req_id]
+                self._gated_keys.pop(req_id, None)
+                continue
+            self._early_promoted_tasks[req_id] = tasks_remaining
+            del self._pending_load_tasks[req_id]
+            del self._pending_load_layers[req_id]
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
         for req_id in self._deferred_finished_req_ids:
-            entry = self._async_loads.get(req_id)
-            if entry is not None:
-                tasks = entry.layer_tasks
-                if tasks and not self.kvstore.get_wait(
-                        get_results=tasks, wait=False):
+            load_tasks = (self._pending_load_tasks.pop(req_id, None)
+                          or self._early_promoted_tasks.get(req_id)
+                          or self._active_promoted_tasks.get(req_id))
+            self._gated_keys.pop(req_id, None)
+            if load_tasks is not None:
+                if not self.kvstore.get_wait(get_results=load_tasks,
+                                             wait=False):
                     continue
-                self._wait_load(tasks)
-                self._async_loads.pop(req_id, None)
+                self._wait_load(load_tasks)
+                self._early_promoted_tasks.pop(req_id, None)
+                self._active_promoted_tasks.pop(req_id, None)
 
             tasks = self._current_put_tasks.get(req_id)
             if tasks is None:
