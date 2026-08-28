@@ -217,7 +217,8 @@ def test_parked_request_still_gets_a_load_plan():
     sched = HybridRequestScheduler(
         groups, _FakeStore(), hash_block_size=16)
     st = ReqState(
-        block_hashes=[1, 2], snapshot_boundary=32,
+        block_hashes=[1, 2], num_computed_tokens=32,
+        pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     st.async_load_layers = 1
@@ -240,7 +241,8 @@ def test_async_plan_is_emitted_only_once():
         [_group(0, "attention", ATTN)], _FakeStore(),
         hash_block_size=16)
     st = ReqState(
-        block_hashes=[1, 2], snapshot_boundary=32,
+        block_hashes=[1, 2], num_computed_tokens=32,
+        pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
@@ -314,7 +316,8 @@ def test_sync_still_refuses_zero_scheduled_tokens():
     sched = HybridRequestScheduler(
         groups, _FakeStore(), hash_block_size=16)
     st = ReqState(
-        block_hashes=[1, 2, 3, 4], snapshot_boundary=64,
+        block_hashes=[1, 2, 3, 4], num_computed_tokens=64,
+        pending_load_tokens=64,
         groups=(ReqGroupState(block_ids=[1, 2, 3, 4]),
                 ReqGroupState(block_ids=[7, 8, 9, 10])))
     st.is_async = False
@@ -338,7 +341,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
     st = ReqState(
-        block_hashes=[1, 2], snapshot_boundary=32,
+        block_hashes=[1, 2],
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
@@ -378,7 +381,8 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
     st = ReqState(
-        block_hashes=[1, 2], snapshot_boundary=32,
+        block_hashes=[1, 2], num_computed_tokens=32,
+        pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st

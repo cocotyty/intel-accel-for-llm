@@ -122,7 +122,8 @@ def test_load_meta_curr_slot_is_last_scheduled_block():
     (544 + 544 - 1) // 544 = 1 -> block 6."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[5, 6]])
-    sched._req_states["r1"].snapshot_boundary = 544
+    sched._req_states["r1"].num_computed_tokens = 544
+    sched._req_states["r1"].pending_load_tokens = 544
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 1088,
                        "block_ids": ([5, 6],)}),
@@ -138,7 +139,8 @@ def test_load_meta_chunk_tail_table_index():
     reads this step."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1, 6]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 1560,
                        "block_ids": ([0, 1, 6],)}),
@@ -154,7 +156,8 @@ def test_load_meta_null_prefixed_table():
     load targets."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 7, 9]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 1632,
                        "block_ids": ([0, 7, 9],)}),
@@ -169,7 +172,8 @@ def test_load_meta_decode_tail():
     1088): (1088 + 1 - 1) // 544 = 2 -> block 6."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1, 6]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 1089,
                        "block_ids": ([0, 1, 6],)}),
@@ -187,7 +191,8 @@ def test_load_meta_curr_null_fail_stop():
     restored at all."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1, 0]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     raised = None
     try:
         sched.build_load_meta(
@@ -205,7 +210,8 @@ def test_load_meta_curr_null_decode_fail_stop():
     never enter forward with unrestored state."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1, 0]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     raised = None
     try:
         sched.build_load_meta(
@@ -223,7 +229,8 @@ def test_load_meta_curr_out_of_range_fail_stop():
     -> FAIL-STOP (the block the kernel will read was never allocated)."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     raised = None
     try:
         sched.build_load_meta(
@@ -240,7 +247,8 @@ def test_load_meta_curr_out_of_range_decode_fail_stop():
     """Decode tail (sched == 1): gathered index beyond table -> FAIL-STOP."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 1]])
-    sched._req_states["r1"].snapshot_boundary = 1088
+    sched._req_states["r1"].num_computed_tokens = 1088
+    sched._req_states["r1"].pending_load_tokens = 1088
     raised = None
     try:
         sched.build_load_meta(
@@ -260,7 +268,8 @@ def test_load_meta_table_idx_null_fail_closed():
     so proceeding would enter forward with unrestored state."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[0, 0, 6]])
-    sched._req_states["r1"].snapshot_boundary = 544  # idx (544+1-1)//544 = 1
+    sched._req_states["r1"].num_computed_tokens = 544
+    sched._req_states["r1"].pending_load_tokens = 544  # idx (544+1-1)//544 = 1
     raised = None
     try:
         sched.build_load_meta(
@@ -282,7 +291,8 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks(((5,),)), 0)
-    sched._req_states["r1"].snapshot_boundary = 1632  # idx 1631//544 = 2
+    sched._req_states["r1"].num_computed_tokens = 1632
+    sched._req_states["r1"].pending_load_tokens = 1632  # idx 1631//544 = 2
     raised = None
     try:
         sched.build_load_meta(
@@ -296,8 +306,8 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
 
 
 def test_load_meta_fail_closed_without_boundary():
-    """No snapshot_boundary recorded -> fail closed (0 keys), never guess
-    by recomputing."""
+    """No external credit (pending_load_tokens=0) -> 0 keys, never
+    guess by recomputing."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[5]])
     meta = sched.build_load_meta(
@@ -320,7 +330,8 @@ def test_load_meta_all_null_table_fail_closed():
     """All-null table with boundary > 0 -> FAIL-STOP (curr slot null)."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[0, 0]])
-    sched._req_states["r1"].snapshot_boundary = 544
+    sched._req_states["r1"].num_computed_tokens = 544
+    sched._req_states["r1"].pending_load_tokens = 544
     raised = None
     try:
         sched.build_load_meta(
@@ -339,7 +350,8 @@ def test_load_meta_hit_sched_zero_fail_stop():
     path that must never drive a real mamba load."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[5, 9]])
-    sched._req_states["r1"].snapshot_boundary = 544
+    sched._req_states["r1"].num_computed_tokens = 544
+    sched._req_states["r1"].pending_load_tokens = 544
     raised = None
     try:
         sched.build_load_meta(
@@ -360,7 +372,11 @@ def test_completeness_intact_boundary_unchanged():
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
     assert ext == 1088, ext
-    assert sched._req_states["r1"].snapshot_boundary == 1088
+    sched.update_state_after_alloc(
+        type("R", (), {"request_id": "r1"}),
+        FakeBlocks(([9], [9])), 1088)
+    # the credit landed num_computed_tokens exactly on the boundary
+    assert sched._req_states["r1"].num_computed_tokens == 1088
 
 
 def test_mamba_align_granularity():
