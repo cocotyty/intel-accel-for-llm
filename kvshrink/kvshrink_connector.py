@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""KVShrink external KV cache connector (hybrid GDN/Mamba aware)."""
-
 from __future__ import annotations
 
 import hashlib
@@ -94,7 +92,9 @@ def group_label(group_idx: int) -> str:
     return f"g{int(group_idx)}"
 
 def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
-    """Is this boundary present in the store?"""
+    """Is this boundary present in the store? Presence is per
+    # (label, hash) chunk; a boundary is present when the store has
+    # it under the group's label."""
     try:
         present = store.has([key.hash_str],
                             label=group_label(key.group_idx))
@@ -105,7 +105,8 @@ def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
 
 @dataclass(frozen=True)
 class GroupInfo:
-    """One vLLM KV cache group: a frozen snapshot of its storage spec."""
+    """One vLLM KV cache group: a frozen snapshot of its storage
+    # contract (kind, layers, block size, mamba alignment)."""
 
     group_idx: int
     kind: str
@@ -116,7 +117,8 @@ class GroupInfo:
 
 @dataclass(frozen=True)
 class CacheKey:
-    """Logical key for one page, or for a whole boundary."""
+    """Logical key for one page, or for a whole boundary
+    # (layer_name empty)."""
     block_hash: object
     group_idx: int
     layer_name: str
@@ -144,7 +146,8 @@ def make_boundary_key(group_idx: int,
 
 @dataclass
 class GroupTransferMeta:
-    """Per-group transfer instructions for one request (one step)."""
+    """Per-group transfer instructions for one request (one step).
+    # keys expands per (block, layer); gpu_block_ids is per block."""
     group_idx: int
     keys: tuple[CacheKey, ...] = ()
     gpu_block_ids: tuple[int, ...] = ()
@@ -156,7 +159,9 @@ class KVShrinkParseError(ValueError):
     pass
 
 def validate_codec_env() -> None:
-    """Warn when the codec is configured to lose bits."""
+    """Warn when the codec is configured to lose bits (the opaque
+    # mamba pools are exempted structurally, so this only flags the
+    # operator request)."""
     lossy = os.getenv("IAXL_KV_LOSSY_TRUNC", "0").strip()
     if lossy in ("", "0"):
         return
@@ -167,11 +172,7 @@ def validate_codec_env() -> None:
         "KVStore).", lossy)
 
 def _spec_kind(spec: object) -> str:
-    """Mamba or attention; unknown spec types raise KVShrinkParseError
-    (fail closed). Sliding-window specs are AttentionSpec subclasses and
-    are intentionally NOT distinguished: their block layout is the
-    attention one, and the hit-rule difference lives in vLLM's spec
-    registry, which is consulted directly."""
+    """Mamba or attention; unknown specs raise KVShrinkParseError."""
     if isinstance(spec, MambaSpec):
         return "mamba"
     if isinstance(spec, AttentionSpec):
@@ -193,7 +194,10 @@ def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[list[GroupInfo], int]:
-    """Return (groups, num_blocks)."""
+    """Return (groups, num_blocks). Per-layer geometry is not
+    # parsed: KVStore binds pools from the live tensors, which carry
+    # their own layout. Raises KVShrinkParseError on unknown specs or
+    # mixed block sizes."""
     num_blocks = kv_cache_config.num_blocks
     groups: list[GroupInfo] = []
 
@@ -254,7 +258,7 @@ def save_enabled() -> bool:
             or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
 
 class _StoreAsBlockPool:
-    """The one thing vLLM's matching code needs that we must supply."""
+    """The one thing vLLM's matching code needs from us."""
 
     __slots__ = ("_present",)
 
@@ -283,11 +287,7 @@ class HybridHitPolicy:
         hash_block_size: int,
         num_computed_tokens: int,
     ):
-        """Configure the policy for one request: the groups, a
-        store-presence predicate ``present(group_idx, block_hash)`` and
-        the request's computed tokens. Orders groups attention-first
-        (tighter initial bound) and takes the global mamba alignment as
-        the minimum across mamba groups."""
+        """Configure the policy for one request."""
         self._groups: list[GroupInfo] = groups
         self._present: Callable[[int, object], bool] = present
         self._hash_block_size: int = hash_block_size
@@ -322,9 +322,8 @@ class HybridHitPolicy:
     def find_longest_cache_hit(
         self, block_hashes: list[int], max_length: int
     ) -> int:
-        """Fixed-point convergence over all groups. Returns the
-        restorable boundary in tokens; 0 = miss.
-        """
+        """Fixed-point convergence over all groups; returns the
+        # restorable prefix in tokens (the snapshot boundary)."""
         candidate = max_length
         if self._mamba_align is not None:
             a = self._mamba_align
@@ -344,7 +343,7 @@ class HybridHitPolicy:
         return candidate if candidate > self._num_computed else 0
 
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
-    """KVShrink external KV cache connector."""
+    """KVShrink external KV cache connector (hybrid GDN/Mamba aware)."""
 
     @classmethod
     def requires_piecewise_for_cudagraph(
@@ -472,7 +471,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     @staticmethod
     def _choose_block_hash_source(recurrent: bool) -> str:
-        """Which block-identity scheme to key the cache with."""
+        """Which block-identity scheme keys the cache: vLLM block
+        # hashes (default) or the legacy token-hash fallback."""
         choice = (os.getenv("KVSHRINK_BLOCK_HASH_SOURCE") or "auto").lower()
         if choice == "auto":
             return "vllm" if recurrent else "legacy"
@@ -538,10 +538,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
         request: Optional["Request"] = None,
     ) -> None:
-        """Register a fresh ReqState. Internal: called by us from
-        get_num_new_matched_tokens / build_load_meta /
-        update_state_after_alloc when a request first becomes visible
-        (vLLM has no dedicated "new request" connector hook)."""
+        """Register a fresh ReqState."""
         live_source = None
         if request is not None:
             live_source = (request.block_hashes
@@ -596,9 +593,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, req_id: str, new_block_ids: tuple[list[int], ...],
         resumed: bool, num_computed_tokens: Optional[int],
     ) -> None:
-        """vLLM trigger: every scheduling pass, for each running
-        (cached) request, via connector.build_connector_meta.
-        """
+        """Every pass, for each running request: sync the block
+        # tables and hashes from upstream; on resume (or progress
+        # regression) roll the save cursor back so boundaries emitted
+        # before a preemption get re-emitted (overwrite is idempotent)."""
         state = self._req_states[req_id]
         if state.live_source is not None:
             if self._block_hash_source == "vllm":
@@ -666,9 +664,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return external, use_async
 
     def _decide_async(self, req_id: str, external: int) -> bool:
-        """Should this request's pages stream in while the GPU runs
-        OTHER requests, instead of stalling a forward step on us?
-        """
+        """Async when there are external tokens to stream and the
+        # concurrency-tuned layer count is nonzero. The gate always
+        # covers every recurrent layer regardless of that count."""
         if external <= 0 or self._async_load_layer_config is None:
             return False
         state = self._req_states[req_id]
@@ -689,7 +687,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        """Record the allocated block tables per group (after alloc)."""
+        """Record the allocated block tables per group and the
+        # external-token count the core accepted (drives the load
+        # plan). For async requests this is also where the load plan
+        # is emitted, since a parked request never appears in
+        # build_connector_meta."""
         req_id = request.request_id
         state = self._req_states.get(req_id)
         if state is None:
@@ -725,16 +727,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        """SupportsHMA entry point (v0.23.0 calls this instead of
-        ``request_finished`` whenever the hybrid memory allocator is on,
-        which is the default for every model).
-        """
+        """SupportsHMA entry point (v0.23 calls this for hybrid models)."""
         return self.request_finished(request, [])
 
     def build_load_meta(
         self, new_req: "NewRequestData", scheduled_tokens: int = 0
     ) -> ReqMeta:
-        """Build the LOAD ReqMeta for a NewRequestData entry."""
+        """Load plan for a NewRequestData entry."""
         req_id = new_req.req_id
         state = self._req_states[req_id]
         return self._build_load_meta_from_state(
@@ -743,7 +742,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def build_resumed_load_meta(
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
-        """Build the LOAD ReqMeta for a PREEMPTION-RESUMED request."""
+        """Load plan for a PREEMPTION-RESUMED request: v1 carries
+        # them in scheduled_cached_reqs.resumed_req_ids, not in
+        # scheduled_new_reqs, so they need their own loop."""
         state = self._req_states[req_id]
         meta = self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
@@ -762,12 +763,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def _build_load_meta_from_state(
         self, req_id: str, state: ReqState, scheduled_tokens: int,
     ) -> ReqMeta:
-        """The snapshot_boundary recorded by get_num_new_matched_tokens
-        is the AUTHORITATIVE restore boundary for this alloc/load. NEVER recompute here: after
-        update_state_after_alloc the locally-computed counter already
-        includes external tokens, and a fresh lookup would be polluted.
-        Missing/expired boundary must
-        FAIL CLOSED (boundary 0), not guess."""
+        """Build one request's load plan from its recorded state."""
         boundary = state.snapshot_boundary
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info(
@@ -843,7 +839,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
-        """Production save: INCREMENTAL per-group page persistence."""
+        """Incremental save plan: for each request, every group,
+        # emit the boundaries completed since the last pass. The
+        # worker executes it after forward, when the GPU pages hold
+        # state up to computed+scheduled tokens. A partial boundary
+        # (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
         progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
@@ -901,7 +901,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        """Assemble this pass's hybrid plans."""
+        """Assemble this pass's load/save plans."""
         meta = KVShrinkConnectorMetadata()
         debug = bool(os.getenv("KVSHRINK_DEBUG_LOG"))
         save_on = save_enabled()
@@ -1018,7 +1018,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         execution_order: list[str],
     ) -> None:
-        """Record the model's execution order and which layers recur."""
+        """Record the model's execution order; only the attention
+        # order is used, by the async release gate."""
         self._layer_names = list(execution_order)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
@@ -1072,11 +1073,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.start_load(metadata)
 
     def start_load(self, metadata: KVShrinkConnectorMetadata) -> int:
-        """Submit ALL of this step's loads, then host-block on the GDN
-        ones. Attention layers stay pipelined: vLLM calls a hook on
-        entry to each of them, so their pages are waited for exactly
-        when they are about to be read.
-        """
+        """Submit all of this step's loads, then host-block on the
+        # recurrent ones (no hook ever fires for them). Attention
+        # pages are waited per layer by the forward hooks."""
         self._current_get_tasks = None
         self._saved_layers = set()
         self._step_save_pages = 0
@@ -1188,7 +1187,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def _gather_save_candidates(
         self, metadata: KVShrinkConnectorMetadata
     ) -> dict[tuple[str, int], dict]:
-        """Batch-level boundary candidates with cross-request dedup."""
+        """boundary_key -> {"group_idx", "pages", "req_ids"}, with
+        # cross-request dedup (shared boundaries are written once)."""
         candidates: dict[tuple[str, int], dict] = {}
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
             for op in req_meta.group_ops:
@@ -1206,11 +1206,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, g_idx: int, layer_names: list[str],
         entries: list[tuple[int, str]],
     ) -> dict[str, Task]:
-        """Submit ONE async engine put covering ``layer_names`` for the
-        blocks in ``entries`` (list of (gpu_block_id, chunk_label), same
-        order for every layer -- scheduler invariant). Async D2H+zip on
-        the engine's put_stream, self-gated on the compute stream so it
-        reads final values. Returns the engine tasks dict."""
+        """One async engine put covering ``layer_names`` for the
+        # (gpu_block, hash) entries."""
         return self.kvstore.put(block_indices=[gpu for gpu, _ in entries],
                                 block_hashs=[h for _, h in entries],
                                 layer_names=layer_names,
@@ -1220,11 +1217,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, g_idx: int, layer_names: list[str],
         metadata: KVShrinkConnectorMetadata,
     ) -> None:
-        """Submit ONE async engine put covering ``layer_names`` of one
-        group for this step's complete boundary candidates. No waiting:
-        the tasks join ``_current_put_tasks`` and drain in
-        get_finished. Partial-boundary candidates are skipped here
-        exactly as submit_saves skips them."""
+        """One async engine put for ``layer_names`` of one group over
+        # this step's complete boundary candidates."""
         expected = sorted(self._groups[g_idx].layer_names)
         entries: list[tuple[int, str]] = []
         req_ids: set[str] = set()
@@ -1252,9 +1246,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """Pipelined save. vLLM calls this on exit of EVERY attention
-        layer during forward (kv_transfer_utils decorator).
-        """
+        """Submit this attention layer's pages plus the mamba segment
+        # before it (their kernels already ran, so the data is final).
+        # The trailing segment goes out in wait_for_save. Submission
+        # only; the drain lives in get_finished."""
         if self._connector_metadata is None:
             return
         if os.getenv("KVSHRINK_SAVE_PIPELINED", "1") == "0":
@@ -1291,13 +1286,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def submit_saves(
         self, metadata: KVShrinkConnectorMetadata
     ) -> tuple[int, int]:
-        """Post-forward save SUBMISSION: every layer not already
-        pipelined through save_kv_layer (trailing mamba segment,
-        attention layers whose hook never fired) goes out here, one
-        engine put per group. Nothing is waited: the writes drain in
-        get_finished, which is also where finished requests' blocks are
-        released (the deferred-freeing contract, same as main).
-        Returns (pages, boundaries) submitted this step."""
+        """Submit every layer not already pipelined (trailing mamba
+        # segment, hooks that never fired), one put per group. The
+        # drain lives in get_finished. Returns (pages, boundaries)."""
         candidates = self._gather_save_candidates(metadata)
         per_group: dict[int, dict[str, Any]] = {}
         nbound = 0
@@ -1338,7 +1329,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """Report transfers that completed since the last step."""
+        """Worker-side: report finished saves and released async loads."""
         if self.kvstore is None:
             return None, None
 
