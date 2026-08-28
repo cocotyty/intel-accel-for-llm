@@ -103,6 +103,10 @@ def _meta(async_layers, req_id="r1"):
 # ------------------------------------------------------------------
 # the recurrent-state constraint
 # ------------------------------------------------------------------
+def _layers(s):
+    return {k.rsplit("#", 1)[0] for k in s}
+
+
 def test_gate_covers_every_recurrent_layer_despite_short_prefix():
     """Asking to release after ONE attention layer must still wait for
     all GDN state: it is consumed whole at the start of forward."""
@@ -110,11 +114,11 @@ def test_gate_covers_every_recurrent_layer_despite_short_prefix():
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
 
-    entry = w._async_loads["r1"]
-    assert set(GDN) <= entry.gate_layers, (
+    gated = w._gated_keys["r1"]
+    assert set(GDN) <= _layers(gated), (
         "recurrent layers were left out of the release gate")
     # exactly one attention layer, the first in execution order
-    assert entry.gate_layers & set(ATTN) == {"a1"}
+    assert {ln for ln in _layers(gated) if ln in ATTN} == {"a1"}
 
 
 def test_not_released_until_recurrent_state_has_landed():
@@ -123,17 +127,19 @@ def test_not_released_until_recurrent_state_has_landed():
     w.start_load(_meta(async_layers=1))
 
     b.landed = {"a1"}                      # attention prefix only
-    assert w.poll_finished_loads() == set()
+    _, recving = w.get_finished(set())
+    assert not recving
 
     b.landed |= set(GDN)                   # now the state is there
-    assert w.poll_finished_loads() == {"r1"}
+    _, recving = w.get_finished(set())
+    assert recving == {"r1"}, recving
 
 
 def test_negative_layer_count_gates_on_every_layer():
     b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=-1))
-    assert w._async_loads["r1"].gate_layers == set(ORDER)
+    assert _layers(w._gated_keys["r1"]) == set(ORDER)
 
 
 # ------------------------------------------------------------------
@@ -146,6 +152,7 @@ def test_async_tasks_live_outside_the_step_tasks():
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     assert w._load_tasks == {}
+    assert "r1" in w._pending_load_tasks
 
 
 def test_remaining_layers_are_drained_by_the_layer_hooks():
@@ -153,13 +160,17 @@ def test_remaining_layers_are_drained_by_the_layer_hooks():
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
     b.landed = set(ORDER)
-    assert w.poll_finished_loads() == {"r1"}
+    _, recving = w.get_finished(set())
+    assert recving == {"r1"}
 
     # gate layers were finalized at release; a3 was not
     assert "a3" not in b.waited
+    # release promoted leftovers to active-for-forward, main-style
+    assert "r1" in w._early_promoted_tasks or \
+           "r1" in w._active_promoted_tasks
     w.wait_layer_load("a3")
     assert "a3" in b.waited
-    assert "r1" not in w._async_loads      # fully drained, entry dropped
+    assert "r1" not in w._pending_load_tasks
 
 
 # ------------------------------------------------------------------
@@ -173,12 +184,9 @@ def test_failed_transfer_raises_at_poll():
     b.landed = set(ORDER)
 
     with pytest.raises(RuntimeError, match="transfer failed"):
-        w.poll_finished_loads()
+        w.get_finished(set())
 
 
-# ------------------------------------------------------------------
-# the deadlock this file exists to prevent
-# ------------------------------------------------------------------
 def test_parked_request_still_gets_a_load_plan():
     """Regression: an async request appears in NEITHER scheduled list.
 
