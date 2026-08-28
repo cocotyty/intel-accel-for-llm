@@ -53,7 +53,6 @@ ReqId = str
 class ReqMeta:
     """All transfer instructions for one request in one step."""
     group_ops: tuple[GroupTransferMeta, ...] = ()
-    external_hit_tokens: int = 0
     is_async: bool = False
     async_load_layers: int = -1
 
@@ -68,7 +67,6 @@ class ReqState:
     live_source: list = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
-    snapshot_boundary: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     pending_load_tokens: int = 0
     last_known_progress: int = 0
@@ -86,11 +84,9 @@ class RequestMetadata:
         group_ops: tuple[GroupTransferMeta, ...] = (),
         is_async: bool = False,
         async_load_layers: int = -1,
-        external_hit_tokens: int = 0,
     ) -> None:
         self.requests[req_id] = ReqMeta(
             group_ops=group_ops,
-            external_hit_tokens=external_hit_tokens,
             is_async=is_async,
             async_load_layers=async_load_layers,
         )
@@ -382,10 +378,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         boundary = policy.find_longest_cache_hit(
             block_hashes, request.num_tokens)
         state = self._req_states[request.request_id]
-        if boundary and state.block_hashes:
-            state.snapshot_boundary = boundary
-        else:
-            boundary = 0
         external = max(0, boundary - num_computed_tokens)
         use_async = external > 0 and self._async_load_layer_config is not None
         if use_async:
@@ -468,7 +460,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "kvshrink resumed request has accepted external "
                     "tokens but no restorable pages (req="
                     f"{req_id} pending={state.pending_load_tokens} "
-                    f"boundary={state.snapshot_boundary} "
+                    f"boundary={state.num_computed_tokens} "
                     f"sched={scheduled_tokens}): refusing to enter "
                     "forward with unrestored state")
         return meta
@@ -477,33 +469,37 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, req_id: str, state: ReqState, scheduled_tokens: int,
     ) -> ReqMeta:
         """Build one request's load plan from its recorded state."""
-        boundary = state.snapshot_boundary
+        ext = state.pending_load_tokens
         group_ops = []
         for g_idx, group in enumerate(self._groups):
             ids = state.groups[g_idx].block_ids
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
             if group.kind == "attention":
-                num_hash = boundary // group.block_size
+                start = ((state.num_computed_tokens - ext)
+                         // group.block_size)
+                end = state.num_computed_tokens // group.block_size
                 for layer_name in group.layer_names:
                     keys.extend(CacheKey(state.block_hashes[i],
                                          group.group_idx, layer_name)
-                                for i in range(num_hash))
-                    gpu_ids.extend(ids[i] for i in range(num_hash))
+                                for i in range(start, end))
+                    gpu_ids.extend(ids[i] for i in range(start, end))
             elif group.kind == "mamba":
-                if boundary > 0:
-                    idx = boundary // group.block_size - 1
+                if ext > 0:
+                    idx = (state.num_computed_tokens
+                           // group.block_size - 1)
                     blk_hash = state.block_hashes[idx]
                     key = CacheKey(blk_hash, group.group_idx, "")
                     bs = group.block_size
-                    curr_idx = (boundary + scheduled_tokens -
-                                1) // bs
+                    curr_idx = (state.num_computed_tokens +
+                                scheduled_tokens - 1) // bs
 
                     if scheduled_tokens <= 0 and not state.is_async:
                         raise RuntimeError(
                             "kvshrink mamba external HIT with "
                             "scheduled_tokens=0 "
-                            f"(req={req_id} boundary={boundary}): "
+                            f"(req={req_id} "
+                            f"boundary={state.num_computed_tokens}): "
                             "production hits must schedule >= 1 "
                             "token; refusing to build load meta")
                     if not (0 <= curr_idx < len(ids)
@@ -511,7 +507,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         raise RuntimeError(
                             "kvshrink mamba load curr slot "
                             f"invalid (req={req_id} "
-                            f"boundary={boundary} "
+                            f"boundary={state.num_computed_tokens} "
                             f"sched={scheduled_tokens} "
                             f"table_idx={curr_idx} "
                             f"table={ids}): refusing to enter "
@@ -525,7 +521,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
         return ReqMeta(
-            external_hit_tokens=boundary - state.num_computed_tokens,
             group_ops=tuple(group_ops),
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
@@ -597,10 +592,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for new_req in scheduler_output.scheduled_new_reqs:
             req_meta = self.build_load_meta(
                 new_req, num_sched[new_req.req_id])
-            if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
+            if any(op.keys for op in req_meta.group_ops):
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.group_ops, req_meta.is_async,
-                    req_meta.async_load_layers, req_meta.external_hit_tokens)
+                    req_meta.async_load_layers)
             save_meta = self.build_save_meta(
                 new_req.req_id, num_sched[new_req.req_id])
             if save_meta.group_ops:
@@ -615,25 +610,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 req_id, state, scheduled_tokens=0)
             state.async_plan_emitted = True
             state.is_async = False
-            if req_meta is None or not req_meta.group_ops:
-                logger.warning(
-                    "async req=%s has no restorable pages; dropping the "
-                    "plan so it is recomputed rather than left waiting",
-                    req_id)
-                continue
             meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
-                req_meta.async_load_layers, req_meta.external_hit_tokens)
+                req_meta.async_load_layers)
         self._async_load_pending -= set(pending)
 
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
             req_meta = self.build_resumed_load_meta(
                 req_id, num_sched[req_id])
-            if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
+            if any(op.keys for op in req_meta.group_ops):
                 meta.reqs_to_load.add_request(
-                req_id, req_meta.group_ops, req_meta.is_async,
-                req_meta.async_load_layers, req_meta.external_hit_tokens)
+                    req_id, req_meta.group_ops, req_meta.is_async,
+                    req_meta.async_load_layers)
 
         resumed = cr.resumed_req_ids
         new_bids = cr.new_block_ids
