@@ -48,8 +48,7 @@ class FakeBlocks:
 
 
 def HybridRequestScheduler(groups, store, hash_block_size,
-                           async_load_config=None,
-                           block_hash_source="vllm"):
+                           async_load_config=None):
     """Scheduler-side connector instance without the vLLM config stack.
 
     The scheduler-side methods live on KVShrinkConnector; this factory
@@ -63,7 +62,6 @@ def HybridRequestScheduler(groups, store, hash_block_size,
     conn.kvstore = store
     conn._hash_block_size = hash_block_size
     conn._async_load_layer_config = async_load_config
-    conn._block_hash_source = block_hash_source
     conn._attention_layers = tuple(
         ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
     conn._req_states = {}
