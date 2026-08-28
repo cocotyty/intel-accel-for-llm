@@ -242,15 +242,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_cpu_affinity()
             self._bind_intel_accel()
 
-        if kv_cache_config is not None:
-            self._init_kv_stack(vllm_config, role, kv_cache_config)
-
-    def _init_kv_stack(
-        self,
-        vllm_config: VllmConfig,
-        role: KVConnectorRole,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
         """Build the hybrid stack for this role."""
         pc = vllm_config.parallel_config
         tp_size = pc.tensor_parallel_size
@@ -260,11 +251,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 f"(pipeline_parallel_size={pc.pipeline_parallel_size}); "
                 "each rank would persist only its own layers' pages. "
                 "Set pipeline_parallel_size=1 or the KV connector.")
-        if role == KVConnectorRole.WORKER:
-            rank = pc.rank
-        else:
-            rank = 0
-
         groups, _num_blocks = parse_kv_cache_config(kv_cache_config)
         self._groups = groups
         self._hash_block_size = math.gcd(*(g.block_size for g in groups))
@@ -278,7 +264,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "snapshot only restores the non-speculative state "
                     "slot. Disable speculative decoding or the KV "
                     "connector.")
-        self._rank = rank
+
         self._attention_layers = tuple(
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
@@ -296,7 +282,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
             "hash_block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            tp_size, rank, self._hash_block_size,
+            tp_size, self.rank, self._hash_block_size,
             [(g.group_idx, g.kind, g.block_size) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
@@ -777,7 +763,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             kv_caches=kv_caches,
-            rank=self._rank,
+            rank=self.rank,
             tp_size=self.tp_size,
         )
         logger.info("Registered %d KV cache layers",
@@ -809,7 +795,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             "kvshrink hybrid worker registered: %d attention "
             "hook points, %d recurrent layers (tp=%d rank=%d)",
             len(self._attn_order),
-            len(self._mamba_layers), self.tp_size, self._rank)
+            len(self._mamba_layers), self.tp_size, self.rank)
 
     def start_load_kv(
         self,
@@ -880,7 +866,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 "start_load_kv: %d pages loaded "
                 "elapsed_ms=%.3f (rank %d/%d)", npages,
-                (time.monotonic() - _t0) * 1e3, self._rank, self.tp_size)
+                (time.monotonic() - _t0) * 1e3, self.rank, self.tp_size)
         return npages
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1079,7 +1065,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 "chunk_save: %d pages submitted, %d boundaries "
                 "(rank %d/%d)", self._step_save_pages, nbound,
-                self._rank, self.tp_size)
+                self.rank, self.tp_size)
         return self._step_save_pages, nbound
 
     def get_finished(
