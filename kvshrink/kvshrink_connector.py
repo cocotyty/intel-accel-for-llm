@@ -433,12 +433,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
-        if num_computed_tokens >= request.num_tokens:
-            return 0, False
         block_hashes = self._request_block_hashes(request)
         self._track_new_request(
             request.request_id, block_hashes,
             num_computed_tokens, request=request)
+        if num_computed_tokens >= request.num_tokens:
+            return 0, False
         policy = HybridHitPolicy(
             self._groups,
             lambda g, h: self._store().has(
@@ -480,12 +480,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # is emitted, since a parked request never appears in
         # build_connector_meta."""
         req_id = request.request_id
-        state = self._req_states.get(req_id)
-        if state is None:
-            self._track_new_request(
-                req_id, self._request_block_hashes(request), 0,
-                request=request)
-            state = self._req_states[req_id]
+        state = self._req_states[req_id]
         state.num_computed_tokens = (
             state.num_computed_tokens + num_external_tokens)
         state.pending_load_tokens = num_external_tokens
