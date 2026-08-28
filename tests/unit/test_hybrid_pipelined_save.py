@@ -10,7 +10,6 @@ finished requests' blocks (finished_sending). These tests use a fake
 store and fake canonicalizer -- no GPU, no disk, no model.
 """
 
-import os
 from conftest import HybridWorker, make_spec
 from kvshrink.kvshrink_connector import (
     KVShrinkConnectorMetadata,
@@ -80,13 +79,7 @@ def _worker():
     return w
 
 
-def _env_off(monkeypatch_env=None):
-    os.environ.pop("KVSHRINK_SAVE", None)
-    os.environ.pop("KVSHRINK_DEBUG_AUTOSAVE", None)
-
-
 def test_pipelined_attention_submits_during_forward():
-    _env_off()
     c = _worker()
     # forward: vLLM binds the step metadata, then calls save_kv_layer
     # on exit of each attention layer
@@ -116,7 +109,6 @@ def test_pipelined_attention_submits_during_forward():
 def test_fallback_when_hook_never_fired():
     """Older vLLM / decorator missing: attention submits post-forward,
     commits still correct (idempotent full coverage)."""
-    _env_off()
     c = _worker()
     _pages, nbound = c.submit_saves(_save_meta())  # no save_kv_layer first
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
@@ -129,7 +121,6 @@ def test_fallback_when_hook_never_fired():
 def test_mamba_segment_rides_the_next_attention_hook():
     """Mamba layers before an attention layer are final when its save
     hook fires, so they submit there instead of post-forward."""
-    _env_off()
     c = _worker()
     c._mamba_save_segments = {"a0": ("m0",)}
     meta = _save_meta()
@@ -147,7 +138,6 @@ def test_mamba_segment_rides_the_next_attention_hook():
 def test_mamba_segment_splits_by_group():
     """A segment between two attention layers interleaves the mamba
     groups; each group's layers must go under their own store label."""
-    _env_off()
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"]),
               _group(2, "mamba", ["m1"])]
@@ -183,7 +173,6 @@ def test_write_is_the_commit():
     expressed. The write is drained (and the request released) in
     get_finished.
     """
-    _env_off()
     w = _worker()
     pages, boundaries = w.submit_saves(_save_meta())
     assert pages > 0 and boundaries > 0

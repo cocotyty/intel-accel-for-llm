@@ -22,9 +22,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 # Knobs that change connector behaviour. Cleared for every test so a
 # developer's shell environment can never alter the results.
 _KVSHRINK_ENV = (
-    "KVSHRINK_SAVE",
-    "KVSHRINK_DEBUG_AUTOSAVE",
-    "KVSHRINK_DEBUG_LOG",
     "KVSHRINK_DEBUG_DUMP",
     "KVSHRINK_PERSIST_DIR",
 )
