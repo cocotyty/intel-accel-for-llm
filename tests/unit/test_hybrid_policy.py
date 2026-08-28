@@ -6,7 +6,7 @@ block (block_size granularity), e.g. 2135-token prompt with block_size=544
 """
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo
-from kvshrink.kvshrink_connector import HybridHitPolicy
+from kvshrink.hybrid_hit import HybridHitPolicy
 
 
 def _group(g_idx, kind, block_size, align=None, mode="align"):
