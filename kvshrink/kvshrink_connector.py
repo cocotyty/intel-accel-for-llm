@@ -610,54 +610,55 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # (v0.23 align mode pins execution to column 0 = the
                 # block holding the last scheduled token, for both
                 # prefill and decode).
-                if state.block_hashes and boundary > 0:
+                if boundary > 0:
                     # hash index of the snapshot AT boundary:
                     # hash[i] covers [i*bs, (i+1)*bs) -> snapshot at
-                    # boundary lives at hash[boundary//bs - 1]
+                    # boundary lives at hash[boundary//bs - 1]. The index
+                    # is always in range: the policy only returns
+                    # aligned boundaries capped by the hash list.
                     idx = boundary // group.block_size - 1
-                    if 0 <= idx < len(state.block_hashes):
-                        blk_hash = state.block_hashes[idx]
-                        key = CacheKey(blk_hash, group.group_idx, "")
-                        bs = group.block_size
-                        # CURR running-state index (align mode):
-                        # (num_computed + num_scheduled - 1) // bs.
-                        # Kernels gather exactly this one column, so
-                        # it is the only slot forward ever reads.
-                        curr_idx = (boundary + scheduled_tokens -
-                                    1) // bs
+                    blk_hash = state.block_hashes[idx]
+                    key = CacheKey(blk_hash, group.group_idx, "")
+                    bs = group.block_size
+                    # CURR running-state index (align mode):
+                    # (num_computed + num_scheduled - 1) // bs.
+                    # Kernels gather exactly this one column, so
+                    # it is the only slot forward ever reads.
+                    curr_idx = (boundary + scheduled_tokens -
+                                1) // bs
 
-                        # Fail-closed: a HIT already committed
-                        # num_computed_tokens=boundary; a skipped
-                        # slot would let forward read unrestored
-                        # state.
-                        if scheduled_tokens <= 0 and not state.is_async:
-                            # Sync restore with no scheduled tokens
-                            # means no forward, so the slot would stay
-                            # unrestored while the core already
-                            # credited the tokens: fail-stop. (Async is
-                            # correct here: vLLM's prev->curr copy
-                            # carries the snapshot in at schedule time.)
-                            raise RuntimeError(
-                                "kvshrink mamba external HIT with "
-                                "scheduled_tokens=0 "
-                                f"(req={req_id} boundary={boundary}): "
-                                "production hits must schedule >= 1 "
-                                "token; refusing to build load meta")
-                        if not (0 <= curr_idx < len(ids)
-                                and ids[curr_idx] != 0):
-                            raise RuntimeError(
-                                "kvshrink mamba load curr slot "
-                                f"invalid (req={req_id} "
-                                f"boundary={boundary} "
-                                f"sched={scheduled_tokens} "
-                                f"table_idx={curr_idx} "
-                                f"table={ids}): refusing to enter "
-                                "forward with unrestored state")
-                        gpu_block = ids[curr_idx]
-                        for layer_name in group.layer_names:
-                            keys.append(replace(key,
-                                                layer_name=layer_name))
-                            gpu_ids.append(gpu_block)
+                    # Fail-closed: a HIT already committed
+                    # num_computed_tokens=boundary; a skipped
+                    # slot would let forward read unrestored
+                    # state.
+                    if scheduled_tokens <= 0 and not state.is_async:
+                        # Sync restore with no scheduled tokens
+                        # means no forward, so the slot would stay
+                        # unrestored while the core already
+                        # credited the tokens: fail-stop. (Async is
+                        # correct here: vLLM's prev->curr copy
+                        # carries the snapshot in at schedule time.)
+                        raise RuntimeError(
+                            "kvshrink mamba external HIT with "
+                            "scheduled_tokens=0 "
+                            f"(req={req_id} boundary={boundary}): "
+                            "production hits must schedule >= 1 "
+                            "token; refusing to build load meta")
+                    if not (0 <= curr_idx < len(ids)
+                            and ids[curr_idx] != 0):
+                        raise RuntimeError(
+                            "kvshrink mamba load curr slot "
+                            f"invalid (req={req_id} "
+                            f"boundary={boundary} "
+                            f"sched={scheduled_tokens} "
+                            f"table_idx={curr_idx} "
+                            f"table={ids}): refusing to enter "
+                            "forward with unrestored state")
+                    gpu_block = ids[curr_idx]
+                    for layer_name in group.layer_names:
+                        keys.append(replace(key,
+                                            layer_name=layer_name))
+                        gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
