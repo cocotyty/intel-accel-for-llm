@@ -134,7 +134,7 @@ class KVStore:
                     f"kv_caches keys {kv_keys} must match layer_names {layer_set}"
                 )
 
-        self.kv_caches, self._opaque_layers = self._bind_pools(kv_caches)
+        self.kv_caches, self._opaque_layers = _bind_pools(kv_caches)
         self.rank = rank
         self.tp_size = tp_size
 
