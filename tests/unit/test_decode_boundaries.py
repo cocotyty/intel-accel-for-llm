@@ -39,7 +39,7 @@ class _LiveRequest:
 
 def _state(sched, live, hashes):
     st = ReqState(
-        live_source=live.block_hashes if live is not None else None,
+        live_source=live.block_hashes if live is not None else [],
         block_hashes=list(hashes),
         groups=tuple(ReqGroupState() for _ in sched._groups))
     sched._req_states["r1"] = st

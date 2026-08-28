@@ -69,8 +69,10 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    # block identity list and GPU block table, per group.
-    live_source: Any = None
+    # The engine's live block_hashes list (it grows in place as decode
+    # completes blocks); block_hashes below is our copy, synced from it
+    # each pass in on_cached_request.
+    live_source: list = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     snapshot_boundary: int = 0
@@ -412,10 +414,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # (decode completes blocks too; without this, generated tokens
         # are never offloaded). Only ever extends -- hashes are
         # content-addressed and append-only.
-        if state.live_source is not None:
-            live = state.live_source
-            if len(live) > len(state.block_hashes):
-                state.block_hashes.extend(live[len(state.block_hashes):])
+        live = state.live_source
+        if len(live) > len(state.block_hashes):
+            state.block_hashes.extend(live[len(state.block_hashes):])
         old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
