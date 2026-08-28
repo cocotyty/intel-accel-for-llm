@@ -27,7 +27,6 @@ from vllm.distributed.parallel_state import (
 import vllm.envs as envs
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -43,7 +42,8 @@ if TYPE_CHECKING:
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
 from iaxl.kvflow.flow import Task
 
-from .async_load_config import load_async_load_layer_config_from_env
+from .async_load_config import (
+    load_async_load_layer_config_from_env, save_enabled)
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
@@ -121,24 +121,6 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 # ======================================================================
 
 
-def group_label(group_idx: int) -> str:
-    """Store label for one group's block space."""
-    return f"g{int(group_idx)}"
-
-
-def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
-    """Is this boundary present in the store? Presence is per
-    # (label, hash) chunk; a boundary is present when the store has
-    # it under the group's label."""
-    try:
-        present = store.has([key.hash_str],
-                            label=group_label(key.group_idx))
-        return bool(present and present[0])
-    except Exception:  # pragma: no cover - fail closed to MISS
-        logger.exception("lookup error; treating as MISS")
-        return False
-
-
 # ======================================================================
 # hybrid layout vocabulary
 # ======================================================================
@@ -179,15 +161,6 @@ class CacheKey:
         return (self.hash_str, self.group_idx)
 
 
-def make_boundary_key(group_idx: int,
-                      block_hash: object) -> "CacheKey":
-    """A group's key at one block hash, with no layer: the address the
-    hit policy asks about and the address the save/load builders expand
-    into per-layer page keys."""
-    return CacheKey(
-        block_hash=block_hash, group_idx=group_idx, layer_name="")
-
-
 @dataclass
 class GroupTransferMeta:
     """Per-group transfer instructions for one request (one step).
@@ -200,37 +173,6 @@ class GroupTransferMeta:
 # ======================================================================
 # parse: vLLM KVCacheConfig -> hybrid groups
 # ======================================================================
-class KVShrinkParseError(ValueError):
-    """Raised when the vLLM cache config cannot be parsed safely
-    (unknown spec or inconsistent layout). The parse never
-    guesses (fail closed)."""
-    pass
-
-
-def validate_codec_env() -> None:
-    """Warn when the codec is configured to lose bits (the opaque
-    # mamba pools are exempted structurally, so this only flags the
-    # operator request)."""
-    lossy = os.getenv("IAXL_KV_LOSSY_TRUNC", "0").strip()
-    if lossy in ("", "0"):
-        return
-    logger.warning(
-        "IAXL_KV_LOSSY_TRUNC=%s is enabled. On hybrid models the flag "
-        "gates per pool entry: attention layers honor it, while mamba "
-        "state is exempted structurally (lossy bit hard-cleared by "
-        "KVStore).", lossy)
-
-
-def _spec_kind(spec: object) -> str:
-    """Mamba or attention; unknown specs raise KVShrinkParseError."""
-    if isinstance(spec, MambaSpec):
-        return "mamba"
-    if isinstance(spec, AttentionSpec):
-        return "attention"
-    raise KVShrinkParseError(
-        f"Unsupported KV cache spec {type(spec).__name__}")
-
-
 def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
     """Yield (layer_name, spec) pairs, expanding UniformTypeKVCacheSpecs."""
     spec = group_spec.kv_cache_spec
@@ -246,66 +188,23 @@ def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[list[GroupInfo], int]:
-    """Return (groups, num_blocks). Per-layer geometry is not
-    # parsed: KVStore binds pools from the live tensors, which carry
-    # their own layout. Raises KVShrinkParseError on unknown specs or
-    # mixed block sizes."""
-    num_blocks = kv_cache_config.num_blocks
+    """One GroupInfo per vLLM KV cache group. Per-layer geometry is not
+    parsed: KVStore binds pools from the live tensors, which carry their
+    own layout."""
     groups: list[GroupInfo] = []
-
     for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
-        kind = None
-        block_size = None
-        per_layer_specs: list[tuple[str, object]] = list(_iter_layer_specs(g))
-
-        for name, spec in per_layer_specs:
-            sk = _spec_kind(spec)
-            if kind is None:
-                kind = sk
-            elif sk != kind:
-                raise KVShrinkParseError(
-                    f"Group {g_idx} mixes spec kinds {kind} and {sk}")
-            bs = int(spec.block_size)
-            if block_size is None:
-                block_size = bs
-            elif bs != block_size:
-                raise KVShrinkParseError(
-                    f"Group {g_idx} layers have differing block sizes")
-
-        mamba_align = None
-        if kind == "mamba":
-            mamba_mode = per_layer_specs[0][1].mamba_cache_mode
-        # GDN snapshots are addressed by an aligned boundary.
-            if mamba_mode != "align":
-                raise KVShrinkParseError(
-                    f"Group {g_idx} has mamba_cache_mode={mamba_mode!r}, "
-                    "but the external cache requires 'align'. Start vLLM "
-                    "with --enable-prefix-caching --mamba-cache-mode align "
-                    "(vLLM forces the mode to 'none' when prefix caching "
-                    "is disabled, and disables prefix caching by default "
-                    "for hybrid models)")
-            mamba_align = block_size
-        group = GroupInfo(
+        spec = list(_iter_layer_specs(g))[0][1]
+        kind = "mamba" if isinstance(spec, MambaSpec) else "attention"
+        groups.append(GroupInfo(
             group_idx=g_idx,
             kind=kind,
             layer_names=tuple(g.layer_names),
-            block_size=block_size,
-            mamba_align_size=mamba_align,
-            spec=per_layer_specs[0][1],
-        )
-
-        groups.append(group)
-
-    # One block size for the whole model: hash i names block i in
-    # EVERY group, which is what lets one hash address a boundary
-    # across groups.
-    sizes = {g.block_size for g in groups}
-    if len(sizes) != 1:
-        raise KVShrinkParseError(
-            f"KV cache groups have different block sizes {sorted(sizes)}; "
-            "the external cache addresses every group with one block hash "
-            "and cannot express that")
-    return groups, num_blocks
+            block_size=int(spec.block_size),
+            mamba_align_size=(int(spec.block_size)
+                              if kind == "mamba" else None),
+            spec=spec,
+        ))
+    return groups, kv_cache_config.num_blocks
 
 
 def choose_block_hash_source(recurrent: bool) -> str:
@@ -319,13 +218,6 @@ def choose_block_hash_source(recurrent: bool) -> str:
             "KVSHRINK_BLOCK_HASH_SOURCE must be auto, vllm or "
             f"legacy; got {choice!r}")
     return choice
-
-
-def save_enabled() -> bool:
-    """Production save is ON by default; KVSHRINK_SAVE=0 disables it and
-    KVSHRINK_DEBUG_AUTOSAVE=1 force-enables it."""
-    return (os.getenv("KVSHRINK_SAVE", "1") != "0"
-            or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
 
 
 # ======================================================================
@@ -546,11 +438,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                               for g in kv_cache_config.kv_cache_groups})
         hash_block_size = math.gcd(*block_sizes)
         self._hash_block_size = hash_block_size
-        # Fail-closed: a lossy codec would corrupt GDN state (see the
-        # function for why this path cannot tolerate what the
-        # attention-only path is designed to).
-        validate_codec_env()
-
         groups, num_blocks = parse_kv_cache_config(
             kv_cache_config)
 
@@ -587,7 +474,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if role != KVConnectorRole.SCHEDULER:
             # One store label per group (see the lookup-vocabulary
             # section for why groups cannot share one).
-            self._labels = [group_label(g.group_idx) for g in groups]
+            self._labels = [f"g{g.group_idx}" for g in groups]
             # layer_name -> group idx, every cached layer.
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -762,8 +649,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             num_computed_tokens, request=request)
         policy = HybridHitPolicy(
             self._groups,
-            lambda g, h: lookup_boundary(
-                self.kvstore, make_boundary_key(g, h)),
+            lambda g, h: self._store().has(
+                [CacheKey(h, g, "").hash_str], label=f"g{g}")[0],
             self._hash_block_size, num_computed_tokens)
         # Restorable boundary in tokens; 0 = miss. The policy already
         # gated on live chunk presence (engine Record), so a nonzero
@@ -912,14 +799,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     if i >= len(state.block_hashes):
                         break
                     blk_hash = state.block_hashes[i]
-                    key = self._boundary_key(group, blk_hash)
-                    if not lookup_boundary(self.kvstore, key):
+                    key = CacheKey(blk_hash, group.group_idx, "")
+                    if not self._store().has(
+                            [key.hash_str], label=f"g{key.group_idx}")[0]:
                         break
                     # v0.21 hashes are per complete block: hash i == block i
                     if i < len(ids):
                         # one page key + gpu block per layer (full expansion)
                         for layer_name in group.layer_names:
-                            keys.append(self._page_key(key, layer_name))
+                            keys.append(replace(key, layer_name=layer_name))
                             gpu_ids.append(ids[i])
             elif group.kind == "mamba":
                 # Load the snapshot into the CURR state block only
@@ -933,8 +821,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     idx = boundary // group.block_size - 1
                     if 0 <= idx < len(state.block_hashes):
                         blk_hash = state.block_hashes[idx]
-                        key = self._boundary_key(group, blk_hash)
-                        if lookup_boundary(self.kvstore, key):
+                        key = CacheKey(blk_hash, group.group_idx, "")
+                        if self._store().has([key.hash_str],
+                                             label=f"g{key.group_idx}")[0]:
                             bs = group.block_size
                             # CURR running-state index (align mode):
                             # (num_computed + num_scheduled - 1) // bs.
@@ -972,8 +861,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                     "forward with unrestored state")
                             gpu_block = ids[curr_idx]
                             for layer_name in group.layer_names:
-                                keys.append(self._page_key(
-                                    key, layer_name))
+                                keys.append(replace(key,
+                                                    layer_name=layer_name))
                                 gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
@@ -1012,9 +901,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for i in range(start, num_hash):
                     blk_hash = state.block_hashes[i]
                     for layer_name in group.layer_names:
-                        keys.append(self._page_key(
-                            self._boundary_key(group, blk_hash),
-                            layer_name))
+                        keys.append(CacheKey(blk_hash, group.group_idx,
+                                             layer_name))
                         gpu_ids.append(ids[i])
                 if num_hash > start:
                     gstate.next_stored_chunk_idx = num_hash
@@ -1039,9 +927,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                 and idx < len(state.block_hashes)):
                             blk_hash = state.block_hashes[idx]
                             for layer_name in group.layer_names:
-                                keys.append(self._page_key(
-                                    self._boundary_key(group, blk_hash),
-                                    layer_name))
+                                keys.append(CacheKey(blk_hash,
+                                                     group.group_idx,
+                                                     layer_name))
                                 gpu_ids.append(ids[block_pos])
                             gstate.next_stored_chunk_idx = idx + 1
             group_ops.append(GroupTransferMeta(
@@ -1153,17 +1041,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 len(meta.reqs_to_save.requests))
         return meta
 
-    def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
-        """Boundary key for one group at one block hash."""
-        return make_boundary_key(group.group_idx, block_hash)
-
-    @staticmethod
-    def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
-        """Expand a boundary key to ONE layer's page key: same hash and
-        group as the boundary, plus the layer name. This is the exact
-        page address the worker must move."""
-        return replace(boundary_key, layer_name=layer_name)
-
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -1263,14 +1140,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._active_promoted_tasks.update(self._early_promoted_tasks)
             self._early_promoted_tasks = {}
 
-        # Submits every load, then host-blocks on the recurrent ones;
-        # attention layers are waited by their own hooks during forward.
-        self.start_load(metadata)
-
-    def start_load(self, metadata: KVShrinkConnectorMetadata) -> int:
-        """Submit all of this step's loads, then host-block on the
+        # Submit all of this step's loads, then host-block on the
         # recurrent ones (no hook ever fires for them). Attention
-        # pages are waited per layer by the forward hooks."""
+        # pages are waited per layer by the forward hooks.
         # Per-step reset; _saved_layers/_step_save_pages track
         # what the save hooks have submitted.
         self._current_get_tasks = None
@@ -1455,10 +1327,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # only; the drain lives in get_finished."""
         if self._connector_metadata is None:
             return
-        if os.getenv("KVSHRINK_SAVE_PIPELINED", "1") == "0":
-            return
-        if not save_enabled():
-            return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
@@ -1479,8 +1347,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if self.kvstore is None:
             return
 
-        if not save_enabled():
-            return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")

@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import HybridWorker, make_spec
+from conftest import HybridWorker, drive_start_load, make_spec
 from kvshrink.kvshrink_connector import (
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta, RequestMetadata)
+    CacheKey, GroupInfo, GroupTransferMeta, KVShrinkConnectorMetadata,
+    ReqMeta, RequestMetadata)
 
 PAGE = 4096
 ORDER = ["m0", "a1", "m2", "a3"]
@@ -90,7 +91,7 @@ def _meta(async_layers, req_id="r1"):
     md.requests[req_id] = ReqMeta(
         group_ops=(op(0, ATTN), op(1, GDN)),
         is_async=True, async_load_layers=async_layers)
-    return type("M", (), {"reqs_to_load": md})
+    return KVShrinkConnectorMetadata(reqs_to_load=md)
 
 
 # ------------------------------------------------------------------
@@ -101,7 +102,7 @@ def test_gate_covers_every_recurrent_layer_despite_short_prefix():
     all GDN state: it is consumed whole at the start of forward."""
     b = _FakeStore()
     w = _worker(b)
-    w.start_load(_meta(async_layers=1))
+    drive_start_load(w, _meta(async_layers=1))
     assert w._pending_load_layers["r1"] == 1
 
     # the gate lands: every recurrent layer plus exactly the first
@@ -115,7 +116,7 @@ def test_gate_covers_every_recurrent_layer_despite_short_prefix():
 def test_not_released_until_recurrent_state_has_landed():
     b = _FakeStore()
     w = _worker(b)
-    w.start_load(_meta(async_layers=1))
+    drive_start_load(w, _meta(async_layers=1))
 
     b.landed = {"a1"}                      # attention prefix only
     _, recving = w.get_finished(set())
@@ -129,7 +130,7 @@ def test_not_released_until_recurrent_state_has_landed():
 def test_negative_layer_count_gates_on_every_layer():
     b = _FakeStore()
     w = _worker(b)
-    w.start_load(_meta(async_layers=-1))
+    drive_start_load(w, _meta(async_layers=-1))
     assert w._pending_load_layers["r1"] == -1
     b.landed = set(ORDER)
     _, recving = w.get_finished(set())
@@ -147,7 +148,7 @@ def test_async_tasks_live_outside_the_step_tasks():
     per-step _current_get_tasks drained by the layer hooks."""
     b = _FakeStore()
     w = _worker(b)
-    w.start_load(_meta(async_layers=1))
+    drive_start_load(w, _meta(async_layers=1))
     assert w._current_get_tasks is None
     assert "r1" in w._pending_load_tasks
 
@@ -155,7 +156,7 @@ def test_async_tasks_live_outside_the_step_tasks():
 def test_remaining_layers_are_drained_by_the_layer_hooks():
     b = _FakeStore()
     w = _worker(b)
-    w.start_load(_meta(async_layers=1))
+    drive_start_load(w, _meta(async_layers=1))
     b.landed = set(ORDER)
     _, recving = w.get_finished(set())
     assert recving == {"r1"}
@@ -179,7 +180,7 @@ def test_failed_transfer_raises_at_poll():
     b = _FakeStore()
     b.fail_on = {"m0"}
     w = _worker(b)
-    w.start_load(_meta(async_layers=1))
+    drive_start_load(w, _meta(async_layers=1))
     b.landed = set(ORDER)
 
     with pytest.raises(RuntimeError, match="transfer failed"):

@@ -16,7 +16,7 @@ Rulings under test:
 import pytest
 
 from conftest import FakeBlocks, HybridRequestScheduler, make_spec
-from kvshrink.kvshrink_connector import CacheKey, GroupInfo, lookup_boundary
+from kvshrink.kvshrink_connector import CacheKey, GroupInfo
 
 PAGE = 64 * 1024
 
@@ -191,8 +191,7 @@ def test_abort_keeps_committed_boundary_hittable():
     sched.request_finished(
         type("R", (), {"request_id": "r1"})(), [])  # abort
     # a fresh lookup for the same hashes still hits
-    assert lookup_boundary(
-        store, CacheKey(0, 0, "")) == True
+    assert store.has(["0"], label="g0") == [True]
 
 
 def test_resumed_missing_progress_rolls_back_to_zero():
