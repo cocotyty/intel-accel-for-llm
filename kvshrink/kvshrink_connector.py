@@ -491,37 +491,36 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                 for i in range(num_hash))
                     gpu_ids.extend(ids[i] for i in range(num_hash))
             elif group.kind == "mamba":
-                if state.block_hashes and boundary > 0:
+                if boundary > 0:
                     idx = boundary // group.block_size - 1
-                    if 0 <= idx < len(state.block_hashes):
-                        blk_hash = state.block_hashes[idx]
-                        key = CacheKey(blk_hash, group.group_idx, "")
-                        bs = group.block_size
-                        curr_idx = (boundary + scheduled_tokens -
-                                    1) // bs
+                    blk_hash = state.block_hashes[idx]
+                    key = CacheKey(blk_hash, group.group_idx, "")
+                    bs = group.block_size
+                    curr_idx = (boundary + scheduled_tokens -
+                                1) // bs
 
-                        if scheduled_tokens <= 0 and not state.is_async:
-                            raise RuntimeError(
-                                "kvshrink mamba external HIT with "
-                                "scheduled_tokens=0 "
-                                f"(req={req_id} boundary={boundary}): "
-                                "production hits must schedule >= 1 "
-                                "token; refusing to build load meta")
-                        if not (0 <= curr_idx < len(ids)
-                                and ids[curr_idx] != 0):
-                            raise RuntimeError(
-                                "kvshrink mamba load curr slot "
-                                f"invalid (req={req_id} "
-                                f"boundary={boundary} "
-                                f"sched={scheduled_tokens} "
-                                f"table_idx={curr_idx} "
-                                f"table={ids}): refusing to enter "
-                                "forward with unrestored state")
-                        gpu_block = ids[curr_idx]
-                        for layer_name in group.layer_names:
-                            keys.append(replace(key,
-                                                layer_name=layer_name))
-                            gpu_ids.append(gpu_block)
+                    if scheduled_tokens <= 0 and not state.is_async:
+                        raise RuntimeError(
+                            "kvshrink mamba external HIT with "
+                            "scheduled_tokens=0 "
+                            f"(req={req_id} boundary={boundary}): "
+                            "production hits must schedule >= 1 "
+                            "token; refusing to build load meta")
+                    if not (0 <= curr_idx < len(ids)
+                            and ids[curr_idx] != 0):
+                        raise RuntimeError(
+                            "kvshrink mamba load curr slot "
+                            f"invalid (req={req_id} "
+                            f"boundary={boundary} "
+                            f"sched={scheduled_tokens} "
+                            f"table_idx={curr_idx} "
+                            f"table={ids}): refusing to enter "
+                            "forward with unrestored state")
+                    gpu_block = ids[curr_idx]
+                    for layer_name in group.layer_names:
+                        keys.append(replace(key,
+                                            layer_name=layer_name))
+                        gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
