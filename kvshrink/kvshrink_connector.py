@@ -597,17 +597,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # No existence re-query: the hit policy verified these
                 # keys at lookup, committed entries are never deleted,
                 # and unzip_from_mem fails stop on a missing key.
+                # No bounds guards: _lookup capped the boundary at what
+                # block_hashes covers, the tables only grow, and a real
+                # inconsistency must IndexError loudly rather than
+                # silently truncate the plan below the credited tokens.
                 for i in range(num_hash):
-                    if i >= len(state.block_hashes):
-                        break
                     blk_hash = state.block_hashes[i]
                     key = CacheKey(blk_hash, group.group_idx, "")
                     # v0.21 hashes are per complete block: hash i == block i
-                    if i < len(ids):
-                        # one page key + gpu block per layer (full expansion)
-                        for layer_name in group.layer_names:
-                            keys.append(replace(key, layer_name=layer_name))
-                            gpu_ids.append(ids[i])
+                    # one page key + gpu block per layer (full expansion)
+                    for layer_name in group.layer_names:
+                        keys.append(replace(key, layer_name=layer_name))
+                        gpu_ids.append(ids[i])
             elif group.kind == "mamba":
                 # Load the snapshot into the CURR state block only
                 # (v0.23 align mode pins execution to column 0 = the
