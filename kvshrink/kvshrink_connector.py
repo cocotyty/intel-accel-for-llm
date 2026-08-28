@@ -43,7 +43,7 @@ from iaxl.kvflow.flow import Task
 
 from .hybrid_hit import HybridHitPolicy
 from .async_load_config import (
-    load_async_load_layer_config_from_env, save_enabled)
+    load_async_load_layer_config_from_env)
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
@@ -351,13 +351,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 gstate = state.groups[g_idx]
                 safe = safe_n // group.block_size
                 if gstate.next_stored_chunk_idx > safe:
-                    if os.getenv("KVSHRINK_DEBUG_LOG"):
-                        logger.info(
-                            "cursor rollback req=%s g%d: %d -> %d "
-                            "(progress %d -> %s, resumed=%s)",
-                            req_id, g_idx, gstate.next_stored_chunk_idx,
-                            safe, old_progress, num_computed_tokens,
-                            resumed)
                     gstate.next_stored_chunk_idx = safe
         if new_block_ids:
             for gstate, ids in zip(state.groups, new_block_ids):
@@ -432,11 +425,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if (state.is_async and not state.async_plan_emitted
                 and num_external_tokens > 0):
             self._async_load_pending.add(req_id)
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info(
-                "update_state req=%s per-group block_ids: %s hashes=%d",
-                req_id, [[b for b in g.block_ids] for g in state.groups],
-                len(state.block_hashes))
 
     def request_finished(
         self,
@@ -490,13 +478,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> ReqMeta:
         """Build one request's load plan from its recorded state."""
         boundary = state.snapshot_boundary
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info(
-                "TAIL req=%s snapshot_boundary=%d computed_before_fwd=%d "
-                "external=%d",
-                req_id, state.snapshot_boundary,
-                state.num_computed_tokens,
-                state.snapshot_boundary - state.num_computed_tokens)
         group_ops = []
         for g_idx, group in enumerate(self._groups):
             ids = state.groups[g_idx].block_ids
@@ -602,13 +583,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         if ids[pos] != 0:
                             block_pos = pos
                             break
-                    if block_pos is None:
-                        if os.getenv("KVSHRINK_DEBUG_LOG"):
-                            logger.info(
-                                "save mamba g%d: no non-null block in "
-                                "ids=%s", g_idx, ids)
-                    elif (progress > 0
-                          and progress % group.block_size == 0):
+                    if (block_pos is not None and progress > 0
+                            and progress % group.block_size == 0):
                         idx = progress // group.block_size - 1
                         if (idx >= gstate.next_stored_chunk_idx
                                 and idx < len(state.block_hashes)):
@@ -629,35 +605,20 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> KVConnectorMetadata:
         """Assemble this pass's load/save plans."""
         meta = KVShrinkConnectorMetadata()
-        debug = bool(os.getenv("KVSHRINK_DEBUG_LOG"))
-        save_on = save_enabled()
         num_sched = scheduler_output.num_scheduled_tokens
 
         for new_req in scheduler_output.scheduled_new_reqs:
             req_meta = self.build_load_meta(
                 new_req, num_sched.get(new_req.req_id, 0))
-            if debug:
-                logger.info(
-                    "LOADMETA req=%s ops=%d computed_before_fwd=%d "
-                    "num_scheduled_tokens=%s",
-                    new_req.req_id, len(req_meta.group_ops),
-                    new_req.num_computed_tokens,
-                    num_sched.get(new_req.req_id))
-                for op in req_meta.group_ops:
-                    logger.info(
-                        "LOADMETA  g%d kind=%s keys=%d gpu_ids=%d",
-                        op.group_idx, self._groups[op.group_idx].kind,
-                        len(op.keys), len(op.gpu_block_ids))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.group_ops, req_meta.is_async,
                     req_meta.async_load_layers, req_meta.external_hit_tokens)
-            if save_on:
-                save_meta = self.build_save_meta(
-                    new_req.req_id, num_sched.get(new_req.req_id, 0))
-                if save_meta.group_ops:
-                    meta.reqs_to_save.add_request(
-                        new_req.req_id, save_meta.group_ops)
+            save_meta = self.build_save_meta(
+                new_req.req_id, num_sched.get(new_req.req_id, 0))
+            if save_meta.group_ops:
+                meta.reqs_to_save.add_request(
+                    new_req.req_id, save_meta.group_ops)
 
         pending = sorted(self._async_load_pending
                          - set(meta.reqs_to_load.requests))
@@ -673,11 +634,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "plan so it is recomputed rather than left waiting",
                     req_id)
                 continue
-            if debug:
-                logger.info(
-                    "LOADMETA(async) req=%s ops=%d layers=%s",
-                    req_id, len(req_meta.group_ops),
-                    req_meta.async_load_layers)
             meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
                 req_meta.async_load_layers, req_meta.external_hit_tokens)
@@ -687,33 +643,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in cr.resumed_req_ids:
             req_meta = self.build_resumed_load_meta(
                 req_id, num_sched.get(req_id, 0))
-            if debug:
-                logger.info(
-                    "LOADMETA(resumed) req=%s ops=%d",
-                    req_id, len(req_meta.group_ops))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
                 meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
                 req_meta.async_load_layers, req_meta.external_hit_tokens)
 
-        if save_on:
-            resumed = cr.resumed_req_ids
-            new_bids = cr.new_block_ids
-            ncts = cr.num_computed_tokens
-            for i, req_id in enumerate(cr.req_ids):
-                self.on_cached_request(
-                    req_id, new_bids[i], req_id in resumed, ncts[i])
-                save_meta = self.build_save_meta(
-                    req_id, num_sched.get(req_id, 0))
-                if save_meta.group_ops:
-                    meta.reqs_to_save.add_request(req_id,
-                                                  save_meta.group_ops)
-
-        if debug:
-            logger.info(
-                "build_connector_meta: %d load reqs, %d save reqs",
-                len(meta.reqs_to_load.requests),
-                len(meta.reqs_to_save.requests))
+        resumed = cr.resumed_req_ids
+        new_bids = cr.new_block_ids
+        ncts = cr.num_computed_tokens
+        for i, req_id in enumerate(cr.req_ids):
+            self.on_cached_request(
+                req_id, new_bids[i], req_id in resumed, ncts[i])
+            save_meta = self.build_save_meta(
+                req_id, num_sched.get(req_id, 0))
+            if save_meta.group_ops:
+                meta.reqs_to_save.add_request(req_id,
+                                              save_meta.group_ops)
         return meta
 
     def register_kv_caches(
@@ -981,13 +926,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info("wait_for_save worker: reqs_to_save=%d",
-                        len(metadata.reqs_to_save.requests))
         pages, boundaries = self.submit_saves(metadata)
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info("chunk_save: %d pages, %d boundaries",
-                        pages, boundaries)
         if os.getenv("KVSHRINK_DEBUG_DUMP"):
             for group in self._groups:
                 if group.kind != "mamba":

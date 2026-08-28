@@ -84,10 +84,7 @@ export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYE
 # ---- Hybrid (GDN/Mamba) models ----------------------------------------------
 # Used only when the model has GDN/Mamba layers (e.g. Qwen3.5); pure
 # attention models ignore every knob below.
-export KVSHRINK_SAVE=${KVSHRINK_SAVE:-1}                     # Persist newly computed KV/state (0/1)
-export KVSHRINK_SAVE_PIPELINED=${KVSHRINK_SAVE_PIPELINED:-1} # Submit attention saves per layer during forward (0 = all after forward)
 # export KVSHRINK_PERSIST_DIR=...          # Commit-manifest root (unset = $IAXL_CACHE_DIR/kv4-manifests)
-# export KVSHRINK_DEBUG_LOG=1              # Verbose per-request plan logging
 # export KVSHRINK_DEBUG_DUMP=1             # Log GDN state page digests after each forward
 # Cross-restart cache reuse requires reproducible block hashes: vLLM
 # seeds its first-block hash from PYTHONHASHSEED and falls back to a

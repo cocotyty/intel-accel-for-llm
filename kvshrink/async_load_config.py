@@ -227,8 +227,3 @@ def load_async_load_layer_config_from_env(
     )
 
 
-def save_enabled() -> bool:
-    """Production save is ON by default; KVSHRINK_SAVE=0 disables it and
-    KVSHRINK_DEBUG_AUTOSAVE=1 force-enables it (debug/test knob)."""
-    return (os.getenv("KVSHRINK_SAVE", "1") != "0"
-            or os.getenv("KVSHRINK_DEBUG_AUTOSAVE") == "1")
