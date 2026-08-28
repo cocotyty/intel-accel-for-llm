@@ -91,7 +91,6 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._layer_names = []
     conn._load_tasks = {}
     conn._pending_load_tasks = {}
-    conn._pending_load_layers = {}
     conn._gated_keys = {}
     conn._early_promoted_tasks = {}
     conn._active_promoted_tasks = {}

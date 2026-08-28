@@ -325,12 +325,10 @@ class KVStore:
             layer_names = self.layer_names
 
         tensors = {name: self.kv_caches[name] for name in layer_names}
-        block_shape = tuple(next(iter(tensors.values())).shape[1:])
 
         return self.tensorzip.get(
             label=label or self.LABEL,
             tensors=tensors,
-            block_shape=block_shape,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
