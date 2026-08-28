@@ -442,14 +442,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
-    def _request_block_hashes(self, request: "Request") -> list[Any]:
-        """This request's block identities, in block order."""
-        if self._block_hash_source == "vllm":
-            return list(request.block_hashes)
-        tokens = request.all_token_ids
-        return [str(h) for h in generate_block_hashs(
-            tokens[:-1], self._hash_block_size)]
-
     def on_cached_request(
         self, req_id: str, new_block_ids: tuple[list[int], ...],
         resumed: bool, num_computed_tokens: Optional[int],
@@ -512,7 +504,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
-        block_hashes = self._request_block_hashes(request)
+        # This request's block identities, in block order.
+        if self._block_hash_source == "vllm":
+            block_hashes = list(request.block_hashes)
+        else:
+            block_hashes = [str(h) for h in generate_block_hashs(
+                request.all_token_ids[:-1], self._hash_block_size)]
         self._req_states[request.request_id] = ReqState(
             live_source=(request.block_hashes
                          if self._block_hash_source == "vllm"

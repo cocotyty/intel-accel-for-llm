@@ -38,8 +38,18 @@ def _group(kind):
 class _Req:
     """Carries both identities so a test can tell which one was used."""
 
+    request_id = "r1"
     block_hashes = ["vllm-a", "vllm-b", "vllm-c"]
     all_token_ids = list(range(48 + 1))   # 3 full blocks at bs=16, +1
+    num_tokens = 48 + 1
+
+
+class _Miss:
+    """A store with nothing cached: the lookup registers the request
+    state (carrying the chosen block identities) and reports no hit."""
+
+    def has(self, keys, label=None):
+        return [False] * len(keys)
 
 
 # ------------------------------------------------------------------
@@ -85,12 +95,19 @@ def _sched(source):
         block_hash_source=source)
 
 
+def _registered_hashes(source):
+    sched = _sched(source)
+    sched.kvstore = _Miss()
+    assert sched.get_num_new_matched_tokens(_Req(), 0) == (0, False)
+    return sched._req_states["r1"].block_hashes
+
+
 def test_vllm_source_uses_the_engine_hashes():
-    assert _sched("vllm")._request_block_hashes(_Req()) == _Req.block_hashes
+    assert _registered_hashes("vllm") == _Req.block_hashes
 
 
 def test_legacy_source_recomputes_from_tokens():
-    got = _sched("legacy")._request_block_hashes(_Req())
+    got = _registered_hashes("legacy")
     assert got and got != _Req.block_hashes, (
         "legacy must not silently return the engine's hashes")
     assert all(isinstance(h, str) for h in got)
