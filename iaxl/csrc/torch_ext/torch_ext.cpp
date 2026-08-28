@@ -62,6 +62,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Call zip_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
              py::arg("cpu_tensors"), py::arg("compress") = true,
+             py::arg("lossy_trunc_enabled") = false,
              py::call_guard<py::gil_scoped_release>())
         .def("unzip_from_mem", &Context::unzip_from_mem,
              "Retrieve from cache, decompress, and H2D transfer (async).\n"

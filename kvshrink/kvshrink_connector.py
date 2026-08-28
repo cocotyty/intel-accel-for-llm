@@ -103,103 +103,6 @@ def lookup_boundary(store: "KVStore", key: "CacheKey") -> bool:
         logger.exception("lookup error; treating as MISS")
         return False
 
-class Canonicalizer:
-    """Builds canonical (num_blocks, page_size_bytes) int8 views per layer."""
-
-    def __init__(self, layer_infos: dict[str, LayerPageInfo], num_blocks: int):
-        """Record per-layer descriptors and the GLOBAL block-pool size
-        (shared across groups); views are built by ``register``."""
-        self._layer_infos: dict[str, LayerPageInfo] = layer_infos
-        self._num_blocks: int = num_blocks
-        self._views: dict[str, torch.Tensor] = {}
-
-    def register(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
-    ) -> None:
-        """Build the canonical (num_blocks, page_size_bytes) int8 views
-        over the vLLM kv_caches, handling Mamba list-of-tensors storage
-        and split-K/V attention layouts. Raises ValueError on any
-        descriptor/storage mismatch (fail closed). Called once per layer
-        set."""
-        for layer_name, info in self._layer_infos.items():
-            raw = kv_caches[layer_name]
-            if isinstance(raw, (list, tuple)):
-                first = raw[0]
-                tensor = torch.empty(
-                    0, dtype=torch.int8, device=first.device
-                ).set_(first.untyped_storage())
-            else:
-                tensor = torch.empty(
-                    0, dtype=torch.int8, device=raw.device
-                ).set_(raw.untyped_storage())
-
-            if (not isinstance(raw, (list, tuple))
-                    and self._is_split_kv_layout(raw, info)):
-                N = info.num_blocks
-                half = info.page_size_bytes // 2
-                storage = raw.untyped_storage()
-                base = torch.empty(
-                    0, dtype=torch.int8, device=raw.device).set_(storage)
-                flat = base.view(2, N, half)
-                k_view, v_view = flat.unbind(0)
-                self._views[layer_name] = (k_view, v_view)
-                logger.info(
-                    "Canonicalized split-K/V layer %s: N=%d half_page=%d",
-                    layer_name, N, half)
-                continue
-
-            stride = info.page_size_bytes
-            needed = stride * (info.num_blocks - 1) + info.page_size_bytes
-            if needed > storage_size_bytes(raw):
-                raise ValueError(
-                    f"Layer {layer_name}: descriptor requires {needed} bytes "
-                    f"but storage has {storage_size_bytes(raw)}")
-            view = torch.as_strided(
-                tensor,
-                size=(info.num_blocks, info.page_size_bytes),
-                stride=(stride, 1),
-                storage_offset=0,
-            )
-            self._views[layer_name] = view
-        logger.info(
-            "Canonicalized %d layers, %d blocks, page=%d bytes",
-            len(self._views), self._num_blocks,
-            next(iter(self._layer_infos.values())).page_size_bytes)
-
-    @staticmethod
-    def _is_split_kv_layout(
-        raw: torch.Tensor, info: LayerPageInfo
-    ) -> bool:
-        """True when num_blocks lives in a non-leading physical dim
-        (K/V-split layout). Mirrors the physical-to-logical stride
-        mapping in vLLM's offloading worker."""
-        if raw.dim() < 2 or raw.shape[0] != 2:
-            return False
-        strides = raw.stride()
-        physical_to_logical = sorted(
-            range(len(strides)), key=lambda i: strides[i], reverse=True)
-        try:
-            logical_nb_dim = list(raw.shape).index(info.num_blocks)
-        except ValueError:
-            return False
-        physical_pos = physical_to_logical.index(logical_nb_dim)
-        return physical_pos != 0
-
-    def page_view_parts(self, layer_name: str) -> dict[str, torch.Tensor]:
-        """Full-pool canonical page views for the KVFlow chunk engine."""
-        v = self._views[layer_name]
-        if isinstance(v, tuple):
-            return {"k": v[0], "v": v[1]}
-        return {"page": v}
-
-def storage_size_bytes(t: torch.Tensor | list[torch.Tensor]) -> int:
-    """Bytes of the underlying untyped storage for a kv_cache entry;
-    Mamba entries (list/tuple of tensors sharing one storage) report
-    the first tensor's storage. Used for descriptor bounds checks."""
-    if isinstance(t, (list, tuple)):
-        return t[0].untyped_storage().size()
-    return t.untyped_storage().size()
-
 @dataclass(frozen=True)
 class LayerPageInfo:
     """Canonical page info for one layer (as seen by the connector)."""
@@ -582,7 +485,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 tp_size=self.tp_size,
             )
         else:
-            self._canon = Canonicalizer(layer_infos, num_blocks)
             self._labels = [group_label(g.group_idx) for g in groups]
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -1135,27 +1037,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.register(kv_caches,
                       sorted(kv_caches, key=extract_layer_index))
 
-        views = self._flat_views(
-            {ln: self._canon.page_view_parts(ln)
-             for ln in self._layer_names})
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            block_dim=0,
-            kv_caches=views,
+            kv_caches=kv_caches,
             rank=self._rank,
             tp_size=self.tp_size,
         )
-        logger.info("Registered %d KV cache layers (%d page views)",
-                    len(kv_caches), len(views))
+        logger.info("Registered %d KV cache layers",
+                    len(self.kvstore.layer_names))
 
     def register(
         self,
-        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
         execution_order: list[str],
     ) -> None:
-        """Bind canonical page views and record which layers recur."""
+        """Record the model's execution order and which layers recur."""
         self._layer_names = list(execution_order)
-        self._canon.register(kv_caches)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
             for ln in g.layer_names)
@@ -1184,14 +1080,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 f"{type(metadata).__name__}; expected "
                 "KVShrinkConnectorMetadata")
         return metadata
-
-    @staticmethod
-    def _flat_views(
-        layer_views: dict[str, dict[str, torch.Tensor]],
-    ) -> dict[str, torch.Tensor]:
-        return {f"{ln}#{part}": view
-                for ln, parts in layer_views.items()
-                for part, view in parts.items()}
 
     def _wait_load(self, tasks: dict[str, Task]) -> None:
         """Host-block until these reads land; an incomplete transfer is
@@ -1343,16 +1231,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         layer_names: set[str],
     ) -> tuple[dict[str, Task], int]:
         """One engine get covering ``layer_names`` for the blocks in
-        ``entries``; returns the flat tasks dict ("layer#part" ->
-        Task) and the page count."""
-        tensors = self._flat_views(
-            {ln: self._canon.page_view_parts(ln) for ln in layer_names})
+        ``entries``; returns the tasks dict (layer name -> Task) and
+        the page count."""
         tasks = self.kvstore.get(block_indices=[gpu for gpu, _ in entries],
                                  block_hashs=[h for _, h in entries],
-                                 layer_names=list(tensors),
-                                 tensors=tensors,
+                                 layer_names=list(layer_names),
                                  label=self._labels[g_idx])
-        return tasks, len(entries) * len(tensors)
+        return tasks, len(entries) * len(layer_names)
 
     def _gather_save_candidates(
         self, metadata: KVShrinkConnectorMetadata
@@ -1380,12 +1265,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         order for every layer -- scheduler invariant). Async D2H+zip on
         the engine's put_stream, self-gated on the compute stream so it
         reads final values. Returns the engine tasks dict."""
-        tensors = self._flat_views(
-            {ln: self._canon.page_view_parts(ln) for ln in layer_names})
         return self.kvstore.put(block_indices=[gpu for gpu, _ in entries],
                                 block_hashs=[h for _, h in entries],
-                                layer_names=list(tensors),
-                                tensors=tensors,
+                                layer_names=layer_names,
                                 label=self._labels[g_idx])
 
     def _track_put(self, tasks: dict[str, Task], req_ids: set[str]) -> None:
@@ -1560,7 +1442,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if group.kind != "mamba":
                 continue
             ln = group.layer_names[0]
-            page_view = self._canon.page_view_parts(ln)["page"]
+            page_view = self.kvstore.kv_caches[ln]
             for blk in range(10):
                 page = page_view[blk]
                 h = hashlib.sha256(
