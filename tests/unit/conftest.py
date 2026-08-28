@@ -93,7 +93,7 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
-    conn._rank = rank
+    conn.rank = rank
     conn.tp_size = tp_size
     conn._labels = [f"g{g.group_idx}" for g in groups]
     conn.kvstore = None
