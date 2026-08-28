@@ -81,7 +81,6 @@ def _worker():
 
 
 def _env_off(monkeypatch_env=None):
-    os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
     os.environ.pop("KVSHRINK_SAVE", None)
     os.environ.pop("KVSHRINK_DEBUG_AUTOSAVE", None)
 
@@ -125,19 +124,6 @@ def test_fallback_when_hook_never_fired():
     assert ["a0", "a1"] in submit_layers
     assert ["m0"] in submit_layers
     assert nbound == 2
-
-
-def test_pipelined_disabled_by_env():
-    _env_off()
-    os.environ["KVSHRINK_SAVE_PIPELINED"] = "0"
-    try:
-        c = _worker()
-        c.bind_connector_metadata(_save_meta())
-        c.save_kv_layer("a0", None, None)
-        assert c.kvstore.submits == []  # nothing during forward
-        assert c.submit_saves(_save_meta())[1] == 2
-    finally:
-        os.environ.pop("KVSHRINK_SAVE_PIPELINED", None)
 
 
 def test_mamba_segment_rides_the_next_attention_hook():

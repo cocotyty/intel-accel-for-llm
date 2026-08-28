@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import HybridWorker, make_spec
+from conftest import HybridWorker, drive_start_load, make_spec
 from kvshrink.kvshrink_connector import (
     RequestMetadata,
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
+    CacheKey, GroupInfo, GroupTransferMeta, KVShrinkConnectorMetadata,
+    ReqMeta)
 
 PAGE = 4096
 
@@ -88,7 +89,7 @@ def _load_meta(layers, group_idx, req_id="r1"):
                            gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(group_ops=(op,))
-    return type("M", (), {"reqs_to_load": md})
+    return KVShrinkConnectorMetadata(reqs_to_load=md)
 
 
 # ------------------------------------------------------------------
@@ -117,7 +118,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
     that reaches forward unrestored is silent output corruption."""
     be = _FakeStore()
     w = _worker(be)
-    w.start_load(_load_meta(GDN, 1))
+    drive_start_load(w, _load_meta(GDN, 1))
     assert sorted(be.submitted) == sorted(GDN)
     assert sorted(be.waited) == sorted(GDN), be.waited
     # the batch stays open until the last attention hook (main's rule)
@@ -132,7 +133,7 @@ def test_attention_pages_stay_pipelined():
     meta = _load_meta(ATTN, 0)
     meta.reqs_to_load.requests.update(
         _load_meta(GDN, 1, req_id="r2").reqs_to_load.requests)
-    w.start_load(meta)
+    drive_start_load(w, meta)
     # GDN waited already; no attention layer has been waited yet
     assert sorted(be.waited) == sorted(GDN), be.waited
 
@@ -153,7 +154,7 @@ def test_failed_blocking_wait_raises():
     be.get_wait = _boom
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
-        w.start_load(_load_meta(GDN, 1))
+        drive_start_load(w, _load_meta(GDN, 1))
 
 
 def test_empty_ops_are_skipped():
@@ -165,5 +166,5 @@ def test_empty_ops_are_skipped():
     meta = _load_meta(GDN, 1)
     req = next(iter(meta.reqs_to_load.requests.values()))
     req.group_ops = (GroupTransferMeta(group_idx=0),) + req.group_ops
-    w.start_load(meta)
+    drive_start_load(w, meta)
     assert sorted(be.submitted) == sorted(GDN), be.submitted

@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 # developer's shell environment can never alter the results.
 _KVSHRINK_ENV = (
     "KVSHRINK_SAVE",
-    "KVSHRINK_SAVE_PIPELINED",
     "KVSHRINK_DEBUG_AUTOSAVE",
     "KVSHRINK_DEBUG_LOG",
     "KVSHRINK_DEBUG_DUMP",
@@ -79,13 +78,13 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     kv_caches; tests pass {name: None} placeholders (only the key set
     matters to the part mapping) plus the group descriptors.
     """
-    from kvshrink.kvshrink_connector import KVShrinkConnector, group_label
+    from kvshrink.kvshrink_connector import KVShrinkConnector
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
     conn._rank = rank
     conn.tp_size = tp_size
-    conn._labels = [group_label(g.group_idx) for g in groups]
+    conn._labels = [f"g{g.group_idx}" for g in groups]
     conn.kvstore = None
     conn._layer_names = []
     conn._current_get_tasks = None
@@ -133,3 +132,10 @@ def make_spec(kind: str, block_size: int):
         head_size=1,
         dtype=torch.bfloat16,
     )
+
+
+def drive_start_load(w, metadata):
+    """Submit one step's loads through the real entry point."""
+    from types import SimpleNamespace
+    w.bind_connector_metadata(metadata)
+    w.start_load_kv(SimpleNamespace(attn_metadata=True))
