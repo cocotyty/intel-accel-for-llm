@@ -1002,8 +1002,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         from vllm.model_executor.models.utils import extract_layer_index
 
-        self.register(kv_caches,
-                      sorted(kv_caches, key=extract_layer_index))
+        self.register(sorted(kv_caches, key=extract_layer_index))
 
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
