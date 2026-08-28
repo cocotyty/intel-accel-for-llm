@@ -186,6 +186,18 @@ def test_failed_transfer_raises_at_poll():
         w.get_finished(set())
 
 
+
+def _empty_out():
+    """A scheduler output with nothing scheduled (parked-only pass)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], resumed_req_ids=set(),
+            new_block_ids=[], num_computed_tokens=[]),
+        num_scheduled_tokens={})
+
+
 def test_parked_request_still_gets_a_load_plan():
     """Regression: an async request appears in NEITHER scheduled list.
 
@@ -211,7 +223,7 @@ def test_parked_request_still_gets_a_load_plan():
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
-    plans = sched.take_async_load_plans(already_emitted=set())
+    plans = sched.build_connector_meta(_empty_out()).reqs_to_load.requests
     assert list(plans) == ["r1"], (
         "the parked request got no load plan -- it would hang")
     assert plans["r1"].is_async and plans["r1"].group_ops
@@ -233,8 +245,10 @@ def test_async_plan_is_emitted_only_once():
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
-    assert len(sched.take_async_load_plans(set())) == 1
-    assert sched.take_async_load_plans(set()) == {}
+    drains = sched.build_connector_meta(_empty_out()).reqs_to_load.requests
+    assert list(drains) == ["r1"]
+    assert sched.build_connector_meta(
+        _empty_out()).reqs_to_load.requests == {}
 
 
 def test_recurrent_models_can_go_async():
@@ -244,19 +258,23 @@ def test_recurrent_models_can_go_async():
     land in the slot vLLM will read, which it does -- see
     test_async_mamba_targets_the_slot_vllm_reads_as_prev.
     """
-    from kvshrink.kvshrink_connector import ReqState
     from conftest import HybridRequestScheduler
 
     class _Cfg:
         def select(self, concurrency):
             return 4
 
+    class _Req:
+        request_id = "r1"
+        block_hashes = [1, 2]
+        num_tokens = 48
+
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
         _FakeStore(), hash_block_size=16,
         async_load_config=_Cfg())
-    hybrid._req_states["r1"] = ReqState()
-    assert hybrid._decide_async("r1", external=64) is True
+    external, use_async = hybrid.get_num_new_matched_tokens(_Req(), 0)
+    assert external == 32 and use_async is True
 
 
 def test_async_mamba_targets_the_slot_vllm_reads_as_prev():
@@ -334,11 +352,13 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
             return ([4, 5],)
 
     sched.update_state_after_alloc(_Req(), _Blocks(), 32)
-    assert len(sched.take_async_load_plans(set())) == 1
+    assert list(sched.build_connector_meta(
+        _empty_out()).reqs_to_load.requests) == ["r1"]
 
     # vLLM's second callback for the same request
     sched.update_state_after_alloc(_Req(), _Blocks(), 32)
-    assert sched.take_async_load_plans(set()) == {}, (
+    assert sched.build_connector_meta(
+        _empty_out()).reqs_to_load.requests == {}, (
         "a second transfer was queued for a request already running")
 
 
@@ -363,7 +383,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     sched._req_states["r1"] = st
     sched._async_load_pending.add("r1")
 
-    plans = sched.take_async_load_plans(set())
+    plans = sched.build_connector_meta(_empty_out()).reqs_to_load.requests
     assert plans and plans["r1"].is_async
 
     assert st.is_async is False, (

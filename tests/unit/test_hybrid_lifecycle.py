@@ -188,7 +188,8 @@ def test_abort_keeps_committed_boundary_hittable():
     store = _HitStore(committed={0, 1})
     sched = _sched([_attn()], store)
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.on_request_finished("r1")  # abort
+    sched.request_finished(
+        type("R", (), {"request_id": "r1"})(), [])  # abort
     # a fresh lookup for the same hashes still hits
     assert lookup_boundary(
         store, CacheKey(0, 0, "")) == True
