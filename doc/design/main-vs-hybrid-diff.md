@@ -238,6 +238,16 @@ hybrid 下这条路裂成三股必要的需求：
 3. **running 请求**：通过 on_cached_request 同步新增块 id 并回滚游标
    ——这是本分支新增的核心簿记之一。
 
+**为什么不能像 main 那样"alloc 时攒累积器、meta 只搬运"**：main 的
+`_reqs_to_load/_reqs_to_save` 之所以成立，是因为它的计划在分配时刻
+已完全确定——单组、块 hash 固定、"见块就存"无时机语义。hybrid 的
+load 计划缺一个关键输入：GDN 恢复状态必须落在本 pass 的 CURR 槽
+`curr_idx = (boundary + scheduled_tokens - 1) // block_size`，而
+scheduled_tokens 只在 build_connector_meta 从 scheduler_output 拿得
+到。同理 save 的边界推进也依赖它。所以两端的计划都只能在
+build_connector_meta 单趟组装——main 的 build_connector_meta 是搬运
+工，我们的是装配车间，差异不在风格而在信息到达的时刻。
+
 ## 3.3 增量保存游标及其回滚：main 不需要的概念
 
 **main 怎么做**：每个请求维护 `num_seen_blocks` 计数；保存候选 =
