@@ -151,7 +151,7 @@ void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std:
                     PROFILE_SCOPE("compress");
                     METRICS_TIMER_START(metrics_compress);
                     kv_zip_compress_batch(cpu_tensors_copy, compressed_bufs, compressed_sizes,
-                                          unzip_sizes, compress);
+                                          unzip_sizes, compress, lossy_trunc_enabled);
                     METRICS_ADD_COMPRESS(metrics_compress, metrics_sum_sizes(unzip_sizes));
                 }
 

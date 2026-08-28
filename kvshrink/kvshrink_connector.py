@@ -715,7 +715,7 @@ class HybridHitPolicy:
 # worker bookkeeping
 # ======================================================================
 # Async load tracking uses main's four parallel dicts verbatim:
-#   _pending_load_tasks / _pending_load_layers  -- in flight
+#   _pending_load_tasks                     -- in flight
 #   _early_promoted_tasks                       -- released, draining
 #   _active_promoted_tasks                      -- draining this forward
 # One extra piece of information rides alongside: _gated_keys[req],
@@ -799,7 +799,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # land before release (every recurrent layer + configured
         # first-N attention layers).
         self._pending_load_tasks: dict[str, dict[str, Task]] = {}
-        self._pending_load_layers: dict[str, int] = {}
         self._gated_keys: dict[str, frozenset[str]] = {}
         self._early_promoted_tasks: dict[str, dict[str, Task]] = {}
         self._active_promoted_tasks: dict[str, dict[str, Task]] = {}
@@ -2169,7 +2168,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             gate = recurrent | set(prefix)
         # main's four-dict shape: tasks + per-request layer count.
         self._pending_load_tasks[req_id] = dict(tasks)
-        self._pending_load_layers[req_id] = n if n is not None else -1
         self._gated_keys[req_id] = frozenset(
             k for k in tasks if k.rsplit("#", 1)[0] in gate)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
@@ -2453,19 +2451,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                                    wait=False):
                 continue
             self._wait_load(gated)
-            del self._gated_keys[req_id]
             finished_recving.add(req_id)
             if not (tasks_remaining := {
                     k: t for k, t in tasks.items() if k not in gated}):
                 del self._pending_load_tasks[req_id]
-                del self._pending_load_layers[req_id]
-                self._gated_keys.pop(req_id, None)
+                del self._gated_keys[req_id]
                 continue
             # Promote: released; the leftover keys drain at their layer
             # hooks during that request's forward.
             self._early_promoted_tasks[req_id] = tasks_remaining
             del self._pending_load_tasks[req_id]
-            del self._pending_load_layers[req_id]
+            del self._gated_keys[req_id]
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
