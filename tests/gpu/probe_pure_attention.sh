@@ -29,7 +29,7 @@ gate_stop
 
 FIRST_LOG="$GATE_LOG_DIR/pure_attention_first.log"
 check "pure-attention model served as one attention group" \
-    grep -qF "kvshrink groups: [(0, 'attention'" "$FIRST_LOG"
+    grep -qF "groups=[(0, 'attention'" "$FIRST_LOG"
 check "pure-attention KV store registered" \
     grep -q "Registered .* KV cache layers" "$FIRST_LOG"
 check "first run produced output" test -n "$FIRST_OUT"
