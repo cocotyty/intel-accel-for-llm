@@ -48,9 +48,8 @@ developer's shell settings can never change the result.
 | `test_hybrid_canonical.py` | Canonical page views, including the split K/V attention layout |
 | `test_hybrid_mamba_table.py` | GDN slot selection: the snapshot must land in `block_table[(computed + scheduled - 1) // block_size]`, the only slot v0.23.0's kernel reads; null / out-of-range / no-boundary cases all fail closed |
 | `test_hybrid_piggyback.py` | GDN loads ride the preceding attention layer's hook; leading segment waits before forward; every GDN layer covered exactly once; un-waited layers, stale residue, TOCTOU changes and failed transfers all fail stop |
-| `test_hybrid_pipelined_save.py` | Attention layers submit their save during forward, GDN groups after it; commits carry every layer's checksum; `KVSHRINK_SAVE_PIPELINED=0` falls back cleanly |
+| `test_hybrid_pipelined_save.py` | Attention layers submit their save during forward, GDN groups after it; commits carry every layer's checksum |
 | `test_hybrid_lifecycle.py` | Preemption/resume: save-cursor rollback, resumed requests get load plans, fail-closed when credited tokens cannot be restored, immediate block free |
-| `test_hybrid_tp_heal.py` | A boundary missing on any TP rank reads as MISS so the request recomputes and re-commits every rank |
 | `test_hybrid_mamba_split.py` | vLLM's own block-aligned prefill split accepts external tokens (regression guard for the restriction that older versions had) |
 | `test_hybrid_contract.py` | vLLM v0.23.0 connector API contract: metadata instance, 3-argument constructor, `SupportsHMA` |
 
