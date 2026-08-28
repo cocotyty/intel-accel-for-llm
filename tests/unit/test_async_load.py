@@ -55,8 +55,9 @@ class _FakeStore:
             label=None):
         return {ln: f"task:{ln}" for ln in layer_names}
 
-    def get_wait(self, get_results, wait=True):
-        layers = {k.rsplit("#", 1)[0] for k in get_results}
+    def get_wait(self, get_results, layer_names=None, wait=True):
+        layers = (set(layer_names) if layer_names is not None
+                  else set(get_results))
         if layers & self.fail_on:
             raise RuntimeError(
                 f"transfer failed: {sorted(layers & self.fail_on)}")
@@ -67,14 +68,6 @@ class _FakeStore:
 
     def has(self, chunk_labels, label=None):
         return [True]
-
-
-class _FakeCanon:
-    def register(self, kv_caches):
-        pass
-
-    def page_view_parts(self, layer_name):
-        return {"page": layer_name}
 
 
 def _worker(store):
@@ -103,22 +96,20 @@ def _meta(async_layers, req_id="r1"):
 # ------------------------------------------------------------------
 # the recurrent-state constraint
 # ------------------------------------------------------------------
-def _layers(s):
-    return {k.rsplit("#", 1)[0] for k in s}
-
-
 def test_gate_covers_every_recurrent_layer_despite_short_prefix():
     """Asking to release after ONE attention layer must still wait for
     all GDN state: it is consumed whole at the start of forward."""
     b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
+    assert w._pending_load_layers["r1"] == 1
 
-    gated = w._gated_keys["r1"]
-    assert set(GDN) <= _layers(gated), (
-        "recurrent layers were left out of the release gate")
-    # exactly one attention layer, the first in execution order
-    assert {ln for ln in _layers(gated) if ln in ATTN} == {"a1"}
+    # the gate lands: every recurrent layer plus exactly the first
+    # attention layer in execution order
+    b.landed = {"a1", *GDN}
+    _, recving = w.get_finished(set())
+    assert recving == {"r1"}
+    assert set(b.waited) == {"a1", "m0", "m2"}, b.waited
 
 
 def test_not_released_until_recurrent_state_has_landed():
@@ -139,7 +130,13 @@ def test_negative_layer_count_gates_on_every_layer():
     b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=-1))
-    assert _layers(w._gated_keys["r1"]) == set(ORDER)
+    assert w._pending_load_layers["r1"] == -1
+    b.landed = set(ORDER)
+    _, recving = w.get_finished(set())
+    assert recving == {"r1"}
+    assert set(b.waited) == set(ORDER), b.waited
+    # -1 waits everything, so nothing is left to promote
+    assert "r1" not in w._early_promoted_tasks
 
 
 # ------------------------------------------------------------------
@@ -147,11 +144,11 @@ def test_negative_layer_count_gates_on_every_layer():
 # ------------------------------------------------------------------
 def test_async_tasks_live_outside_the_step_tasks():
     """Async tasks outlive the step by design: they are not in the
-    per-step _load_tasks drained by the layer hooks."""
+    per-step _current_get_tasks drained by the layer hooks."""
     b = _FakeStore()
     w = _worker(b)
     w.start_load(_meta(async_layers=1))
-    assert w._load_tasks == {}
+    assert w._current_get_tasks is None
     assert "r1" in w._pending_load_tasks
 
 
@@ -165,12 +162,14 @@ def test_remaining_layers_are_drained_by_the_layer_hooks():
 
     # gate layers were finalized at release; a3 was not
     assert "a3" not in b.waited
-    # release promoted leftovers to active-for-forward, main-style
-    assert "r1" in w._early_promoted_tasks or \
-           "r1" in w._active_promoted_tasks
-    w.wait_layer_load("a3")
+    assert "r1" in w._early_promoted_tasks
+    # main: the next start_load_kv promotes early -> active
+    w._active_promoted_tasks.update(w._early_promoted_tasks)
+    w._early_promoted_tasks = {}
+    w.wait_for_layer_load("a3")
     assert "a3" in b.waited
-    assert "r1" not in w._pending_load_tasks
+    # a3 is the last attention layer: the promoted book is cleared
+    assert w._active_promoted_tasks == {}
 
 
 # ------------------------------------------------------------------

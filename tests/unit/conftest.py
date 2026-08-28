@@ -83,15 +83,14 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
-    conn._layer_infos = layer_infos
     conn._rank = rank
     conn.tp_size = tp_size
     conn._labels = [group_label(g.group_idx) for g in groups]
     conn.kvstore = None
     conn._layer_names = []
-    conn._load_tasks = {}
+    conn._current_get_tasks = None
     conn._pending_load_tasks = {}
-    conn._gated_keys = {}
+    conn._pending_load_layers = {}
     conn._early_promoted_tasks = {}
     conn._active_promoted_tasks = {}
     conn._layer_group = {
@@ -101,15 +100,13 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
         for ln in g.layer_names}
     conn._mamba_layers = frozenset()
     conn._attn_order = ()
+    conn._last_layer_name = None
     conn._mamba_save_segments = {}
     conn._saved_layers = set()
     conn._step_save_pages = 0
     conn._current_put_tasks = {}
     conn._deferred_finished_req_ids = set()
     conn._connector_metadata = None
-    # Raw pools: tests fill per-layer part dicts themselves (see the
-    # helpers that call w.register with placeholder kv_caches).
-    conn._raw_pools = {}
     return conn
 
 

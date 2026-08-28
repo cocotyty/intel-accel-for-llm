@@ -250,7 +250,7 @@ sequenceDiagram
     Mix->>GPU: 3. forward begins
     loop each attention layer, in execution order
         GPU->>Con: 4. wait_for_layer_load(layer)
-        Con->>Wk: wait_layer_load
+        Con->>Wk: wait_for_layer_load
         Wk->>Wk: wait this layer's pages<br/>+ the GDN segment that follows it
         Note over Wk: those GDN layers execute after this hook returns,<br/>so waiting here is early enough, while their<br/>transfers have already overlapped earlier compute
         GPU->>Con: 5. save_kv_layer(layer, kv, metadata)

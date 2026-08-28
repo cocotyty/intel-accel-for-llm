@@ -318,16 +318,15 @@ recurient 任务一次性 pop 出来 host-block。
    无需维护任何"哪个 attn 负责哪个 gdn"的映射机构。简单压倒聪明。
 
 c) **async 请求不在 sync 大批**——他们被 park 着、不参与本步
-forward，如果混进去会被 b) 屏障误伤。单独登记到 _AsyncLoad 册子。
-gate 的计算里 recurrent 全收 + 前 N attention 层（这是 _decide_async
-的结果）。
+forward，如果混进去会被 b) 屏障误伤。登记方式与 main 逐行相同：
+_pending_load_tasks[req] = tasks + _pending_load_layers[req] = n。
 
-## 4.2 wait_for_layer_load / wait_layer_load：排水范围扩大
+## 4.2 wait_for_layer_load：与 main 逐行一致
 
-main 每次只等当前层的同步任务。我们除了等当前层，还要顺手把每一个
-"已 released 的 async 册子"里当前层的余款一起排水。原因是 worker 无
-从知晓 step 里到底覆盖了哪些请求——**等早一步只赔一瞬间的空等，不
-等则是给未恢复内存跑了 kernel**，不对称得离谱所以永远多做。
+恢复为 main 原版：任务字典原样保留，get_wait(layer_names=[当前层])
+过滤等待，到最后一个 attention 层（_last_layer_name）清空
+_current_get_tasks 与 _active_promoted_tasks。hybrid 的差异全部在
+start_load 的 GDN 屏障里付掉了，这里不需要任何新机制。
 
 ## 4.3 save 流水线：从每层一次 put 变三级接力
 
@@ -350,25 +349,22 @@ get_finished 逐个 put_wait 收割，收干净才 completed 上报，vLLM 才�
   是 gate 的锚，start_load_kv 开头的镜像日志同样如此，保证"保存开着
   但啥也没干"在日志上肉眼可见。
 
-## 4.4 get_finished：从两大块变三段式收割
+## 4.4 get_finished：两段式，同 main
 
-结构对比一眼看清：
+结构与 main 相同：先 poll async loads（四字典 early-promote 状态机），
+再合账 drain finished 请求的 puts。唯一的功能性差异在 gate 的算法：
 
-```
-main:
-  poll async loads（两个字典、early-promote 状态机）
-  drain finished reqs 的 puts
+- main：gate = _layer_names[:n]（纯位置切片）。
+- ours：gate = 该请求任务里的全部 recurrent 层 ∪ 执行序前 N 个
+  attention 层，poll 时现算后经同一个 get_wait(layer_names=...) 接口
+  下发。recurrent 全收是硬约束——状态在 forward 开头被整读，缺一段就
+  是静默错误输出；n == -1 时退化为 main 的"全等"分支，不发生晋升。
 
-ours:
-  poll_finished_loads()     <- poll loads，但状态机搬进了 _AsyncLoad 一个类
-  合账 deferred finished    <- 相同
-  逐 req: 先收它的 in-flight async load 余款
-        再收它名下 puts    <- 相同思路 + ctx 已清则划过的 dedupe bug 修复
-```
+收割 puts 的部分保留了我们对共享边界的 dedupe 修复：
 
 双重 drain bug 值得讲清楚，它是共享数据结构自然孕育的竞争：多个请
-求贡献同一边界时（并行 decode 常态）,_SaveCandidate 把 put 挂到每个
-贡献者名下。第一个请求收尾时 put_wait 已经 finalize 了任务（ctx 清
+求贡献同一边界时（并行 decode 常态），同一份 put 挂到每个贡献者名
+下。第一个请求收尾时 put_wait 已经 finalize 了任务（ctx 清
 None）;第二个请求轮到时再去碰它,native 断言拍死 worker。修复 =
 收账前看 ctx 是否已被清空，等于"这笔别人付过了，我销我的账"。
 
@@ -377,17 +373,13 @@ main 为什么没有这个 bug？main 的 put 按请求独立、从不合并同 
 一份任务挂两个名字的情况。我们把去重当优化引入时，就要负责处理
 "去重的副作用是所有权共享"。这是一条真正的架构税，我们付了。
 
-## 4.5 异步加载早期晋升的状态机被收割简化了
+## 4.5 异步簿记：四字典原样保留
 
-main 维护四本字典（_pending_load_tasks / _pending_load_layers /
-_early_promoted_tasks / _active_promoted_tasks）+ start_load 时的晋升
-promote + last-layer-reset 语法. 我们把这团状态机收进单个
-_AnyLoad dataclass（layer_tasks dict + gate_layers set + released
-bool）：poll 时检查 gate 是否齐 -> 齐 = released 上报;剩余楼层由逐
-层 hook 排水，排完即弹出。状态本质从"四个平行数组手工保持一致"变成
-"一个请求生命周期的显式相位机"——**这个重构与功能无关，纯粹是复杂
-度消化**；同样的信息在两套平行字典里靠纪律维系的做法，扩展到每组一
-张表的规模时就会自相撕裂。
+main 的四本字典（_pending_load_tasks / _pending_load_layers /
+_early_promoted_tasks / _active_promoted_tasks）+ start_load_kv 里的
+early→active 晋升 + last-layer-reset 全部原样保留，包括 deferred
+drain 里对四本字典的逐个弹出。本节曾经是私有状态机（_AsyncLoad
+类），评审意见是"与功能无关的习惯漂移"，已改回 main 形态。
 
 ====================================================================
 # 第五部分：不变的清单（评审时可直接放过的部分）
