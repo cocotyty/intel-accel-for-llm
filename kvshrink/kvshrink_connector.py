@@ -33,8 +33,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 if TYPE_CHECKING:
-    from .async_load_config import AsyncLoadLayerConfig
-    from vllm.config import ModelConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -80,6 +78,21 @@ class ReqState:
 @dataclass
 class RequestMetadata:
     requests: dict[ReqId, ReqMeta] = field(default_factory=dict)
+
+    def add_request(
+        self,
+        req_id: ReqId,
+        group_ops: tuple[GroupTransferMeta, ...] = (),
+        is_async: bool = False,
+        async_load_layers: int = -1,
+        external_hit_tokens: int = 0,
+    ) -> None:
+        self.requests[req_id] = ReqMeta(
+            group_ops=group_ops,
+            external_hit_tokens=external_hit_tokens,
+            is_async=is_async,
+            async_load_layers=async_load_layers,
+        )
 
 @dataclass
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
@@ -362,40 +375,44 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
-        self.vllm_config: VllmConfig = vllm_config
-        self.model_config: ModelConfig = vllm_config.model_config
-        self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
-        self.num_layers: int = self.model_config.get_num_layers(
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.vllm_device: str = vllm_config.device_config.device_type
-        self.rank: int = get_world_group().rank if model_parallel_is_initialized() else 0
+        self.vllm_device = vllm_config.device_config.device_type
+        self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
 
-        self._async_load_layer_config: AsyncLoadLayerConfig = (
-            load_async_load_layer_config_from_env(
-                num_layers=self.num_layers,
-            )
+        self._req_states: dict[ReqId, ReqState] = {}
+        self._async_load_pending: set[str] = set()
+        self._current_get_tasks: Optional[dict[str, Any]] = None
+        self._current_put_tasks: dict[ReqId, list[dict[str, Any]]] = {}
+        self._deferred_finished_req_ids: set[ReqId] = set()
+        self._last_layer_name: Optional[str] = None
+        self._layer_names: list[str] = []
+        self._pending_load_tasks: dict[ReqId, dict[str, Any]] = {}
+        self._pending_load_layers: dict[ReqId, int] = {}
+        self._early_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
+        self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
+
+        self._async_load_layer_config = load_async_load_layer_config_from_env(
+            num_layers=self.num_layers,
         )
 
-        self.kvstore: Optional[KVStore] = None
-
-        self._req_states: dict[str, ReqState] = {}
-        self._async_load_pending: set[str] = set()
-
-        self._pending_load_tasks: dict[str, dict[str, Task]] = {}
-        self._pending_load_layers: dict[str, int] = {}
-        self._early_promoted_tasks: dict[str, dict[str, Task]] = {}
-        self._active_promoted_tasks: dict[str, dict[str, Task]] = {}
-        self._current_get_tasks: Optional[dict[str, Task]] = None
-        self._last_layer_name: Optional[str] = None
-        self._current_put_tasks: dict[str, list[dict[str, Task]]] = {}
-        self._deferred_finished_req_ids: set[str] = set()
+        if role == KVConnectorRole.SCHEDULER:
+            self.kvstore: Optional[KVStore] = KVStore(
+                model_name=os.path.basename(self.model_config.model),
+                layer_names=[str(index) for index in range(self.num_layers)],
+                tp_size=self.tp_size,
+            )
+        else:
+            self.kvstore = None
+            self._bind_cpu_affinity()
+            self._bind_intel_accel()
 
         if kv_cache_config is not None:
             self._init_kv_stack(vllm_config, role, kv_cache_config)
-        else:
-            self._bind_cpu_affinity()
-            self._bind_intel_accel()
 
     def _init_kv_stack(
         self,
@@ -416,7 +433,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             rank = pc.rank
         else:
             rank = 0
-        model_config = vllm_config.model_config
 
         block_sizes = sorted({int(g.kv_cache_spec.block_size)
                               for g in kv_cache_config.kv_cache_groups})
@@ -446,13 +462,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         recurrent = any(g.kind == "mamba" for g in groups)
         self._block_hash_source = self._choose_block_hash_source(recurrent)
 
-        if role == KVConnectorRole.SCHEDULER:
-            self.kvstore = KVStore(
-                model_name=os.path.basename(self.model_config.model),
-                layer_names=[str(i) for i in range(self.num_layers)],
-                tp_size=self.tp_size,
-            )
-        else:
+        if role != KVConnectorRole.SCHEDULER:
             self._labels = [group_label(g.group_idx) for g in groups]
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -923,12 +933,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         op.group_idx, self._groups[op.group_idx].kind,
                         len(op.keys), len(op.gpu_block_ids))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
-                meta.reqs_to_load.requests[new_req.req_id] = req_meta
+                meta.reqs_to_load.add_request(
+                    new_req.req_id, req_meta.group_ops, req_meta.is_async,
+                    req_meta.async_load_layers, req_meta.external_hit_tokens)
             if save_on:
                 save_meta = self.build_save_meta(
                     new_req.req_id, num_sched.get(new_req.req_id, 0))
                 if save_meta.group_ops:
-                    meta.reqs_to_save.requests[new_req.req_id] = save_meta
+                    meta.reqs_to_save.add_request(
+                        new_req.req_id, save_meta.group_ops)
 
         for req_id, req_meta in self.take_async_load_plans(
                 set(meta.reqs_to_load.requests)).items():
@@ -937,7 +950,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "LOADMETA(async) req=%s ops=%d layers=%s",
                     req_id, len(req_meta.group_ops),
                     req_meta.async_load_layers)
-            meta.reqs_to_load.requests[req_id] = req_meta
+            meta.reqs_to_load.add_request(
+                req_id, req_meta.group_ops, req_meta.is_async,
+                req_meta.async_load_layers, req_meta.external_hit_tokens)
 
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
@@ -948,7 +963,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     "LOADMETA(resumed) req=%s ops=%d",
                     req_id, len(req_meta.group_ops))
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
-                meta.reqs_to_load.requests[req_id] = req_meta
+                meta.reqs_to_load.add_request(
+                req_id, req_meta.group_ops, req_meta.is_async,
+                req_meta.async_load_layers, req_meta.external_hit_tokens)
 
         if save_on:
             resumed = cr.resumed_req_ids
@@ -960,7 +977,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 save_meta = self.build_save_meta(
                     req_id, num_sched.get(req_id, 0))
                 if save_meta.group_ops:
-                    meta.reqs_to_save.requests[req_id] = save_meta
+                    meta.reqs_to_save.add_request(req_id,
+                                                  save_meta.group_ops)
 
         if debug:
             logger.info(
