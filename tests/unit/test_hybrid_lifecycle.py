@@ -12,11 +12,10 @@ Rulings under test:
    deletes them; uncommitted pages never hit.
 """
 
-
-import pytest
-
-from conftest import FakeBlocks, HybridRequestScheduler, make_spec
-from kvshrink.kvshrink_connector import CacheKey, GroupInfo
+from conftest import (
+    FakeBlocks, HybridRequestScheduler, make_spec,
+    track_new_request)
+from kvshrink.kvshrink_connector import GroupInfo
 
 PAGE = 64 * 1024
 
@@ -55,7 +54,7 @@ def _sched(groups, store=None):
 
 
 def _setup_attn_req(sched, hashes, ids, tokens=0):
-    sched._track_new_request("r1", block_hashes=hashes,
+    track_new_request(sched, "r1", block_hashes=hashes,
                          num_computed_tokens=tokens)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
@@ -83,7 +82,7 @@ def test_resume_to_zero_rolls_cursor_and_reemits():
 
 def test_mamba_resume_reemits_boundary_snapshot():
     sched = _sched([_mamba()])
-    sched._track_new_request("r1", block_hashes=[0, 1],
+    track_new_request(sched, "r1", block_hashes=[0, 1],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
@@ -216,7 +215,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
     conn = _sched_side_connector(sched)
     for i in range(1000):
         rid = f"r{i}"
-        sched._track_new_request(rid, block_hashes=[0, 1, 2, 3], num_computed_tokens=0)
+        track_new_request(sched, rid, block_hashes=[0, 1, 2, 3], num_computed_tokens=0)
         sched.update_state_after_alloc(
             type("R", (), {"request_id": rid}),
             FakeBlocks(([10, 11, 12, 13],)), 0)
@@ -258,7 +257,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     ]
     sched = HybridRequestScheduler(groups, _HitStore(committed), 16)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
-    sched._track_new_request("r1", block_hashes=hashes, num_computed_tokens=0)
+    track_new_request(sched, "r1", block_hashes=hashes, num_computed_tokens=0)
     sched._req_states["r1"].snapshot_boundary = 544
     attn_ids = list(range(100, 134))  # 34 fresh attention blocks
     mamba_ids = [200, 201]            # CURR slot for this step = idx 1

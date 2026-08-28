@@ -442,25 +442,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
-    def _track_new_request(
-        self, req_id: str, block_hashes: list[int],
-        num_computed_tokens: int,
-        request: Optional["Request"] = None,
-    ) -> None:
-        """Register a fresh ReqState."""
-        live_source = None
-        if request is not None:
-            live_source = (request.block_hashes
-                           if self._block_hash_source == "vllm"
-                           else request.all_token_ids)
-        self._req_states[req_id] = ReqState(
-            live_source=live_source,
-            block_hashes=list(block_hashes),
-            num_computed_tokens=num_computed_tokens,
-            groups=tuple(
-                ReqGroupState() for _ in self._groups),
-        )
-
     def _request_block_hashes(self, request: "Request") -> list[Any]:
         """This request's block identities, in block order."""
         if self._block_hash_source == "vllm":
@@ -532,9 +513,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
         block_hashes = self._request_block_hashes(request)
-        self._track_new_request(
-            request.request_id, block_hashes,
-            num_computed_tokens, request=request)
+        self._req_states[request.request_id] = ReqState(
+            live_source=(request.block_hashes
+                         if self._block_hash_source == "vllm"
+                         else request.all_token_ids),
+            block_hashes=list(block_hashes),
+            num_computed_tokens=num_computed_tokens,
+            groups=tuple(ReqGroupState() for _ in self._groups),
+        )
         if num_computed_tokens >= request.num_tokens:
             return 0, False
         policy = HybridHitPolicy(

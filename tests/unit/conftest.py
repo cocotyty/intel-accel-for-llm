@@ -71,6 +71,17 @@ def HybridRequestScheduler(groups, store, hash_block_size,
     return conn
 
 
+def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0):
+    """Register a fresh ReqState (what get_num_new_matched_tokens does)."""
+    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
+    sched._req_states[req_id] = ReqState(
+        live_source=None,
+        block_hashes=list(block_hashes),
+        num_computed_tokens=num_computed_tokens,
+        groups=tuple(ReqGroupState() for _ in sched._groups),
+    )
+
+
 def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     """Worker-side connector instance without the vLLM config stack.
 

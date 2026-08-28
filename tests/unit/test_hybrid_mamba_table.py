@@ -13,7 +13,9 @@ so they run in the container test runner).
 from __future__ import annotations
 
 
-from conftest import FakeBlocks, HybridRequestScheduler, make_spec
+from conftest import (
+    FakeBlocks, HybridRequestScheduler, make_spec,
+    track_new_request)
 from kvshrink.kvshrink_connector import GroupInfo
 
 
@@ -61,7 +63,7 @@ def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
 
 def _make(groups, committed, block_ids_per_group):
     sched = HybridRequestScheduler(groups, _Store(committed), 16)
-    sched._track_new_request("r1", block_hashes=[0, 1],
+    track_new_request(sched, "r1", block_hashes=[0, 1],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),  # request-like
@@ -275,7 +277,7 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
     """Gathered table index beyond the table length -> FAIL-STOP."""
     groups = [_group(0, "mamba", 544, align=544)]
     sched = HybridRequestScheduler(groups, _Store({2}), 16)
-    sched._track_new_request("r1", block_hashes=[0, 1, 2],
+    track_new_request(sched, "r1", block_hashes=[0, 1, 2],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
