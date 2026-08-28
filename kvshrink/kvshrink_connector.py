@@ -65,7 +65,7 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    live_source: Any = None
+    live_source: list = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     snapshot_boundary: int = 0
@@ -335,10 +335,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # regression) roll the save cursor back so boundaries emitted
         # before a preemption get re-emitted (overwrite is idempotent)."""
         state = self._req_states[req_id]
-        if state.live_source is not None:
-            live = state.live_source
-            if len(live) > len(state.block_hashes):
-                state.block_hashes.extend(live[len(state.block_hashes):])
+        live = state.live_source
+        if len(live) > len(state.block_hashes):
+            state.block_hashes.extend(live[len(state.block_hashes):])
         old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
