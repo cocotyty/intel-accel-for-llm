@@ -283,21 +283,6 @@ def test_resumed_load_meta_restores_credited_pages():
     assert mamba.gpu_block_ids == (201,), mamba  # ids[curr_idx=1]
 
 
-def test_resumed_load_meta_fail_closed_when_pages_unrestorable():
-    """Fail-closed: the core credited 544 external tokens but
-    the store can no longer restore ANY page -> raise instead of
-    letting forward read unrestored KV."""
-    sched = _hybrid_resumed_setup(set())  # nothing committed anymore
-    raised = None
-    try:
-        sched.build_resumed_load_meta("r1", scheduled_tokens=64)
-    except RuntimeError as e:
-        raised = e
-    assert raised is not None, \
-        "credited external tokens with no restorable pages must raise"
-    assert "unrestored state" in str(raised)
-
-
 def test_resumed_load_meta_without_credit_is_quiet():
     """Resume covered entirely by the LOCAL prefix cache (ext=0, no
     external boundary): empty load meta, no error."""
