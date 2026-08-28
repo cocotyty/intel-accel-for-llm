@@ -90,7 +90,11 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn.kvstore = None
     conn._layer_names = []
     conn._load_tasks = {}
-    conn._async_loads = {}
+    conn._pending_load_tasks = {}
+    conn._pending_load_layers = {}
+    conn._gated_keys = {}
+    conn._early_promoted_tasks = {}
+    conn._active_promoted_tasks = {}
     conn._layer_group = {
         ln: g.group_idx for g in groups for ln in g.layer_names}
     conn._attn_layer_group = {
