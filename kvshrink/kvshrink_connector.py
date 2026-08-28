@@ -489,14 +489,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 gran = group.block_size
                 num_hash = boundary // gran
                 for i in range(num_hash):
-                    if i >= len(state.block_hashes):
-                        break
                     blk_hash = state.block_hashes[i]
                     key = CacheKey(blk_hash, group.group_idx, "")
-                    if i < len(ids):
-                        for layer_name in group.layer_names:
-                            keys.append(replace(key, layer_name=layer_name))
-                            gpu_ids.append(ids[i])
+                    for layer_name in group.layer_names:
+                        keys.append(replace(key, layer_name=layer_name))
+                        gpu_ids.append(ids[i])
             elif group.kind == "mamba":
                 if state.block_hashes and boundary > 0:
                     idx = boundary // group.block_size - 1
