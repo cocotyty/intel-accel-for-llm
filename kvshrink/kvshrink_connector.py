@@ -543,6 +543,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             os.environ[target] = devices[self.rank]
             logger.info("Bound rank %d: %s=%s", self.rank, target, devices[self.rank])
 
+    def _store(self) -> KVStore:
+        if self.kvstore is None:
+            raise RuntimeError("KVStore has not been initialized")
+        return self.kvstore
+
     def _track_new_request(
         self, req_id: str, block_hashes: list[int],
         num_computed_tokens: int,
@@ -1030,7 +1035,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             tp_size=self.tp_size,
         )
         logger.info("Registered %d KV cache layers",
-                    len(self.kvstore.layer_names))
+                    len(self._store().layer_names))
 
     def register(
         self,
@@ -1131,7 +1136,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._current_get_tasks = merged
         recurrent = [ln for ln in merged if ln in self._mamba_layers]
         if recurrent:
-            if not self.kvstore.get_wait(
+            if not self._store().get_wait(
                     get_results=merged, layer_names=recurrent, wait=True):
                 raise RuntimeError(
                     "kvshrink load failed: recurrent pages did not land; "
@@ -1148,7 +1153,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         if self._current_get_tasks:
-            success = self.kvstore.get_wait(
+            success = self._store().get_wait(
                 get_results=self._current_get_tasks,
                 layer_names=[layer_name],
             )
@@ -1158,7 +1163,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
         for tasks in self._active_promoted_tasks.values():
-            success = self.kvstore.get_wait(
+            success = self._store().get_wait(
                 get_results=tasks,
                 layer_names=[layer_name],
             )
@@ -1196,7 +1201,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """One engine get covering ``layer_names`` for the blocks in
         ``entries``; returns the tasks dict (layer name -> Task) and
         the page count."""
-        tasks = self.kvstore.get(block_indices=[gpu for gpu, _ in entries],
+        tasks = self._store().get(block_indices=[gpu for gpu, _ in entries],
                                  block_hashs=[h for _, h in entries],
                                  layer_names=list(layer_names),
                                  label=self._labels[g_idx])
@@ -1226,7 +1231,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> dict[str, Task]:
         """One async engine put covering ``layer_names`` for the
         # (gpu_block, hash) entries."""
-        return self.kvstore.put(block_indices=[gpu for gpu, _ in entries],
+        return self._store().put(block_indices=[gpu for gpu, _ in entries],
                                 block_hashs=[h for _, h in entries],
                                 layer_names=layer_names,
                                 label=self._labels[g_idx])
@@ -1347,34 +1352,31 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """Worker-side: report finished saves and released async loads."""
-        if self.kvstore is None:
-            return None, None
-
         finished_recving: set[str] = set()
         for req_id in list(self._pending_load_tasks.keys()):
             tasks = self._pending_load_tasks[req_id]
             async_load_layers = self._pending_load_layers[req_id]
             if async_load_layers == -1:
-                gate_layers = None
+                if self._store().get_wait(get_results=tasks, wait=False):
+                    self._store().get_wait(get_results=tasks, wait=True)
+                    del self._pending_load_tasks[req_id]
+                    del self._pending_load_layers[req_id]
+                    finished_recving.add(req_id)
             else:
                 gate_layers = (
                     [ln for ln in tasks if ln in self._mamba_layers]
                     + [ln for ln in self._attn_order
                        if ln in tasks][:async_load_layers])
-                if not gate_layers:
-                    gate_layers = None
-            if self.kvstore.get_wait(get_results=tasks,
-                                     layer_names=gate_layers,
-                                     wait=False):
-                self.kvstore.get_wait(get_results=tasks,
-                                      layer_names=gate_layers,
-                                      wait=True)
-                del self._pending_load_tasks[req_id]
-                del self._pending_load_layers[req_id]
-                if gate_layers is not None:
+                if self._store().get_wait(
+                        get_results=tasks, layer_names=gate_layers,
+                        wait=False):
+                    self._store().get_wait(
+                        get_results=tasks, layer_names=gate_layers,
+                        wait=True)
+                    del self._pending_load_tasks[req_id]
+                    del self._pending_load_layers[req_id]
                     self._early_promoted_tasks[req_id] = tasks
-                finished_recving.add(req_id)
+                    finished_recving.add(req_id)
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
@@ -1383,10 +1385,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                           or self._early_promoted_tasks.get(req_id)
                           or self._active_promoted_tasks.get(req_id))
             if load_tasks is not None:
-                if not self.kvstore.get_wait(get_results=load_tasks,
+                if not self._store().get_wait(get_results=load_tasks,
                                              wait=False):
                     continue
-                self.kvstore.get_wait(get_results=load_tasks, wait=True)
+                self._store().get_wait(get_results=load_tasks, wait=True)
                 self._pending_load_tasks.pop(req_id, None)
                 self._pending_load_layers.pop(req_id, None)
                 self._early_promoted_tasks.pop(req_id, None)
@@ -1400,7 +1402,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if all(t.ctx is None for t in tasks[0].values()):
                     tasks.pop(0)
                     continue
-                if not self.kvstore.put_wait(tasks[0], wait=False):
+                if not self._store().put_wait(tasks[0], wait=False):
                     break
                 tasks.pop(0)
             if not tasks:
@@ -1420,7 +1422,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if group.kind != "mamba":
                 continue
             ln = group.layer_names[0]
-            page_view = self.kvstore.kv_caches[ln]
+            page_view = self._store().kv_caches[ln]
             for blk in range(10):
                 page = page_view[blk]
                 h = hashlib.sha256(
