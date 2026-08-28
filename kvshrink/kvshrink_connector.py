@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import NewRequestData
     from vllm.v1.request import Request
 
-from iaxl import KVStore, generate_block_hashs, setup_root_logger
+from iaxl import KVStore, setup_root_logger
 from iaxl.kvflow.flow import Task
 
 from .hybrid_hit import HybridHitPolicy
@@ -174,18 +174,6 @@ def parse_kv_cache_config(
         ))
     return groups, kv_cache_config.num_blocks
 
-def choose_block_hash_source(recurrent: bool) -> str:
-    """Which block-identity scheme keys the cache: vLLM block hashes
-    (default for recurrent models) or the legacy token-hash fallback."""
-    choice = (os.getenv("KVSHRINK_BLOCK_HASH_SOURCE") or "auto").lower()
-    if choice == "auto":
-        return "vllm" if recurrent else "legacy"
-    if choice not in ("vllm", "legacy"):
-        raise ValueError(
-            "KVSHRINK_BLOCK_HASH_SOURCE must be auto, vllm or "
-            f"legacy; got {choice!r}")
-    return choice
-
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     """KVShrink external KV cache connector (hybrid GDN/Mamba aware)."""
 
@@ -268,9 +256,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._attention_layers = tuple(
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
-        self._block_hash_source = choose_block_hash_source(
-            any(g.kind == "mamba" for g in groups))
-
         if role != KVConnectorRole.SCHEDULER:
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -351,11 +336,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # before a preemption get re-emitted (overwrite is idempotent)."""
         state = self._req_states[req_id]
         if state.live_source is not None:
-            if self._block_hash_source == "vllm":
-                live = state.live_source
-            else:
-                live = [str(h) for h in generate_block_hashs(
-                    state.live_source[:-1], self._hash_block_size)]
+            live = state.live_source
             if len(live) > len(state.block_hashes):
                 state.block_hashes.extend(live[len(state.block_hashes):])
         old_progress = max(state.num_computed_tokens,
@@ -392,15 +373,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
-        if self._block_hash_source == "vllm":
-            block_hashes = list(request.block_hashes)
-        else:
-            block_hashes = [str(h) for h in generate_block_hashs(
-                request.all_token_ids[:-1], self._hash_block_size)]
+        block_hashes = list(request.block_hashes)
         self._req_states[request.request_id] = ReqState(
-            live_source=(request.block_hashes
-                         if self._block_hash_source == "vllm"
-                         else request.all_token_ids),
+            live_source=request.block_hashes,
             block_hashes=list(block_hashes),
             num_computed_tokens=num_computed_tokens,
             groups=tuple(ReqGroupState() for _ in self._groups),
