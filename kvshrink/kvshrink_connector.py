@@ -481,8 +481,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         group_ops = []
         for g_idx, group in enumerate(self._groups):
             ids = state.groups[g_idx].block_ids
-            if not ids:
-                continue
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
             if group.kind == "attention":
@@ -491,7 +489,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     keys.extend(CacheKey(state.block_hashes[i],
                                          group.group_idx, layer_name)
                                 for i in range(num_hash))
-                    gpu_ids.extend(ids[:num_hash])
+                    gpu_ids.extend(ids[i] for i in range(num_hash))
             elif group.kind == "mamba":
                 if state.block_hashes and boundary > 0:
                     idx = boundary // group.block_size - 1
