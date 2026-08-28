@@ -316,8 +316,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # divisible by it). Single group -> that group's block size.
         self._hash_block_size = math.gcd(*(g.block_size for g in groups))
 
-        # Fail-closed: speculative decoding widens the GDN state
-        # gate beyond what this path was verified for.
+        # Fail-closed: spec decode moves the GDN running state into
+        # per-draft speculative blocks; the boundary block is committed
+        # only on acceptance, so a snapshot would persist a draft
+        # intermediate state (kvshrink-hybrid.md §5.4).
         for g in groups:
             if g.kind == "mamba" and g.spec.num_speculative_blocks:
                 raise RuntimeError(
