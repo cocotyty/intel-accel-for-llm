@@ -486,14 +486,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
             if group.kind == "attention":
-                gran = group.block_size
-                num_hash = boundary // gran
-                for i in range(num_hash):
-                    blk_hash = state.block_hashes[i]
-                    key = CacheKey(blk_hash, group.group_idx, "")
-                    for layer_name in group.layer_names:
-                        keys.append(replace(key, layer_name=layer_name))
-                        gpu_ids.append(ids[i])
+                num_hash = boundary // group.block_size
+                for layer_name in group.layer_names:
+                    keys.extend(CacheKey(state.block_hashes[i],
+                                         group.group_idx, layer_name)
+                                for i in range(num_hash))
+                    gpu_ids.extend(ids[:num_hash])
             elif group.kind == "mamba":
                 if state.block_hashes and boundary > 0:
                     idx = boundary // group.block_size - 1
