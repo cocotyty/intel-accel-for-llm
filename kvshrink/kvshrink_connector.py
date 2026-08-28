@@ -1972,8 +1972,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # attention layers arrive in separate runs. We recover the order
         # the way vLLM's own ``bind_kv_cache`` does, from the layer
         # index in the layer name.
-        self.register(kv_caches,
-                      sorted(kv_caches, key=extract_layer_index))
+        self.register(sorted(kv_caches, key=extract_layer_index))
 
         # The store binds the RAW kv_caches directly: single-tensor
         # attention pools pass through; mamba lists collapse into one
