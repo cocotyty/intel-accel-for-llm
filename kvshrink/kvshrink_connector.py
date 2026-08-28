@@ -384,9 +384,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._async_load_pending: set[str] = set()
 
         self._pending_load_tasks: dict[str, dict[str, Task]] = {}
-        self._gated_keys: dict[str, frozenset[str]] = {}
+        self._pending_load_layers: dict[str, int] = {}
         self._early_promoted_tasks: dict[str, dict[str, Task]] = {}
         self._active_promoted_tasks: dict[str, dict[str, Task]] = {}
+        self._current_get_tasks: Optional[dict[str, Task]] = None
+        self._last_layer_name: Optional[str] = None
         self._current_put_tasks: dict[str, list[dict[str, Task]]] = {}
         self._deferred_finished_req_ids: set[str] = set()
 
@@ -1032,6 +1034,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 segments[ln] = tuple(pending)
                 pending = []
         self._mamba_save_segments = segments
+        self._last_layer_name = self._attn_order[-1] if self._attn_order else None
         logger.info(
             "kvshrink hybrid worker registered: %d attention "
             "hook points, %d recurrent layers (tp=%d rank=%d)",
@@ -1047,21 +1050,26 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 "KVShrinkConnectorMetadata")
         return metadata
 
-    def _wait_load(self, tasks: dict[str, Task]) -> None:
-        """Host-block until these reads land; an incomplete transfer is
-        fatal -- forward is about to read these blocks."""
-        if tasks and not self.kvstore.get_wait(get_results=tasks,
-                                               wait=True):
-            raise RuntimeError(
-                "kvshrink load failed: get_wait reported an incomplete "
-                "transfer; forward would read unrestored blocks")
-
     def start_load_kv(
         self,
         forward_context: "ForwardContext",
         **kwargs: Any,
     ) -> None:
-        self.start_load(self._metadata())
+        metadata = self._metadata()
+
+        if forward_context.attn_metadata is not None:
+            duplicates = (
+                self._active_promoted_tasks.keys()
+                & self._early_promoted_tasks.keys()
+            )
+            if duplicates:
+                raise RuntimeError(
+                    f"Duplicate promoted load tasks for requests {duplicates}"
+                )
+            self._active_promoted_tasks.update(self._early_promoted_tasks)
+            self._early_promoted_tasks = {}
+
+        self.start_load(metadata)
 
     def start_load(self, metadata: KVShrinkConnectorMetadata) -> int:
         """Submit ALL of this step's loads, then host-block on the GDN
@@ -1069,7 +1077,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         entry to each of them, so their pages are waited for exactly
         when they are about to be read.
         """
-        self._load_tasks = {}
+        self._current_get_tasks = None
         self._saved_layers = set()
         self._step_save_pages = 0
         npages = 0
@@ -1084,7 +1092,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     t, n = self._submit_group_load(op)
                     tasks.update(t)
                     npages += n
-                self._register_async_load(req_id, req_meta, tasks)
+                if tasks:
+                    self._pending_load_tasks[req_id] = tasks
+                    self._pending_load_layers[req_id] = (
+                        req_meta.async_load_layers)
             else:
                 for op in req_meta.group_ops:
                     if not op.keys:
@@ -1093,16 +1104,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         op.group_idx, ([], set()))
                     entries.extend(self._op_entries(op))
                     layers.update(key.layer_name for key in op.keys)
+        merged: dict[str, Task] = {}
         for g_idx, (entries, layers) in by_group.items():
             tasks, n = self._submit_group_load_entries(
                 g_idx, entries, layers)
-            self._load_tasks.update(tasks)
+            merged.update(tasks)
             npages += n
-        recurrent = {k: self._load_tasks.pop(k)
-                     for k in list(self._load_tasks)
-                     if k.rsplit("#", 1)[0] in self._mamba_layers}
+        if merged:
+            self._current_get_tasks = merged
+        recurrent = [ln for ln in merged if ln in self._mamba_layers]
         if recurrent:
-            self._wait_load(recurrent)
+            if not self.kvstore.get_wait(
+                    get_results=merged, layer_names=recurrent, wait=True):
+                raise RuntimeError(
+                    "kvshrink load failed: recurrent pages did not land; "
+                    "forward would read unrestored state")
         if npages:
             logger.info(
                 "start_load_kv: %d pages loaded "
@@ -1110,54 +1126,33 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 (time.monotonic() - _t0) * 1e3, self._rank, self.tp_size)
         return npages
 
-    def _register_async_load(
-        self, req_id: str, req_meta: ReqMeta,
-        tasks: dict[str, Task],
-    ) -> None:
-        """Track one request's cross-step load and compute its release
-        gate.
-        """
-        if not tasks:
-            return
-        layers = {k.rsplit("#", 1)[0] for k in tasks}
-        recurrent = layers - self._attn_layer_group.keys()
-        n = req_meta.async_load_layers
-        if n is None or n < 0:
-            gate = layers
-        else:
-            prefix = [ln for ln in self._attn_order if ln in layers][:n]
-            gate = recurrent | set(prefix)
-        self._pending_load_tasks[req_id] = dict(tasks)
-        self._gated_keys[req_id] = frozenset(
-            k for k in tasks if k.rsplit("#", 1)[0] in gate)
-        if os.getenv("KVSHRINK_DEBUG_LOG"):
-            logger.info(
-                "async load req=%s layers=%d gate=%d (recurrent=%d) "
-                "requested_prefix=%s", req_id, len(layers), len(gate),
-                len(recurrent), n)
-
     def wait_for_layer_load(self, layer_name: str) -> None:
-        self.wait_layer_load(layer_name)
+        if not self._current_get_tasks and not self._active_promoted_tasks:
+            return
 
-    def wait_layer_load(self, layer_name: str) -> None:
-        """Attention-layer entry hook: wait this layer's pages."""
-        keys = [k for k in self._load_tasks
-                if k.rsplit("#", 1)[0] == layer_name]
-        if keys:
-            self._wait_load({k: self._load_tasks.pop(k) for k in keys})
-        books = [self._early_promoted_tasks, self._active_promoted_tasks]
-        for book in books:
-            for req_id, tasks in list(book.items()):
-                sel = {k: t for k, t in tasks.items()
-                       if k.rsplit("#", 1)[0] == layer_name}
-                if sel:
-                    self._wait_load(sel)
-                    for k in sel:
-                        del tasks[k]
-                if not tasks:
-                    book.pop(req_id, None)
-        self._early_promoted_tasks = {
-            r: t for r, t in self._early_promoted_tasks.items() if t}
+        if self._current_get_tasks:
+            success = self.kvstore.get_wait(
+                get_results=self._current_get_tasks,
+                layer_names=[layer_name],
+            )
+            if not success:
+                raise RuntimeError(
+                    f"Failed to load KV cache for layer {layer_name}"
+                )
+
+        for tasks in self._active_promoted_tasks.values():
+            success = self.kvstore.get_wait(
+                get_results=tasks,
+                layer_names=[layer_name],
+            )
+            if not success:
+                raise RuntimeError(
+                    f"Failed to load promoted KV cache for layer {layer_name}"
+                )
+
+        if layer_name == self._last_layer_name:
+            self._current_get_tasks = None
+            self._active_promoted_tasks = {}
 
     @staticmethod
     def _op_entries(op: GroupTransferMeta) -> list[tuple[int, str]]:
@@ -1348,35 +1343,43 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return None, None
 
         finished_recving: set[str] = set()
-        for req_id, tasks in list(self._pending_load_tasks.items()):
-            gated = {k: t for k, t in tasks.items()
-                     if k in self._gated_keys[req_id]}
-            if gated and not self.kvstore.get_wait(get_results=gated,
-                                                   wait=False):
-                continue
-            self._wait_load(gated)
-            finished_recving.add(req_id)
-            if not (tasks_remaining := {
-                    k: t for k, t in tasks.items() if k not in gated}):
+        for req_id in list(self._pending_load_tasks.keys()):
+            tasks = self._pending_load_tasks[req_id]
+            async_load_layers = self._pending_load_layers[req_id]
+            if async_load_layers == -1:
+                gate_layers = None
+            else:
+                gate_layers = (
+                    [ln for ln in tasks if ln in self._mamba_layers]
+                    + [ln for ln in self._attn_order
+                       if ln in tasks][:async_load_layers])
+                if not gate_layers:
+                    gate_layers = None
+            if self.kvstore.get_wait(get_results=tasks,
+                                     layer_names=gate_layers,
+                                     wait=False):
+                self.kvstore.get_wait(get_results=tasks,
+                                      layer_names=gate_layers,
+                                      wait=True)
                 del self._pending_load_tasks[req_id]
-                del self._gated_keys[req_id]
-                continue
-            self._early_promoted_tasks[req_id] = tasks_remaining
-            del self._pending_load_tasks[req_id]
-            del self._gated_keys[req_id]
+                del self._pending_load_layers[req_id]
+                if gate_layers is not None:
+                    self._early_promoted_tasks[req_id] = tasks
+                finished_recving.add(req_id)
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
         for req_id in self._deferred_finished_req_ids:
-            load_tasks = (self._pending_load_tasks.pop(req_id, None)
+            load_tasks = (self._pending_load_tasks.get(req_id)
                           or self._early_promoted_tasks.get(req_id)
                           or self._active_promoted_tasks.get(req_id))
-            self._gated_keys.pop(req_id, None)
             if load_tasks is not None:
                 if not self.kvstore.get_wait(get_results=load_tasks,
                                              wait=False):
                     continue
-                self._wait_load(load_tasks)
+                self.kvstore.get_wait(get_results=load_tasks, wait=True)
+                self._pending_load_tasks.pop(req_id, None)
+                self._pending_load_layers.pop(req_id, None)
                 self._early_promoted_tasks.pop(req_id, None)
                 self._active_promoted_tasks.pop(req_id, None)
 
