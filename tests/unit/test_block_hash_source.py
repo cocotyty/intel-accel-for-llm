@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import pytest
 
-from kvshrink.kvshrink_connector import KVShrinkConnector
+from kvshrink.kvshrink_connector import choose_block_hash_source
 from conftest import make_spec
 from kvshrink.kvshrink_connector import GroupInfo
 from conftest import HybridRequestScheduler
 
-_pick = KVShrinkConnector._choose_block_hash_source
+_pick = choose_block_hash_source
 
 
 def _group(kind):
