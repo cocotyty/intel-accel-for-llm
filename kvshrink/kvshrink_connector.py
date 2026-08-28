@@ -493,9 +493,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         break
                     blk_hash = state.block_hashes[i]
                     key = CacheKey(blk_hash, group.group_idx, "")
-                    if not self._store().has(
-                            [key.hash_str], label=f"g{key.group_idx}")[0]:
-                        break
                     if i < len(ids):
                         for layer_name in group.layer_names:
                             keys.append(replace(key, layer_name=layer_name))
@@ -506,34 +503,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     if 0 <= idx < len(state.block_hashes):
                         blk_hash = state.block_hashes[idx]
                         key = CacheKey(blk_hash, group.group_idx, "")
-                        if self._store().has([key.hash_str],
-                                             label=f"g{key.group_idx}")[0]:
-                            bs = group.block_size
-                            curr_idx = (boundary + scheduled_tokens -
-                                        1) // bs
+                        bs = group.block_size
+                        curr_idx = (boundary + scheduled_tokens -
+                                    1) // bs
 
-                            if scheduled_tokens <= 0 and not state.is_async:
-                                raise RuntimeError(
-                                    "kvshrink mamba external HIT with "
-                                    "scheduled_tokens=0 "
-                                    f"(req={req_id} boundary={boundary}): "
-                                    "production hits must schedule >= 1 "
-                                    "token; refusing to build load meta")
-                            if not (0 <= curr_idx < len(ids)
-                                    and ids[curr_idx] != 0):
-                                raise RuntimeError(
-                                    "kvshrink mamba load curr slot "
-                                    f"invalid (req={req_id} "
-                                    f"boundary={boundary} "
-                                    f"sched={scheduled_tokens} "
-                                    f"table_idx={curr_idx} "
-                                    f"table={ids}): refusing to enter "
-                                    "forward with unrestored state")
-                            gpu_block = ids[curr_idx]
-                            for layer_name in group.layer_names:
-                                keys.append(replace(key,
-                                                    layer_name=layer_name))
-                                gpu_ids.append(gpu_block)
+                        if scheduled_tokens <= 0 and not state.is_async:
+                            raise RuntimeError(
+                                "kvshrink mamba external HIT with "
+                                "scheduled_tokens=0 "
+                                f"(req={req_id} boundary={boundary}): "
+                                "production hits must schedule >= 1 "
+                                "token; refusing to build load meta")
+                        if not (0 <= curr_idx < len(ids)
+                                and ids[curr_idx] != 0):
+                            raise RuntimeError(
+                                "kvshrink mamba load curr slot "
+                                f"invalid (req={req_id} "
+                                f"boundary={boundary} "
+                                f"sched={scheduled_tokens} "
+                                f"table_idx={curr_idx} "
+                                f"table={ids}): refusing to enter "
+                                "forward with unrestored state")
+                        gpu_block = ids[curr_idx]
+                        for layer_name in group.layer_names:
+                            keys.append(replace(key,
+                                                layer_name=layer_name))
+                            gpu_ids.append(gpu_block)
             group_ops.append(GroupTransferMeta(
                 group_idx=g_idx,
                 keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
@@ -609,13 +604,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_req in scheduler_output.scheduled_new_reqs:
             req_meta = self.build_load_meta(
-                new_req, num_sched.get(new_req.req_id, 0))
+                new_req, num_sched[new_req.req_id])
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.group_ops, req_meta.is_async,
                     req_meta.async_load_layers, req_meta.external_hit_tokens)
             save_meta = self.build_save_meta(
-                new_req.req_id, num_sched.get(new_req.req_id, 0))
+                new_req.req_id, num_sched[new_req.req_id])
             if save_meta.group_ops:
                 meta.reqs_to_save.add_request(
                     new_req.req_id, save_meta.group_ops)
@@ -642,7 +637,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
             req_meta = self.build_resumed_load_meta(
-                req_id, num_sched.get(req_id, 0))
+                req_id, num_sched[req_id])
             if req_meta.external_hit_tokens > 0 or req_meta.group_ops:
                 meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
@@ -655,7 +650,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self.on_cached_request(
                 req_id, new_bids[i], req_id in resumed, ncts[i])
             save_meta = self.build_save_meta(
-                req_id, num_sched.get(req_id, 0))
+                req_id, num_sched[req_id])
             if save_meta.group_ops:
                 meta.reqs_to_save.add_request(req_id,
                                               save_meta.group_ops)
