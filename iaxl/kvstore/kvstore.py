@@ -221,19 +221,23 @@ class KVStore:
             role=role, rank=self.rank, num_workers=self.tp_size
         )
 
-    def _entry_flags(self, layer_names: List[str]) -> List[int]:
+    def _entry_flags(self, layer_names: List[int]) -> List[int]:
         """Per-entry codec bits aligned to the tensors dict order.
 
-        bit0 = compress; bit1 = lossy-trunc. Compression follows the
-        operator's skip-prefix; lossy is structurally refused for
-        opaque (multi-dtype fused) layers no matter what else asks.
+        bit0 = compress; bit1 = lossy-trunc. Both are structurally
+        refused for opaque (multi-dtype fused) layers: their pages are
+        raw bytes with no codec semantics, and a fused page exceeds the
+        zip source capacity anyway. For the rest, compression follows
+        the operator's skip-prefix and lossy follows the env request.
         """
         flags: List[int] = []
         for ln in layer_names:
+            if ln in self._opaque_layers:
+                flags.append(0)
+                continue
             compress = int(self._skip_order.get(ln, len(layer_names))
                            >= self.skip_compression_count)
-            lossy = 0 if ln in self._opaque_layers else self.lossy_trunc
-            flags.append(compress | (lossy << 1))
+            flags.append(compress | (int(self.lossy_trunc) << 1))
         return flags
 
     def put(
