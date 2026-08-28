@@ -265,34 +265,27 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             rank = 0
 
-        block_sizes = sorted({int(g.kv_cache_spec.block_size)
-                              for g in kv_cache_config.kv_cache_groups})
-        hash_block_size = math.gcd(*block_sizes)
-        self._hash_block_size = hash_block_size
-        groups, num_blocks = parse_kv_cache_config(
-            kv_cache_config)
+        groups, _num_blocks = parse_kv_cache_config(kv_cache_config)
+        self._groups = groups
+        self._hash_block_size = math.gcd(*(g.block_size for g in groups))
 
-        for g, parsed in zip(kv_cache_config.kv_cache_groups, groups):
-            if parsed.kind != "mamba":
-                continue
-            spec_blocks = g.kv_cache_spec.num_speculative_blocks
-            if spec_blocks:
+        for g in groups:
+            if g.kind == "mamba" and g.spec.num_speculative_blocks:
                 raise RuntimeError(
                     "kvshrink hybrid: speculative decoding is not "
                     f"supported (group has num_speculative_blocks="
-                    f"{spec_blocks}); the external GDN snapshot only "
-                    "restores the non-speculative state slot. Disable "
-                    "speculative decoding or the KV connector.")
-        self._groups = groups
+                    f"{g.spec.num_speculative_blocks}); the external GDN "
+                    "snapshot only restores the non-speculative state "
+                    "slot. Disable speculative decoding or the KV "
+                    "connector.")
         self._rank = rank
         self._attention_layers = tuple(
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
-        recurrent = any(g.kind == "mamba" for g in groups)
-        self._block_hash_source = choose_block_hash_source(recurrent)
+        self._block_hash_source = choose_block_hash_source(
+            any(g.kind == "mamba" for g in groups))
 
         if role != KVConnectorRole.SCHEDULER:
-            self._labels = [f"g{g.group_idx}" for g in groups]
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
             self._attn_layer_group = {
@@ -300,12 +293,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for ln in g.layer_names}
 
         logger.info(
-            "kvshrink hybrid path enabled (%s role, %d groups, "
-            "hash_block_size=%d, tp=%d rank=%d)",
+            "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
+            "hash_block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            len(groups), hash_block_size, tp_size, rank)
-        logger.info(
-            "kvshrink groups: %s",
+            tp_size, rank, self._hash_block_size,
             [(g.group_idx, g.kind, g.block_size) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
@@ -962,7 +953,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         tasks = self._store().get(block_indices=[gpu for gpu, _ in entries],
                                  block_hashs=[h for _, h in entries],
                                  layer_names=list(layer_names),
-                                 label=self._labels[g_idx])
+                                 label=f"g{g_idx}")
         return tasks, len(entries) * len(layer_names)
 
     def _gather_save_candidates(
@@ -992,7 +983,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self._store().put(block_indices=[gpu for gpu, _ in entries],
                                 block_hashs=[h for _, h in entries],
                                 layer_names=layer_names,
-                                label=self._labels[g_idx])
+                                label=f"g{g_idx}")
 
     def _submit_layers_save(
         self, g_idx: int, layer_names: list[str],
