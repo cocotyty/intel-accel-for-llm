@@ -286,10 +286,18 @@ so there is a single correct target and **`CURR` only** is written.
 If that column is out of range or null there is no second slot to fall
 back on, so it fails stop.
 
-Related guard: `num_speculative_blocks > 0` (speculative decoding) makes
-the kernel gather `1 + num_speculative_blocks` columns while an external
-snapshot only restores the first, so the connector **refuses to start**
-in that configuration rather than restore a partially valid state.
+Related guard: `num_speculative_blocks > 0` (speculative decoding)
+changes the whole addressing model of GDN state blocks, so the connector
+**refuses to start** in that configuration. With spec decode the running
+state lives in a tail region of `num_speculative_blocks` per-request
+blocks that hold per-draft-token intermediate states; the accepted state
+is copied back into the boundary block only when acceptance crosses a
+block boundary (`preprocess_mamba` / `postprocess_mamba_align_gpu`,
+mamba_utils.py), rejected draft states linger in the speculative blocks,
+and the conv half of the GDN state is never written there at all. The
+invariant our save path relies on -- "the last non-null block holds the
+aligned boundary state" -- stops holding, so a snapshot would silently
+persist a draft intermediate state under a boundary hash.
 
 ### 5.5 What gets saved each pass
 
@@ -374,7 +382,7 @@ implemented: **nothing half-written is ever visible to a lookup**.
 | Situation | Response | Why |
 |---|---|---|
 | `mamba_cache_mode != "align"` | refuse to start | no addressable boundary exists; the cache would silently store nothing |
-| `num_speculative_blocks > 0` | refuse to start | the kernel reads more columns than a snapshot restores |
+| `num_speculative_blocks > 0` | refuse to start | spec decode moves the running state into per-draft speculative blocks; the boundary block is only committed on acceptance, so "last non-null block = boundary state" no longer holds |
 | layer index duplicated or unparsable | refuse to start | execution order would be guessed, and the async release gate depends on it |
 | unknown spec, mismatched block sizes, unknown dtype | refuse to start | the page layout would be guessed |
 | boundary missing on any TP rank | MISS | ranks commit independently; a partial commit heals when the request recomputes and re-saves |
