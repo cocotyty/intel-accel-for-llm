@@ -264,6 +264,18 @@ def parse_kv_cache_config(
             "and cannot express that")
     return groups, num_blocks
 
+def choose_block_hash_source(recurrent: bool) -> str:
+    """Which block-identity scheme keys the cache: vLLM block hashes
+    (default for recurrent models) or the legacy token-hash fallback."""
+    choice = (os.getenv("KVSHRINK_BLOCK_HASH_SOURCE") or "auto").lower()
+    if choice == "auto":
+        return "vllm" if recurrent else "legacy"
+    if choice not in ("vllm", "legacy"):
+        raise ValueError(
+            "KVSHRINK_BLOCK_HASH_SOURCE must be auto, vllm or "
+            f"legacy; got {choice!r}")
+    return choice
+
 def save_enabled() -> bool:
     """Production save is ON by default; KVSHRINK_SAVE=0 disables it and
     KVSHRINK_DEBUG_AUTOSAVE=1 force-enables it."""
@@ -460,7 +472,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
         recurrent = any(g.kind == "mamba" for g in groups)
-        self._block_hash_source = self._choose_block_hash_source(recurrent)
+        self._block_hash_source = choose_block_hash_source(recurrent)
 
         if role != KVConnectorRole.SCHEDULER:
             self._labels = [group_label(g.group_idx) for g in groups]
@@ -478,19 +490,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info(
             "kvshrink groups: %s",
             [(g.group_idx, g.kind, g.block_size) for g in groups])
-
-    @staticmethod
-    def _choose_block_hash_source(recurrent: bool) -> str:
-        """Which block-identity scheme keys the cache: vLLM block
-        # hashes (default) or the legacy token-hash fallback."""
-        choice = (os.getenv("KVSHRINK_BLOCK_HASH_SOURCE") or "auto").lower()
-        if choice == "auto":
-            return "vllm" if recurrent else "legacy"
-        if choice not in ("vllm", "legacy"):
-            raise ValueError(
-                "KVSHRINK_BLOCK_HASH_SOURCE must be auto, vllm or "
-                f"legacy; got {choice!r}")
-        return choice
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
@@ -567,28 +566,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 ReqGroupState() for _ in self._groups),
         )
 
-    def take_async_load_plans(
-        self, already_emitted: set[str]
-    ) -> dict[str, ReqMeta]:
-        """Load plans for requests vLLM parked, drained exactly once."""
-        plans = {}
-        for req_id in sorted(self._async_load_pending - already_emitted):
-            state = self._req_states[req_id]
-            meta = self._build_load_meta_from_state(
-                req_id, state, scheduled_tokens=0)
-            state.async_plan_emitted = True
-            state.is_async = False
-            if meta is not None and meta.group_ops:
-                plans[req_id] = meta
-            else:
-                logger.warning(
-                    "async req=%s has no restorable pages; dropping the "
-                    "plan so it is recomputed rather than left waiting",
-                    req_id)
-        self._async_load_pending -= (self._async_load_pending
-                                     - already_emitted)
-        return plans
-
     def _request_block_hashes(self, request: "Request") -> list[Any]:
         """This request's block identities, in block order."""
         if self._block_hash_source == "vllm":
@@ -596,13 +573,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         tokens = request.all_token_ids
         return [str(h) for h in generate_block_hashs(
             tokens[:-1], self._hash_block_size)]
-
-    def on_request_finished(self, req_id: str) -> None:
-        """vLLM trigger: core frees the request ->
-        connector.request_finished -> here. Drop the ReqState;
-        committed boundaries are content-addressed and stay."""
-        self._req_states.pop(req_id, None)
-        self._async_load_pending.discard(req_id)
 
     def on_cached_request(
         self, req_id: str, new_block_ids: tuple[list[int], ...],
@@ -662,8 +632,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             request.request_id, block_hashes,
             num_computed_tokens, request=request)
         policy = HybridHitPolicy(
-            self._groups, self._present, self._hash_block_size,
-            num_computed_tokens)
+            self._groups,
+            lambda g, h: lookup_boundary(
+                self.kvstore, make_boundary_key(g, h)),
+            self._hash_block_size, num_computed_tokens)
         boundary = policy.find_longest_cache_hit(
             block_hashes, request.num_tokens)
         state = self._req_states[request.request_id]
@@ -672,29 +644,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             boundary = 0
         external = max(0, boundary - num_computed_tokens)
-        use_async = self._decide_async(request.request_id, external)
+        use_async = external > 0 and self._async_load_layer_config is not None
+        if use_async:
+            selected = self._async_load_layer_config.select(
+                len(self._req_states))
+            use_async = selected != 0
+        if use_async:
+            state.is_async = True
+            if selected < 0 or selected > len(self._attention_layers):
+                state.async_load_layers = -1
+            else:
+                state.async_load_layers = selected
         logger.debug(
             "req=%s external_hit=%d boundary=%d async=%s",
             request.request_id, external, boundary, use_async)
         return external, use_async
-
-    def _decide_async(self, req_id: str, external: int) -> bool:
-        """Async when there are external tokens to stream and the
-        # concurrency-tuned layer count is nonzero. The gate always
-        # covers every recurrent layer regardless of that count."""
-        if external <= 0 or self._async_load_layer_config is None:
-            return False
-        state = self._req_states[req_id]
-        selected = self._async_load_layer_config.select(
-            len(self._req_states))
-        if selected == 0:
-            return False
-        state.is_async = True
-        if selected < 0 or selected > len(self._attention_layers):
-            state.async_load_layers = -1
-        else:
-            state.async_load_layers = selected
-        return True
 
     def update_state_after_alloc(
         self,
@@ -734,7 +698,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        self.on_request_finished(request.request_id)
+        self._req_states.pop(request.request_id, None)
+        self._async_load_pending.discard(request.request_id)
         return True, None
 
     def request_finished_all_groups(
@@ -948,8 +913,20 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     meta.reqs_to_save.add_request(
                         new_req.req_id, save_meta.group_ops)
 
-        for req_id, req_meta in self.take_async_load_plans(
-                set(meta.reqs_to_load.requests)).items():
+        pending = sorted(self._async_load_pending
+                         - set(meta.reqs_to_load.requests))
+        for req_id in pending:
+            state = self._req_states[req_id]
+            req_meta = self._build_load_meta_from_state(
+                req_id, state, scheduled_tokens=0)
+            state.async_plan_emitted = True
+            state.is_async = False
+            if req_meta is None or not req_meta.group_ops:
+                logger.warning(
+                    "async req=%s has no restorable pages; dropping the "
+                    "plan so it is recomputed rather than left waiting",
+                    req_id)
+                continue
             if debug:
                 logger.info(
                     "LOADMETA(async) req=%s ops=%d layers=%s",
@@ -958,6 +935,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             meta.reqs_to_load.add_request(
                 req_id, req_meta.group_ops, req_meta.is_async,
                 req_meta.async_load_layers, req_meta.external_hit_tokens)
+        self._async_load_pending -= set(pending)
 
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
@@ -995,13 +973,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def _boundary_key(self, group: GroupInfo, block_hash: object) -> CacheKey:
         """Boundary key for one group at one block hash."""
         return make_boundary_key(group.group_idx, block_hash)
-
-    def _present(self, group_idx: int, block_hash: object) -> bool:
-        """Store-presence predicate handed to the hit policy, which
-        plans against boundary addresses without seeing store details."""
-        return lookup_boundary(
-            self.kvstore,
-            make_boundary_key(group_idx, block_hash))
 
     @staticmethod
     def _page_key(boundary_key: CacheKey, layer_name: str) -> CacheKey:
@@ -1065,21 +1036,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             len(self._attn_order),
             len(self._mamba_layers), self.tp_size, self._rank)
 
-    def _metadata(self) -> KVShrinkConnectorMetadata:
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, KVShrinkConnectorMetadata):
-            raise TypeError(
-                "kvshrink hybrid worker received "
-                f"{type(metadata).__name__}; expected "
-                "KVShrinkConnectorMetadata")
-        return metadata
-
     def start_load_kv(
         self,
         forward_context: "ForwardContext",
         **kwargs: Any,
     ) -> None:
-        metadata = self._metadata()
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, KVShrinkConnectorMetadata):
+            raise TypeError("Unexpected connector metadata")
 
         if forward_context.attn_metadata is not None:
             duplicates = (
@@ -1111,7 +1075,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for op in req_meta.group_ops:
                     if not op.keys:
                         continue
-                    t, n = self._submit_group_load(op)
+                    t, n = self._submit_group_load_entries(
+                        op.group_idx, self._op_entries(op),
+                        {key.layer_name for key in op.keys})
                     tasks.update(t)
                     npages += n
                 if tasks:
@@ -1184,15 +1150,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for key, gpu in zip(op.keys, op.gpu_block_ids):
             seen.setdefault(key.hash_str, gpu)
         return [(gpu, h) for h, gpu in seen.items()]
-
-    def _submit_group_load(
-        self, op: GroupTransferMeta
-    ) -> tuple[dict[str, Task], int]:
-        """Submit one GroupTransferMeta as one engine get; returns the
-        flat tasks dict and the page count."""
-        return self._submit_group_load_entries(
-            op.group_idx, self._op_entries(op),
-            {key.layer_name for key in op.keys})
 
     def _submit_group_load_entries(
         self, g_idx: int, entries: list[tuple[int, str]],
@@ -1279,7 +1236,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return
         if not save_enabled():
             return
-        metadata = self._metadata()
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, KVShrinkConnectorMetadata):
+            raise TypeError("Unexpected connector metadata")
         segment = self._mamba_save_segments.get(layer_name)
         if segment:
             by_group: dict[int, list[str]] = {}
@@ -1296,7 +1255,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         if not save_enabled():
             return
-        metadata = self._metadata()
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, KVShrinkConnectorMetadata):
+            raise TypeError("Unexpected connector metadata")
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info("wait_for_save worker: reqs_to_save=%d",
                         len(metadata.reqs_to_save.requests))
@@ -1304,7 +1265,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if os.getenv("KVSHRINK_DEBUG_LOG"):
             logger.info("chunk_save: %d pages, %d boundaries",
                         pages, boundaries)
-        self.debug_dump_state()
+        if os.getenv("KVSHRINK_DEBUG_DUMP"):
+            for group in self._groups:
+                if group.kind != "mamba":
+                    continue
+                for blk in range(10):
+                    page = self._store().kv_caches[group.layer_names[0]][blk]
+                    h = hashlib.sha256(
+                        page.cpu().numpy().tobytes()).hexdigest()
+                    logger.info("DUMP g%d block=%d sha=%s",
+                                group.group_idx, blk, h[:16])
 
     def submit_saves(
         self, metadata: KVShrinkConnectorMetadata
@@ -1412,20 +1382,3 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._deferred_finished_req_ids.difference_update(completed)
         return (completed or None), (finished_recving or None)
 
-    def debug_dump_state(self) -> None:
-        """KVSHRINK_DEBUG_DUMP=1: log sha256 of the first layer page of
-        every mamba group at gpu blocks 0..9, so cold-vs-hot GPU states
-        can be compared byte-exactly."""
-        if not os.getenv("KVSHRINK_DEBUG_DUMP"):
-            return
-        for group in self._groups:
-            if group.kind != "mamba":
-                continue
-            ln = group.layer_names[0]
-            page_view = self._store().kv_caches[ln]
-            for blk in range(10):
-                page = page_view[blk]
-                h = hashlib.sha256(
-                    page.cpu().numpy().tobytes()).hexdigest()
-                logger.info("DUMP g%d block=%d sha=%s",
-                            group.group_idx, blk, h[:16])
