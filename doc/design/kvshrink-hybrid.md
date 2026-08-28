@@ -396,6 +396,18 @@ implemented: **nothing half-written is ever visible to a lookup**.
 
 ## 8. Reproducible block hashes
 
+Block identity is **always the engine's own `request.block_hashes`** --
+there is no recomputation from token ids. Boundary addressing requires
+that "hash i names block i" hold across EVERY cache group, and the block
+granularity is vLLM's aligned one (the gcd of the groups' block sizes,
+v0.23 `resolve_kv_cache_block_sizes`). Recomputing hashes from tokens
+would mean replicating vLLM's chaining bit for bit (parent hash,
+`extra_keys`, cache salt); any deviation is a silent false hit, the
+failure mode this design refuses above all others. Taking the engine's
+hashes makes the correspondence the engine's own guarantee. The cost is
+that the key derivation is vLLM's: a vLLM upgrade that changes it
+renames every key (a cold cache, not a corrupt one).
+
 vLLM seeds its first block hash from `PYTHONHASHSEED` and **randomises
 it when unset**, so a restart would change every key and miss
 everything. `setvars.sh` and `tests/gpu/lib.sh` both pin
