@@ -586,9 +586,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         boundary = state.snapshot_boundary
         group_ops = []
         for g_idx, group in enumerate(self._groups):
+            # The group table is always populated by alloc before
+            # scheduling; boundary == 0 makes the body a no-op, and a
+            # missing table with boundary > 0 is a bug that must index
+            # out of range loudly below, not skip silently.
             ids = state.groups[g_idx].block_ids
-            if not ids:
-                continue
             keys: list[CacheKey] = []
             gpu_ids: list[int] = []
             if group.kind == "attention":
@@ -602,7 +604,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     keys.extend(CacheKey(state.block_hashes[i],
                                          group.group_idx, layer_name)
                                 for i in range(num_hash))
-                    gpu_ids.extend(ids[:num_hash])
+                    gpu_ids.extend(ids[i] for i in range(num_hash))
             elif group.kind == "mamba":
                 # Load the snapshot into the CURR state block only
                 # (v0.23 align mode pins execution to column 0 = the
