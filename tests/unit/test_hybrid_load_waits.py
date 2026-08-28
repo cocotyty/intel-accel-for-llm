@@ -50,9 +50,9 @@ class _FakeStore:
         self.submitted.extend(layer_names)
         return {k: f"task:{k}" for k in layer_names}
 
-    def get_wait(self, get_results, wait=True):
-        for k in get_results:
-            self.waited.append(k.rsplit("#", 1)[0])
+    def get_wait(self, get_results, layer_names=None, wait=True):
+        for k in (layer_names or get_results.keys()):
+            self.waited.append(k)
         return True
 
     def has(self, chunk_labels, label=None):
@@ -73,16 +73,9 @@ def _worker(store=None, order=ORDER, gdn=None):
     groups = [_group(0, "attention", attn),
               _group(1, "mamba", gdn if gdn is not None
                      else [ln for ln in order if ln in GDN])]
-    layer_infos = {ln: None for ln in order}
-    w = HybridWorker(groups, layer_infos, rank=0, tp_size=1)
+    w = HybridWorker(groups, {ln: None for ln in order},
+                     rank=0, tp_size=1)
     w.kvstore = store or _FakeStore()
-    w._num_blocks = 2
-    # Placeholder kv_caches: single-tensor attention pools; two-part
-    # mamba pools so the raw-parts mapping sees both shapes.
-    import torch
-    kv_caches = {ln: (torch.zeros(2, 3), torch.zeros(2, 5))
-                 if ln in (gdn or GDN) else torch.zeros(2, 8)
-                 for ln in order}
     w.register(order)
     return w
 
@@ -127,7 +120,8 @@ def test_every_recurrent_layer_is_waited_before_forward():
     w.start_load(_load_meta(GDN, 1))
     assert sorted(be.submitted) == sorted(GDN)
     assert sorted(be.waited) == sorted(GDN), be.waited
-    assert w._load_tasks == {}
+    # the batch stays open until the last attention hook (main's rule)
+    assert set(w._current_get_tasks) == set(GDN)
 
 
 def test_attention_pages_stay_pipelined():
@@ -142,9 +136,9 @@ def test_attention_pages_stay_pipelined():
     # GDN waited already; no attention layer has been waited yet
     assert sorted(be.waited) == sorted(GDN), be.waited
 
-    w.wait_layer_load("a1")
+    w.wait_for_layer_load("a1")
     assert be.waited[-1] == "a1"
-    w.wait_layer_load("a4")
+    w.wait_for_layer_load("a4")
     assert be.waited[-1] == "a4"
 
 
@@ -153,7 +147,7 @@ def test_failed_blocking_wait_raises():
     dies), same contract as the original path."""
     be = _FakeStore()
 
-    def _boom(get_results, wait=True):
+    def _boom(get_results, layer_names=None, wait=True):
         raise RuntimeError("h2d failed")
 
     be.get_wait = _boom
