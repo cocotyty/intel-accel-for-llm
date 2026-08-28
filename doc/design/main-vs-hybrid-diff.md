@@ -248,6 +248,14 @@ scheduled_tokens 只在 build_connector_meta 从 scheduler_output 拿得
 build_connector_meta 单趟组装——main 的 build_connector_meta 是搬运
 工，我们的是装配车间，差异不在风格而在信息到达的时刻。
 
+同理，装配阶段**不再重新验证边界/存在性**：
+update_state_after_alloc 接受 num_external_tokens 那一刻，调度器已
+按"这些 token 由外部恢复"提交了后续全部形状计算，木已成舟；此时
+重查既不能也不应改变任何决策。存在性由 lookup 时的命中策略一次性
+钉死，committed 条目只增不删，万一真有 key 消失，引擎层
+unzip_from_mem 会 raise（fail-stop 保留，只是换在更底层的自然位
+置）。
+
 ## 3.3 增量保存游标及其回滚：main 不需要的概念
 
 **main 怎么做**：每个请求维护 `num_seen_blocks` 计数；保存候选 =
