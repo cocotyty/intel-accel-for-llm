@@ -102,7 +102,7 @@ static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
 
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
                            std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
-                           bool compress) {
+                           bool compress, bool lossy_trunc_enabled) {
     const size_t n = tensors.size();
 
     if (!compress || !envs.IAXL_KV_COMPRESSION) {
@@ -130,7 +130,9 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
                    "kv_zip: tensor must be a contiguous CPU tensor");
         size_t nb = t.numel() * t.element_size();
         char *p = static_cast<char *>(t.data_ptr());
-        lossy_trunc(p, nb, t.element_size());
+        if (lossy_trunc_enabled) {
+            lossy_trunc(p, nb, t.element_size());
+        }
         data_shuffle(p, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
         orig_sizes[i] = nb;
         *data = p;

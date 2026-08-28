@@ -43,22 +43,17 @@ class _FakeStore:
         self.submits = []   # (label, sorted(layers), block_hashs)
         self.waits = 0
 
-    def put(self, block_indices, block_hashs, layer_names, tensors,
+    def put(self, block_indices, block_hashs, layer_names,
             label=None):
-        layers = sorted(k.rsplit("#", 1)[0] for k in tensors)
+        layers = sorted(layer_names)
         self.submits.append((label, layers, list(block_hashs)))
-        return {k: _FakeTask() for k in tensors}
+        return {k: _FakeTask() for k in layer_names}
 
     def put_wait(self, put_results, wait=True):
         self.waits += 1
         for t in put_results.values():
             t.ctx = None
         return True
-
-
-class _FakeCanon:
-    def page_view_parts(self, layer_name):
-        return {"page": layer_name}
 
 
 def _save_meta():
@@ -80,7 +75,7 @@ def _worker():
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"])]
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
-                     _FakeCanon(), rank=0, tp_size=1)
+                     rank=0, tp_size=1)
     w.kvstore = _FakeStore()
     return w
 
@@ -171,7 +166,7 @@ def test_mamba_segment_splits_by_group():
               _group(1, "mamba", ["m0"]),
               _group(2, "mamba", ["m1"])]
     c = HybridWorker(groups, {ln: None for ln in ("a0", "a1", "m0", "m1")},
-                     _FakeCanon(), rank=0, tp_size=1)
+                     rank=0, tp_size=1)
     c.kvstore = _FakeStore()
     c._mamba_save_segments = {"a0": ("m0", "m1")}
     attn_ops = GroupTransferMeta(

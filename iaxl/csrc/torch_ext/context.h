@@ -74,7 +74,8 @@ class Context {
 
     void zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                     const std::vector<std::string> &chunk_labels,
-                    const std::vector<torch::Tensor> &cpu_tensors, bool compress = true);
+                    const std::vector<torch::Tensor> &cpu_tensors, bool compress = true,
+                    bool lossy_trunc_enabled = false);
 
     void unzip_from_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                         const std::vector<std::string> &chunk_labels,
