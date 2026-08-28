@@ -384,7 +384,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._async_load_pending: set[str] = set()
 
         self._pending_load_tasks: dict[str, dict[str, Task]] = {}
-        self._pending_load_layers: dict[str, int] = {}
         self._gated_keys: dict[str, frozenset[str]] = {}
         self._early_promoted_tasks: dict[str, dict[str, Task]] = {}
         self._active_promoted_tasks: dict[str, dict[str, Task]] = {}
@@ -1129,7 +1128,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             prefix = [ln for ln in self._attn_order if ln in layers][:n]
             gate = recurrent | set(prefix)
         self._pending_load_tasks[req_id] = dict(tasks)
-        self._pending_load_layers[req_id] = n if n is not None else -1
         self._gated_keys[req_id] = frozenset(
             k for k in tasks if k.rsplit("#", 1)[0] in gate)
         if os.getenv("KVSHRINK_DEBUG_LOG"):
@@ -1357,17 +1355,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                                    wait=False):
                 continue
             self._wait_load(gated)
-            del self._gated_keys[req_id]
             finished_recving.add(req_id)
             if not (tasks_remaining := {
                     k: t for k, t in tasks.items() if k not in gated}):
                 del self._pending_load_tasks[req_id]
-                del self._pending_load_layers[req_id]
-                self._gated_keys.pop(req_id, None)
+                del self._gated_keys[req_id]
                 continue
             self._early_promoted_tasks[req_id] = tasks_remaining
             del self._pending_load_tasks[req_id]
-            del self._pending_load_layers[req_id]
+            del self._gated_keys[req_id]
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
