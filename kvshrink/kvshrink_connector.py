@@ -332,30 +332,24 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # the rank0 one.
             rank = 0
 
+        groups, _num_blocks = parse_kv_cache_config(kv_cache_config)
+        self._groups = groups
         # Block-hash granularity, per v0.23.0's resolve_kv_cache_block_sizes:
         # the GCD of the groups' block sizes (every group's block size is
         # divisible by it). Single group -> that group's block size.
-        block_sizes = sorted({int(g.kv_cache_spec.block_size)
-                              for g in kv_cache_config.kv_cache_groups})
-        hash_block_size = math.gcd(*block_sizes)
-        self._hash_block_size = hash_block_size
-        groups, num_blocks = parse_kv_cache_config(
-            kv_cache_config)
+        self._hash_block_size = math.gcd(*(g.block_size for g in groups))
 
         # Fail-closed: speculative decoding widens the GDN state
         # gate beyond what this path was verified for.
-        for g, parsed in zip(kv_cache_config.kv_cache_groups, groups):
-            if parsed.kind != "mamba":
-                continue
-            spec_blocks = g.kv_cache_spec.num_speculative_blocks
-            if spec_blocks:
+        for g in groups:
+            if g.kind == "mamba" and g.spec.num_speculative_blocks:
                 raise RuntimeError(
                     "kvshrink hybrid: speculative decoding is not "
                     f"supported (group has num_speculative_blocks="
-                    f"{spec_blocks}); the external GDN snapshot only "
-                    "restores the non-speculative state slot. Disable "
-                    "speculative decoding or the KV connector.")
-        self._groups = groups
+                    f"{g.spec.num_speculative_blocks}); the external GDN "
+                    "snapshot only restores the non-speculative state "
+                    "slot. Disable speculative decoding or the KV "
+                    "connector.")
         # Authoritative TP rank for addressing/labels. Kept separate from
         # self.rank (a world-group read guarded on init order) so
         # rank-sensitive code paths have one stable source.
@@ -367,15 +361,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ln for g in groups if g.kind != "mamba"
             for ln in g.layer_names)
         # A recurrent group changes only which block hashes we ask
-        # about (see _choose_block_hash_source); the storage below is
+        # about (see choose_block_hash_source); the storage below is
         # the same.
-        recurrent = any(g.kind == "mamba" for g in groups)
-        self._block_hash_source = choose_block_hash_source(recurrent)
+        self._block_hash_source = choose_block_hash_source(
+            any(g.kind == "mamba" for g in groups))
 
         if role != KVConnectorRole.SCHEDULER:
-            # One store label per group (see the lookup-vocabulary
-            # section for why groups cannot share one).
-            self._labels = [f"g{g.group_idx}" for g in groups]
             # layer_name -> group idx, every cached layer.
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
@@ -385,12 +376,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for ln in g.layer_names}
 
         logger.info(
-            "kvshrink hybrid path enabled (%s role, %d groups, "
-            "hash_block_size=%d, tp=%d rank=%d)",
+            "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
+            "hash_block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            len(groups), hash_block_size, tp_size, rank)
-        logger.info(
-            "kvshrink groups: %s",
+            tp_size, rank, self._hash_block_size,
             [(g.group_idx, g.kind, g.block_size) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
@@ -1153,7 +1142,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         tasks = self._store().get(block_indices=[gpu for gpu, _ in entries],
                                  block_hashs=[h for _, h in entries],
                                  layer_names=list(layer_names),
-                                 label=self._labels[g_idx])
+                                 label=f"g{g_idx}")
         return tasks, len(entries) * len(layer_names)
 
     # ------------------------------------------------------------------
@@ -1186,7 +1175,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self._store().put(block_indices=[gpu for gpu, _ in entries],
                                 block_hashs=[h for _, h in entries],
                                 layer_names=layer_names,
-                                label=self._labels[g_idx])
+                                label=f"g{g_idx}")
 
 
     def _submit_layers_save(
