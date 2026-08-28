@@ -45,11 +45,10 @@ class _FakeStore:
         self.waited = []             # layer names, in wait order
         self.committed = committed
 
-    def get(self, block_indices, block_hashs, layer_names, tensors,
+    def get(self, block_indices, block_hashs, layer_names,
             label=None):
-        for k in tensors:
-            self.submitted.append(k.rsplit("#", 1)[0])
-        return {k: f"task:{k}" for k in tensors}
+        self.submitted.extend(layer_names)
+        return {k: f"task:{k}" for k in layer_names}
 
     def get_wait(self, get_results, wait=True):
         for k in get_results:
@@ -58,14 +57,6 @@ class _FakeStore:
 
     def has(self, chunk_labels, label=None):
         return [self.committed]
-
-
-class _FakeCanon:
-    def register(self, kv_caches):
-        pass
-
-    def page_view_parts(self, layer_name):
-        return {"page": layer_name}
 
 
 # Execution order: a leading GDN layer, then attention, more GDN, and a
@@ -83,10 +74,16 @@ def _worker(store=None, order=ORDER, gdn=None):
               _group(1, "mamba", gdn if gdn is not None
                      else [ln for ln in order if ln in GDN])]
     layer_infos = {ln: None for ln in order}
-    w = HybridWorker(groups, layer_infos,
-                     _FakeCanon(), rank=0, tp_size=1)
+    w = HybridWorker(groups, layer_infos, rank=0, tp_size=1)
     w.kvstore = store or _FakeStore()
-    w.register({ln: None for ln in order}, order)
+    w._num_blocks = 2
+    # Placeholder kv_caches: single-tensor attention pools; two-part
+    # mamba pools so the raw-parts mapping sees both shapes.
+    import torch
+    kv_caches = {ln: (torch.zeros(2, 3), torch.zeros(2, 5))
+                 if ln in (gdn or GDN) else torch.zeros(2, 8)
+                 for ln in order}
+    w.register(order)
     return w
 
 
@@ -128,7 +125,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
     be = _FakeStore()
     w = _worker(be)
     w.start_load(_load_meta(GDN, 1))
-    assert sorted(be.submitted) == sorted(GDN), be.submitted
+    assert sorted(be.submitted) == sorted(GDN)
     assert sorted(be.waited) == sorted(GDN), be.waited
     assert w._load_tasks == {}
 

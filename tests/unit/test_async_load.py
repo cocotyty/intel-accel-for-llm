@@ -51,7 +51,7 @@ class _FakeStore:
         self.waited: list[str] = []      # layers finalized, in order
         self.fail_on: set[str] = set()
 
-    def get(self, block_indices, block_hashs, layer_names, tensors,
+    def get(self, block_indices, block_hashs, layer_names,
             label=None):
         return {ln: f"task:{ln}" for ln in layer_names}
 
@@ -80,9 +80,9 @@ class _FakeCanon:
 def _worker(store):
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     w = HybridWorker(groups, {ln: None for ln in ORDER},
-                     _FakeCanon(), rank=0, tp_size=1)
+                     rank=0, tp_size=1)
     w.kvstore = store
-    w.register({ln: None for ln in ORDER}, ORDER)
+    w.register(ORDER)
     return w
 
 

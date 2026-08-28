@@ -72,18 +72,18 @@ def HybridRequestScheduler(groups, store, hash_block_size,
     return conn
 
 
-def HybridWorker(groups, layer_infos, canonicalizer,
-                 rank=0, tp_size=1):
+def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     """Worker-side connector instance without the vLLM config stack.
 
-    Same signature shape the pre-merge HybridWorker class had.
+    ``layer_infos`` mirrors what the real register() receives as
+    kv_caches; tests pass {name: None} placeholders (only the key set
+    matters to the part mapping) plus the group descriptors.
     """
     from kvshrink.kvshrink_connector import KVShrinkConnector, group_label
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
     conn._layer_infos = layer_infos
-    conn._canon = canonicalizer
     conn._rank = rank
     conn.tp_size = tp_size
     conn._labels = [group_label(g.group_idx) for g in groups]
@@ -104,6 +104,9 @@ def HybridWorker(groups, layer_infos, canonicalizer,
     conn._current_put_tasks = {}
     conn._deferred_finished_req_ids = set()
     conn._connector_metadata = None
+    # Raw pools: tests fill per-layer part dicts themselves (see the
+    # helpers that call w.register with placeholder kv_caches).
+    conn._raw_pools = {}
     return conn
 
 
