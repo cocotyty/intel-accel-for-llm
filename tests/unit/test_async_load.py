@@ -23,7 +23,7 @@ import pytest
 
 from conftest import HybridWorker, drive_start_load, make_spec
 from kvshrink.kvshrink_connector import (
-    CacheKey, GroupInfo, GroupTransferMeta, KVShrinkConnectorMetadata,
+    GroupInfo, KVShrinkConnectorMetadata,
     ReqMeta, RequestMetadata)
 
 PAGE = 4096
@@ -82,14 +82,10 @@ def _worker(store):
 
 def _meta(async_layers, req_id="r1"):
     """A load plan covering every layer, split per group."""
-    def op(gidx, layers):
-        keys = tuple(CacheKey(block_hash=7, group_idx=gidx,
-                              layer_name=ln) for ln in layers)
-        return GroupTransferMeta(
-            group_idx=gidx, keys=keys, gpu_block_ids=(5,) * len(layers))
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(
-        group_ops=(op(0, ATTN), op(1, GDN)),
+        block_hashes=("7",),
+        group_block_ids=(("5",), ("5",)),
         is_async=True, async_load_layers=async_layers)
     return KVShrinkConnectorMetadata(reqs_to_load=md)
 
@@ -228,7 +224,7 @@ def test_parked_request_still_gets_a_load_plan():
     plans = sched.build_connector_meta(_empty_out()).reqs_to_load.requests
     assert list(plans) == ["r1"], (
         "the parked request got no load plan -- it would hang")
-    assert plans["r1"].is_async and plans["r1"].group_ops
+    assert plans["r1"].is_async and any(plans["r1"].group_block_ids)
 
 
 def test_async_plan_is_emitted_only_once():

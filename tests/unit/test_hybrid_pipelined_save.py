@@ -12,20 +12,14 @@ store and fake canonicalizer -- no GPU, no disk, no model.
 
 from conftest import HybridWorker, make_spec
 from kvshrink.kvshrink_connector import (
-    KVShrinkConnectorMetadata,
-    RequestMetadata,
-    CacheKey, GroupInfo, GroupTransferMeta, ReqMeta)
+    KVShrinkConnectorMetadata, RequestMetadata,
+    GroupInfo, ReqMeta)
 
 
 def _group(g_idx, kind, layers):
     return GroupInfo(group_idx=g_idx, kind=kind,
                      layer_names=tuple(layers), block_size=16,
                      mamba_align_size=None, spec=make_spec(kind, 16))
-
-
-def _key(layer_name, blk_hash=777, g_idx=0):
-    return CacheKey(block_hash=blk_hash, group_idx=g_idx,
-                    layer_name=layer_name)
 
 
 class _FakeTask:
@@ -56,17 +50,11 @@ class _FakeStore:
 
 
 def _save_meta():
-    """One attention boundary (2 layers) + one mamba boundary."""
-    attn_ops = GroupTransferMeta(
-        group_idx=0,
-        keys=tuple(_key(ln) for ln in ("a0", "a1")),
-        gpu_block_ids=(10, 10))
-    mamba_ops = GroupTransferMeta(
-        group_idx=1,
-        keys=(_key("m0", blk_hash=888, g_idx=1),),
-        gpu_block_ids=(20,))
+    """One attention boundary (2 layers) + one mamba boundary, both at
+    hash 777 -- a boundary is one hash shared by every group."""
     saves = RequestMetadata()
-    saves.requests["r1"] = ReqMeta(group_ops=(attn_ops, mamba_ops))
+    saves.requests["r1"] = ReqMeta(
+        block_hashes=("777",), group_block_ids=(("10",), ("20",)))
     return KVShrinkConnectorMetadata(reqs_to_save=saves)
 
 
@@ -76,6 +64,7 @@ def _worker():
     w = HybridWorker(groups, {"a0": None, "a1": None, "m0": None},
                      rank=0, tp_size=1)
     w.kvstore = _FakeStore()
+    w.register(["a0", "a1", "m0"])
     return w
 
 
@@ -112,8 +101,9 @@ def test_fallback_when_hook_never_fired():
     c = _worker()
     _pages, nbound = c.submit_saves(_save_meta())  # no save_kv_layer first
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
-    # the group's unhooked layers go out in ONE post-forward call
-    assert ["a0", "a1"] in submit_layers
+    # every layer goes out in its own post-forward call
+    assert ["a0"] in submit_layers
+    assert ["a1"] in submit_layers
     assert ["m0"] in submit_layers
     assert nbound == 2
 
@@ -145,18 +135,10 @@ def test_mamba_segment_splits_by_group():
                      rank=0, tp_size=1)
     c.kvstore = _FakeStore()
     c._mamba_save_segments = {"a0": ("m0", "m1")}
-    attn_ops = GroupTransferMeta(
-        group_idx=0,
-        keys=tuple(_key(ln) for ln in ("a0", "a1")),
-        gpu_block_ids=(10, 10))
-    m0_ops = GroupTransferMeta(
-        group_idx=1, keys=(_key("m0", blk_hash=888, g_idx=1),),
-        gpu_block_ids=(20,))
-    m1_ops = GroupTransferMeta(
-        group_idx=2, keys=(_key("m1", blk_hash=999, g_idx=2),),
-        gpu_block_ids=(21,))
     saves = RequestMetadata()
-    saves.requests["r1"] = ReqMeta(group_ops=(attn_ops, m0_ops, m1_ops))
+    saves.requests["r1"] = ReqMeta(
+        block_hashes=("777",),
+        group_block_ids=(("10",), ("20",), ("21",)))
     c.bind_connector_metadata(KVShrinkConnectorMetadata(reqs_to_save=saves))
     c.save_kv_layer("a0", None, None)
     by_label = {l: layers for l, layers, _h in c.kvstore.submits}

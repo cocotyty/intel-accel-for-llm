@@ -77,10 +77,9 @@ def test_save_meta_single_element_table():
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[5]])  # ids=[5] only
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    op = meta.group_ops[0]
     # progress = 0 + 544 = 544 -> boundary -> idx=0 -> hash0 committed
-    assert len(op.keys) == 2, op  # 2 layers
-    assert op.gpu_block_ids == (5, 5), op.gpu_block_ids
+    assert meta.block_hashes == ("0",), meta
+    assert meta.group_block_ids == ((5,),), meta
 
 
 def test_save_meta_null_prefixed_table():
@@ -88,9 +87,8 @@ def test_save_meta_null_prefixed_table():
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2
-    assert op.gpu_block_ids == (7, 7), op.gpu_block_ids
+    assert meta.block_hashes == ("0",), meta
+    assert meta.group_block_ids == ((7,),), meta
 
 
 def test_save_meta_skips_partial_tail():
@@ -98,8 +96,8 @@ def test_save_meta_skips_partial_tail():
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0, 1}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1560)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 0, op  # partial tail never saved
+    # partial tail never saved
+    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
 def test_save_meta_multi_block_boundary():
@@ -107,9 +105,8 @@ def test_save_meta_multi_block_boundary():
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {1}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2
-    assert op.gpu_block_ids == (7, 7)
+    assert meta.block_hashes == ("1",), meta
+    assert meta.group_block_ids == ((7,),), meta
 
 
 def test_load_meta_curr_slot_is_last_scheduled_block():
@@ -128,9 +125,9 @@ def test_load_meta_curr_slot_is_last_scheduled_block():
         type("R", (), {"req_id": "r1", "num_tokens": 1088,
                        "block_ids": ([5, 6],)}),
         scheduled_tokens=544)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2, op  # CURR slot x 2 layers
-    assert op.gpu_block_ids == (6, 6), op.gpu_block_ids
+    # snapshot at hash0 into the CURR slot (table idx 1) x 2 layers
+    assert meta.block_hashes == ("0",), meta
+    assert meta.group_block_ids == ((6,),), meta
 
 
 def test_load_meta_chunk_tail_table_index():
@@ -145,9 +142,8 @@ def test_load_meta_chunk_tail_table_index():
         type("R", (), {"req_id": "r1", "num_tokens": 1560,
                        "block_ids": ([0, 1, 6],)}),
         scheduled_tokens=472)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2, op
-    assert op.gpu_block_ids == (6, 6), op.gpu_block_ids
+    assert meta.block_hashes == ("1",), meta
+    assert meta.group_block_ids == ((6,),), meta
 
 
 def test_load_meta_null_prefixed_table():
@@ -162,9 +158,8 @@ def test_load_meta_null_prefixed_table():
         type("R", (), {"req_id": "r1", "num_tokens": 1632,
                        "block_ids": ([0, 7, 9],)}),
         scheduled_tokens=544)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2, op
-    assert op.gpu_block_ids == (9, 9), op.gpu_block_ids
+    assert meta.block_hashes == ("1",), meta
+    assert meta.group_block_ids == ((9,),), meta
 
 
 def test_load_meta_decode_tail():
@@ -178,9 +173,8 @@ def test_load_meta_decode_tail():
         type("R", (), {"req_id": "r1", "num_tokens": 1089,
                        "block_ids": ([0, 1, 6],)}),
         scheduled_tokens=1)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 2, op  # CURR slot x 2 layers
-    assert op.gpu_block_ids == (6, 6), op.gpu_block_ids
+    assert meta.block_hashes == ("1",), meta
+    assert meta.group_block_ids == ((6,),), meta
 
 
 def test_load_meta_curr_null_fail_stop():
@@ -313,8 +307,7 @@ def test_load_meta_fail_closed_without_boundary():
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 545,
                        "block_ids": ([5],)}))
-    op = meta.group_ops[0]
-    assert len(op.keys) == 0, op  # boundary=0 -> idx=-1 -> no load
+    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
 def test_save_meta_all_null_table_skipped():
@@ -322,8 +315,7 @@ def test_save_meta_all_null_table_skipped():
     groups = [_group(0, "mamba", 544, align=544)]
     sched = _make(groups, {0}, [[0, 0]])
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    op = meta.group_ops[0]
-    assert len(op.keys) == 0, op
+    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
 def test_load_meta_all_null_table_fail_closed():
@@ -433,15 +425,10 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
         type("R", (), {"req_id": "r1", "num_tokens": 1088,
                        "block_ids": ([3, 4], [5, 8])}),
         scheduled_tokens=544)
-    attn_op = meta.group_ops[0]
-    mamba_op = meta.group_ops[1]
-    # attention: boundary 544 -> 1 hash (hash0) x 2 layers, gpu block 3
-    assert len(attn_op.keys) == 2, attn_op
-    assert all(k.block_hash == 0 for k in attn_op.keys)
-    assert set(attn_op.gpu_block_ids) == {3}
+    # attention: boundary 544 -> hash0's page, gpu block 3
+    assert meta.block_hashes == ("0",), meta
+    assert meta.group_block_ids[0] == (3,), meta
     # mamba: snapshot at hash0 -> curr table_idx 1 -> block 8
-    assert len(mamba_op.keys) == 2, mamba_op
-    assert all(k.block_hash == 0 for k in mamba_op.keys)
-    assert set(mamba_op.gpu_block_ids) == {8}
+    assert meta.group_block_ids[1] == (8,), meta
 
 

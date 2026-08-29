@@ -92,6 +92,5 @@ def test_save_plan_reaches_the_new_boundaries():
     sched.on_cached_request("r1", None, False, 64)
 
     meta = sched.build_save_meta("r1", scheduled_tokens=0)
-    saved = [k.block_hash for op in meta.group_ops for k in op.keys]
-    assert saved == [1, 2, 3, 4], (
-        f"save plan stopped short of the decode boundaries: {saved}")
+    assert list(meta.block_hashes) == ["1", "2", "3", "4"], (
+        f"save plan stopped short of the decode boundaries: {meta}")

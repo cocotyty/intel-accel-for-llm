@@ -77,7 +77,7 @@ def test_resume_to_zero_rolls_cursor_and_reemits():
     g = sched._req_states["r1"].groups[0]
     assert g.next_stored_chunk_idx == 0, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
-    assert m.group_ops[0].gpu_block_ids == (10, 11), m.group_ops[0]
+    assert m.group_block_ids == ((10, 11),), m.group_block_ids
 
 
 def test_mamba_resume_reemits_boundary_snapshot():
@@ -87,14 +87,14 @@ def test_mamba_resume_reemits_boundary_snapshot():
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
     m1 = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert len(m1.group_ops[0].keys) == 1
+    assert len(m1.block_hashes) == 1
     assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 1
     sched.on_cached_request("r1", ([9],), resumed=True,
                             num_computed_tokens=0)
     assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 0
     m2 = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert len(m2.group_ops[0].keys) == 1  # re-emitted
-    assert m2.group_ops[0].gpu_block_ids == (9,)
+    assert len(m2.block_hashes) == 1  # re-emitted
+    assert m2.group_block_ids == ((9,),)
 
 
 def test_resume_to_nonzero_progress_rolls_to_floor():
@@ -108,7 +108,7 @@ def test_resume_to_nonzero_progress_rolls_to_floor():
     g = sched._req_states["r1"].groups[0]
     assert g.next_stored_chunk_idx == 2, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
-    assert m.group_ops[0].gpu_block_ids == (12, 13), m.group_ops[0]
+    assert m.group_block_ids == ((12, 13),), m.group_block_ids
 
 
 def test_monotonic_progress_no_rollback():
@@ -204,7 +204,7 @@ def test_resumed_missing_progress_rolls_back_to_zero():
     g = sched._req_states["r1"].groups[0]
     assert g.next_stored_chunk_idx == 0, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
-    assert m.group_ops[0].gpu_block_ids == (10, 11)  # re-emitted
+    assert m.group_block_ids == ((10, 11),)  # re-emitted
 
 
 def test_abort_resume_stress_1000_iterations_zero_residue():
@@ -226,7 +226,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         g = sched._req_states[rid].groups[0]
         assert g.next_stored_chunk_idx == 0, f"round {i}: no rollback"
         m = sched.build_save_meta(rid, scheduled_tokens=64)
-        assert m.group_ops[0].gpu_block_ids == (10, 11, 12, 13)
+        assert m.group_block_ids == ((10, 11, 12, 13),)
         free, delay = conn.request_finished(
             type("R", (), {"request_id": rid}), None)
         assert (free, delay) == (True, None)
@@ -273,13 +273,11 @@ def test_resumed_load_meta_restores_credited_pages():
     sched = _hybrid_resumed_setup(set(range(34)))
     meta = sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     assert meta is not None
-    attn, mamba = meta.group_ops
-    assert attn.group_idx == 0  # attention group (fixture order)
-    assert len(attn.keys) == 34, attn
-    assert attn.gpu_block_ids == tuple(range(100, 134)), attn
-    assert mamba.group_idx == 1  # mamba group
-    assert len(mamba.keys) == 1, mamba  # CURR slot only x 1 layer
-    assert mamba.gpu_block_ids == (201,), mamba  # ids[curr_idx=1]
+    # 34 attention pages + the mamba snapshot written into the CURR
+    # slot only (v0.23.0 reads CURR in every kernel path)
+    assert len(meta.block_hashes) == 34, meta
+    assert meta.group_block_ids[0] == tuple(range(100, 134)), meta
+    assert meta.group_block_ids[1] == (201,), meta
 
 
 def test_resumed_load_meta_without_credit_is_quiet():
@@ -288,7 +286,8 @@ def test_resumed_load_meta_without_credit_is_quiet():
     sched = _hybrid_resumed_setup(set(range(34)), ext=0)
     meta = sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     assert meta is not None
-    assert all(len(op.keys) == 0 for op in meta.group_ops)
+    assert meta.block_hashes == ()
+    assert all(len(g) == 0 for g in meta.group_block_ids)
 
 
 def test_connector_meta_includes_resumed_load():
@@ -308,5 +307,5 @@ def test_connector_meta_includes_resumed_load():
     meta = conn.build_connector_meta(scheduler_output)
     load = meta.reqs_to_load.requests.get("r1")
     assert load is not None, "resumed request must receive load metadata"
-    attn = load.group_ops[0]
-    assert len(attn.keys) == 34, attn
+    assert len(load.block_hashes) == 34, load
+    assert load.group_block_ids[0] == tuple(range(100, 134)), load
