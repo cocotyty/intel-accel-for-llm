@@ -872,52 +872,48 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         npages = 0
         _t0 = time.monotonic()
         # One engine get per layer, in execution order: the transfers
-        # then queue in the order forward consumes them. Entries are
-        # per block and shared by a group's layers, so they are
-        # gathered once per (request, group).
-        sync_by_group: dict[int, list[tuple[int, str]]] = {}
-        async_plans: list[tuple[str, dict[int, tuple[tuple[int, str],
-                                                     ...]], ReqMeta]] = []
-        for req_id, req_meta in metadata.reqs_to_load.requests.items():
-            per_group = self._per_group_entries(req_meta)
-            if req_meta.is_async:
-                # Async tasks are parked (no forward this step) and
-                # polled across steps in get_finished (main's flow).
-                async_plans.append((req_id, per_group, req_meta))
-            else:
-                for g_idx, entries in per_group.items():
-                    sync_by_group.setdefault(g_idx, []).extend(entries)
-
-        for req_id, per_group, req_meta in async_plans:
-            tasks: dict[str, Task] = {}
-            for ln in self._layer_names:
-                entries = per_group.get(self._layer_group[ln])
-                if not entries:
-                    continue
-                tasks.update(self._store().get(
-                    block_indices=[gpu for gpu, _ in entries],
-                    block_hashs=[h for _, h in entries],
-                    layer_names=[ln],
-                    label=f"g{self._layer_group[ln]}"))
-                npages += len(entries)
-            if tasks:
-                self._pending_load_tasks[req_id] = tasks
-                self._pending_load_layers[req_id] = (
-                    req_meta.async_load_layers)
-
+        # then queue in the order forward consumes them. Sync and async
+        # dispatch identically; they differ only in where the tasks
+        # land -- the merged batch the forward hooks wait on, or the
+        # per-request dicts get_finished polls for parked requests.
         merged: dict[str, Task] = {}
+        async_tasks: dict[str, dict[str, Task]] = {}
+        async_gate: dict[str, int] = {}
+        npages = 0
         for ln in self._layer_names:
-            entries = sync_by_group.get(self._layer_group[ln])
-            if not entries:
-                continue
-            merged.update(self._store().get(
-                block_indices=[gpu for gpu, _ in entries],
-                block_hashs=[h for _, h in entries],
-                layer_names=[ln],
-                label=f"g{self._layer_group[ln]}"))
-            npages += len(entries)
+            g_idx = self._layer_group[ln]
+            mamba = self._groups[g_idx].kind == "mamba"
+            sync_entries: list[tuple[int, str]] = []
+            for req_id, req_meta in metadata.reqs_to_load.requests.items():
+                gids = req_meta.group_block_ids[g_idx]
+                if not gids:
+                    continue
+                # A mamba entry is the plan's last hash into its single
+                # CURR block; an attention group pairs every block with
+                # its hash.
+                entries = ((gids[0], req_meta.block_hashes[-1]),) if mamba \
+                    else tuple(zip(gids, req_meta.block_hashes))
+                if not req_meta.is_async:
+                    sync_entries.extend(entries)
+                    continue
+                npages += len(entries)
+                async_tasks.setdefault(req_id, {}).update(
+                    self._store().get(
+                        block_indices=[gpu for gpu, _ in entries],
+                        block_hashs=[h for _, h in entries],
+                        layer_names=[ln], label=f"g{g_idx}"))
+                async_gate[req_id] = req_meta.async_load_layers
+            if sync_entries:
+                npages += len(sync_entries)
+                merged.update(self._store().get(
+                    block_indices=[gpu for gpu, _ in sync_entries],
+                    block_hashs=[h for _, h in sync_entries],
+                    layer_names=[ln], label=f"g{g_idx}"))
         if merged:
             self._current_get_tasks = merged
+        for req_id, tasks in async_tasks.items():
+            self._pending_load_tasks[req_id] = tasks
+            self._pending_load_layers[req_id] = async_gate[req_id]
         # Every recurrent layer, waited before forward begins (main's
         # layer filter reused: these layers have no forward hook).
         recurrent = [ln for ln in merged if ln in self._mamba_layers]
@@ -932,7 +928,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 "start_load_kv: %d pages loaded "
                 "elapsed_ms=%.3f (rank %d/%d)", npages,
                 (time.monotonic() - _t0) * 1e3, self.rank, self.tp_size)
-        return npages
+        return 
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # main's hook verbatim: wait this layer's pages in the merged
@@ -965,22 +961,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if layer_name == self._last_layer_name:
             self._current_get_tasks = None
             self._active_promoted_tasks = {}
-
-    def _per_group_entries(
-        self, meta: ReqMeta
-    ) -> dict[int, tuple[tuple[int, str], ...]]:
-        """Group idx -> (gpu_block, hash) entries for one request's
-        plan: an attention group expands per block, the mamba
-        snapshot is the plan's last hash into its single CURR block."""
-        per_group: dict[int, tuple[tuple[int, str], ...]] = {}
-        for g_idx, gids in enumerate(meta.group_block_ids):
-            if not gids:
-                continue
-            if self._groups[g_idx].kind == "mamba":
-                per_group[g_idx] = ((gids[0], meta.block_hashes[-1]),)
-            else:
-                per_group[g_idx] = tuple(zip(gids, meta.block_hashes))
-        return per_group
 
     # ------------------------------------------------------------------
     # save path
