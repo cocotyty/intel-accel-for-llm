@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 import torch
@@ -52,7 +52,8 @@ ReqId = str
 @dataclass
 class ReqMeta:
     """All transfer instructions for one request in one step."""
-    group_ops: tuple[GroupTransferMeta, ...] = ()
+    block_hashes: tuple[str, ...] = ()
+    group_block_ids: tuple[tuple[int, ...], ...] = ()
     is_async: bool = False
     async_load_layers: int = -1
 
@@ -81,12 +82,14 @@ class RequestMetadata:
     def add_request(
         self,
         req_id: ReqId,
-        group_ops: tuple[GroupTransferMeta, ...] = (),
+        block_hashes: tuple[str, ...] = (),
+        group_block_ids: tuple[tuple[int, ...], ...] = (),
         is_async: bool = False,
         async_load_layers: int = -1,
     ) -> None:
         self.requests[req_id] = ReqMeta(
-            group_ops=group_ops,
+            block_hashes=block_hashes,
+            group_block_ids=group_block_ids,
             is_async=is_async,
             async_load_layers=async_load_layers,
         )
@@ -109,34 +112,10 @@ class GroupInfo:
     mamba_align_size: Optional[int]
     spec: object = None
 
-@dataclass(frozen=True)
-class CacheKey:
-    """Logical key for one page, or for a whole boundary
-    # (layer_name empty)."""
-    block_hash: object
-    group_idx: int
-    layer_name: str
-
-    @property
-    def hash_str(self) -> str:
-        """Stable string form for paths / JSON (bytes -> hex)."""
-        h = self.block_hash
-        if isinstance(h, bytes):
-            return h.hex()
-        return str(h)
-
-    @property
-    def boundary_key(self) -> tuple[str, int]:
-        """Identity of a boundary: hash and group."""
-        return (self.hash_str, self.group_idx)
-
-@dataclass
-class GroupTransferMeta:
-    """Per-group transfer instructions for one request (one step).
-    # keys expands per (block, layer); gpu_block_ids is per block."""
-    group_idx: int
-    keys: tuple[CacheKey, ...] = ()
-    gpu_block_ids: tuple[int, ...] = ()
+def _hash_str(block_hash) -> str:
+    """Stable string form for the store (bytes -> hex)."""
+    return block_hash.hex() if isinstance(block_hash, bytes) \
+        else str(block_hash)
 
 def _iter_layer_specs(group_spec: Any) -> Iterator[tuple[str, object]]:
     """Yield (layer_name, spec) pairs, expanding UniformTypeKVCacheSpecs."""
@@ -373,7 +352,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         policy = HybridHitPolicy(
             self._groups,
             lambda g, h: self._store().has(
-                [CacheKey(h, g, "").hash_str], label=f"g{g}")[0],
+                [_hash_str(h)], label=f"g{g}")[0],
             self._hash_block_size, num_computed_tokens)
         boundary = policy.find_longest_cache_hit(
             block_hashes, request.num_tokens)
@@ -454,7 +433,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         meta = self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
         if state.pending_load_tokens > 0:
-            npages = sum(len(op.keys) for op in meta.group_ops)
+            npages = sum(len(g) for g in meta.group_block_ids)
             if npages == 0:
                 raise RuntimeError(
                     "kvshrink resumed request has accepted external "
@@ -470,36 +449,33 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> ReqMeta:
         """Build one request's load plan from its recorded state."""
         ext = state.pending_load_tokens
-        group_ops = []
-        for g_idx, group in enumerate(self._groups):
-            ids = state.groups[g_idx].block_ids
-            keys: list[CacheKey] = []
-            gpu_ids: list[int] = []
-            if group.kind == "attention":
-                start = ((state.num_computed_tokens - ext)
-                         // group.block_size)
-                end = state.num_computed_tokens // group.block_size
-                for layer_name in group.layer_names:
-                    keys.extend(CacheKey(state.block_hashes[i],
-                                         group.group_idx, layer_name)
-                                for i in range(start, end))
-                    gpu_ids.extend(ids[i] for i in range(start, end))
-            elif group.kind == "mamba":
-                if ext > 0:
-                    idx = (state.num_computed_tokens
-                           // group.block_size - 1)
-                    blk_hash = state.block_hashes[idx]
-                    key = CacheKey(blk_hash, group.group_idx, "")
-                    bs = group.block_size
-                    curr_idx = (state.num_computed_tokens +
-                                scheduled_tokens - 1) // bs
+        hashes: list[str] = []
+        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
+        if ext > 0:
+            nc = state.num_computed_tokens
+            owner = next(
+                (g for g in self._groups if g.kind == "attention"),
+                self._groups[0])
+            for g_idx, group in enumerate(self._groups):
+                ids = state.groups[g_idx].block_ids
+                if group.kind == "attention":
+                    start = (nc - ext) // group.block_size
+                    end = nc // group.block_size
+                    if group is owner:
+                        hashes = [_hash_str(state.block_hashes[i])
+                                  for i in range(start, end)]
+                    group_ids[g_idx] = tuple(ids[i]
+                                             for i in range(start, end))
+                elif group.kind == "mamba":
+                    curr_idx = (nc + scheduled_tokens
+                                - 1) // group.block_size
 
                     if scheduled_tokens <= 0 and not state.is_async:
                         raise RuntimeError(
                             "kvshrink mamba external HIT with "
                             "scheduled_tokens=0 "
                             f"(req={req_id} "
-                            f"boundary={state.num_computed_tokens}): "
+                            f"boundary={nc}): "
                             "production hits must schedule >= 1 "
                             "token; refusing to build load meta")
                     if not (0 <= curr_idx < len(ids)
@@ -507,21 +483,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         raise RuntimeError(
                             "kvshrink mamba load curr slot "
                             f"invalid (req={req_id} "
-                            f"boundary={state.num_computed_tokens} "
+                            f"boundary={nc} "
                             f"sched={scheduled_tokens} "
                             f"table_idx={curr_idx} "
                             f"table={ids}): refusing to enter "
                             "forward with unrestored state")
-                    gpu_block = ids[curr_idx]
-                    for layer_name in group.layer_names:
-                        keys.append(replace(key,
-                                            layer_name=layer_name))
-                        gpu_ids.append(gpu_block)
-            group_ops.append(GroupTransferMeta(
-                group_idx=g_idx,
-                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
+                    if group is owner:
+                        idx = nc // group.block_size - 1
+                        hashes = [_hash_str(state.block_hashes[idx])]
+                    group_ids[g_idx] = (ids[curr_idx],)
         return ReqMeta(
-            group_ops=tuple(group_ops),
+            block_hashes=tuple(hashes),
+            group_block_ids=tuple(group_ids),
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
         )
@@ -538,27 +511,25 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
                                         progress)
-        group_ops = []
+        owner = next((g for g in self._groups if g.kind == "attention"),
+                     self._groups[0])
+        hashes: list[str] = []
+        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
         for g_idx, group in enumerate(self._groups):
             gstate = state.groups[g_idx]
             ids = gstate.block_ids
-            if not ids:
-                continue
-            keys: list[CacheKey] = []
-            gpu_ids: list[int] = []
             if group.kind == "attention":
                 num_hash = min(progress // group.block_size, len(ids),
                                len(state.block_hashes))
                 start = gstate.next_stored_chunk_idx
-                for i in range(start, num_hash):
-                    blk_hash = state.block_hashes[i]
-                    for layer_name in group.layer_names:
-                        keys.append(CacheKey(blk_hash, group.group_idx,
-                                             layer_name))
-                        gpu_ids.append(ids[i])
                 if num_hash > start:
+                    if group is owner:
+                        hashes = [_hash_str(state.block_hashes[i])
+                                  for i in range(start, num_hash)]
+                    group_ids[g_idx] = tuple(ids[i] for i in
+                                             range(start, num_hash))
                     gstate.next_stored_chunk_idx = num_hash
-            elif group.kind == "mamba":
+            else:
                 if state.block_hashes:
                     block_pos = None
                     for pos in range(len(ids) - 1, -1, -1):
@@ -570,17 +541,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         idx = progress // group.block_size - 1
                         if (idx >= gstate.next_stored_chunk_idx
                                 and idx < len(state.block_hashes)):
-                            blk_hash = state.block_hashes[idx]
-                            for layer_name in group.layer_names:
-                                keys.append(CacheKey(blk_hash,
-                                                     group.group_idx,
-                                                     layer_name))
-                                gpu_ids.append(ids[block_pos])
+                            if group is owner:
+                                hashes = [_hash_str(
+                                    state.block_hashes[idx])]
+                            group_ids[g_idx] = (ids[block_pos],)
                             gstate.next_stored_chunk_idx = idx + 1
-            group_ops.append(GroupTransferMeta(
-                group_idx=g_idx,
-                keys=tuple(keys), gpu_block_ids=tuple(gpu_ids)))
-        return ReqMeta(group_ops=tuple(group_ops))
+        return ReqMeta(
+            block_hashes=tuple(hashes),
+            group_block_ids=tuple(group_ids),
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -592,15 +561,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for new_req in scheduler_output.scheduled_new_reqs:
             req_meta = self.build_load_meta(
                 new_req, num_sched[new_req.req_id])
-            if any(op.keys for op in req_meta.group_ops):
+            if any(req_meta.group_block_ids):
                 meta.reqs_to_load.add_request(
-                    new_req.req_id, req_meta.group_ops, req_meta.is_async,
+                    new_req.req_id, req_meta.block_hashes,
+                    req_meta.group_block_ids, req_meta.is_async,
                     req_meta.async_load_layers)
             save_meta = self.build_save_meta(
                 new_req.req_id, num_sched[new_req.req_id])
-            if save_meta.group_ops:
+            if any(save_meta.group_block_ids):
                 meta.reqs_to_save.add_request(
-                    new_req.req_id, save_meta.group_ops)
+                    new_req.req_id, save_meta.block_hashes,
+                    save_meta.group_block_ids)
 
         pending = sorted(self._async_load_pending
                          - set(meta.reqs_to_load.requests))
@@ -611,17 +582,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.async_plan_emitted = True
             state.is_async = False
             meta.reqs_to_load.add_request(
-                req_id, req_meta.group_ops, req_meta.is_async,
-                req_meta.async_load_layers)
+                req_id, req_meta.block_hashes, req_meta.group_block_ids,
+                req_meta.is_async, req_meta.async_load_layers)
         self._async_load_pending -= set(pending)
 
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
             req_meta = self.build_resumed_load_meta(
                 req_id, num_sched[req_id])
-            if any(op.keys for op in req_meta.group_ops):
+            if any(req_meta.group_block_ids):
                 meta.reqs_to_load.add_request(
-                    req_id, req_meta.group_ops, req_meta.is_async,
+                    req_id, req_meta.block_hashes,
+                    req_meta.group_block_ids, req_meta.is_async,
                     req_meta.async_load_layers)
 
         resumed = cr.resumed_req_ids
@@ -632,9 +604,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 req_id, new_bids[i], req_id in resumed, ncts[i])
             save_meta = self.build_save_meta(
                 req_id, num_sched[req_id])
-            if save_meta.group_ops:
-                meta.reqs_to_save.add_request(req_id,
-                                              save_meta.group_ops)
+            if any(save_meta.group_block_ids):
+                meta.reqs_to_save.add_request(
+                    req_id, save_meta.block_hashes,
+                    save_meta.group_block_ids)
         return meta
 
     def register_kv_caches(
@@ -718,36 +691,45 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._step_save_pages = 0
         npages = 0
         _t0 = time.monotonic()
-        by_group: dict[int, tuple[list[tuple[int, str]], set[str]]] = {}
+        sync_by_group: dict[int, list[tuple[int, str]]] = {}
+        async_plans: list[tuple[str, dict[int, tuple[tuple[int, str],
+                                                     ...]], ReqMeta]] = []
         for req_id, req_meta in metadata.reqs_to_load.requests.items():
+            per_group = self._per_group_entries(req_meta)
             if req_meta.is_async:
-                tasks: dict[str, Task] = {}
-                for op in req_meta.group_ops:
-                    if not op.keys:
-                        continue
-                    t, n = self._submit_group_load_entries(
-                        op.group_idx, self._op_entries(op),
-                        {key.layer_name for key in op.keys})
-                    tasks.update(t)
-                    npages += n
-                if tasks:
-                    self._pending_load_tasks[req_id] = tasks
-                    self._pending_load_layers[req_id] = (
-                        req_meta.async_load_layers)
+                async_plans.append((req_id, per_group, req_meta))
             else:
-                for op in req_meta.group_ops:
-                    if not op.keys:
-                        continue
-                    entries, layers = by_group.setdefault(
-                        op.group_idx, ([], set()))
-                    entries.extend(self._op_entries(op))
-                    layers.update(key.layer_name for key in op.keys)
+                for g_idx, entries in per_group.items():
+                    sync_by_group.setdefault(g_idx, []).extend(entries)
+
+        for req_id, per_group, req_meta in async_plans:
+            tasks: dict[str, Task] = {}
+            for ln in self._layer_names:
+                entries = per_group.get(self._layer_group[ln])
+                if not entries:
+                    continue
+                tasks.update(self._store().get(
+                    block_indices=[gpu for gpu, _ in entries],
+                    block_hashs=[h for _, h in entries],
+                    layer_names=[ln],
+                    label=f"g{self._layer_group[ln]}"))
+                npages += len(entries)
+            if tasks:
+                self._pending_load_tasks[req_id] = tasks
+                self._pending_load_layers[req_id] = (
+                    req_meta.async_load_layers)
+
         merged: dict[str, Task] = {}
-        for g_idx, (entries, layers) in by_group.items():
-            tasks, n = self._submit_group_load_entries(
-                g_idx, entries, layers)
-            merged.update(tasks)
-            npages += n
+        for ln in self._layer_names:
+            entries = sync_by_group.get(self._layer_group[ln])
+            if not entries:
+                continue
+            merged.update(self._store().get(
+                block_indices=[gpu for gpu, _ in entries],
+                block_hashs=[h for _, h in entries],
+                layer_names=[ln],
+                label=f"g{self._layer_group[ln]}"))
+            npages += len(entries)
         if merged:
             self._current_get_tasks = merged
         recurrent = [ln for ln in merged if ln in self._mamba_layers]
@@ -792,43 +774,40 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._current_get_tasks = None
             self._active_promoted_tasks = {}
 
-    @staticmethod
-    def _op_entries(op: GroupTransferMeta) -> list[tuple[int, str]]:
-        """One (gpu_block_id, chunk_label) per block: keys expand per
-        block x layer (scheduler invariant), so collapse by label."""
-        seen: dict[str, int] = {}
-        for key, gpu in zip(op.keys, op.gpu_block_ids):
-            seen.setdefault(key.hash_str, gpu)
-        return [(gpu, h) for h, gpu in seen.items()]
-
-    def _submit_group_load_entries(
-        self, g_idx: int, entries: list[tuple[int, str]],
-        layer_names: set[str],
-    ) -> tuple[dict[str, Task], int]:
-        """One engine get covering ``layer_names`` for the blocks in
-        ``entries``; returns the tasks dict (layer name -> Task) and
-        the page count."""
-        tasks = self._store().get(block_indices=[gpu for gpu, _ in entries],
-                                 block_hashs=[h for _, h in entries],
-                                 layer_names=list(layer_names),
-                                 label=f"g{g_idx}")
-        return tasks, len(entries) * len(layer_names)
+    def _per_group_entries(
+        self, meta: ReqMeta
+    ) -> dict[int, tuple[tuple[int, str], ...]]:
+        """Group idx -> (gpu_block, hash) entries for one request's
+        plan: an attention group expands per block, the mamba
+        snapshot is the plan's last hash into its single CURR block."""
+        per_group: dict[int, tuple[tuple[int, str], ...]] = {}
+        for g_idx, gids in enumerate(meta.group_block_ids):
+            if not gids:
+                continue
+            if self._groups[g_idx].kind == "mamba":
+                per_group[g_idx] = ((gids[0], meta.block_hashes[-1]),)
+            else:
+                per_group[g_idx] = tuple(zip(gids, meta.block_hashes))
+        return per_group
 
     def _gather_save_candidates(
         self, metadata: KVShrinkConnectorMetadata
     ) -> dict[tuple[str, int], dict]:
-        """boundary_key -> {"group_idx", "pages", "req_ids"}, with
-        # cross-request dedup (shared boundaries are written once)."""
+        """(hash, group) -> {"gpu", "req_ids"}, with cross-request
+        # dedup (shared boundaries are written once)."""
         candidates: dict[tuple[str, int], dict] = {}
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
-            for op in req_meta.group_ops:
-                for key, gpu_block_id in zip(op.keys, op.gpu_block_ids):
-                    cand = candidates.get(key.boundary_key)
-                    if cand is None:
-                        cand = {"group_idx": op.group_idx,
-                                "pages": {}, "req_ids": set()}
-                        candidates[key.boundary_key] = cand
-                    cand["pages"][key.layer_name] = (key, gpu_block_id)
+            for g_idx, gids in enumerate(req_meta.group_block_ids):
+                if not gids:
+                    continue
+                if self._groups[g_idx].kind == "mamba":
+                    items = ((req_meta.block_hashes[-1], gids[0]),)
+                else:
+                    items = zip(req_meta.block_hashes, gids)
+                for h, gpu in items:
+                    cand = candidates.setdefault(
+                        (h, g_idx), {"gpu": gpu, "req_ids": set()})
+                    cand["gpu"] = gpu
                     cand["req_ids"].add(req_id)
         return candidates
 
@@ -849,16 +828,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> None:
         """One async engine put for ``layer_names`` of one group over
         # this step's complete boundary candidates."""
-        expected = sorted(self._groups[g_idx].layer_names)
         entries: list[tuple[int, str]] = []
         req_ids: set[str] = set()
-        for cand in self._gather_save_candidates(metadata).values():
-            if cand["group_idx"] != g_idx:
+        for (h, cand_g), cand in self._gather_save_candidates(
+                metadata).items():
+            if cand_g != g_idx:
                 continue
-            if sorted(cand["pages"]) != expected:
-                continue
-            key, gpu_block_id = cand["pages"][layer_names[0]]
-            entries.append((gpu_block_id, key.hash_str))
+            entries.append((cand["gpu"], h))
             req_ids |= cand["req_ids"]
         if not entries:
             return
@@ -887,11 +863,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise TypeError("Unexpected connector metadata")
         segment = self._mamba_save_segments.get(layer_name)
         if segment:
-            by_group: dict[int, list[str]] = {}
             for ln in segment:
-                by_group.setdefault(self._layer_group[ln], []).append(ln)
-            for seg_g_idx, seg_layers in by_group.items():
-                self._submit_layers_save(seg_g_idx, seg_layers, metadata)
+                self._submit_layers_save(
+                    self._layer_group[ln], [ln], metadata)
         self._submit_layers_save(
             self._attn_layer_group[layer_name], [layer_name], metadata)
 
@@ -918,38 +892,29 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, metadata: KVShrinkConnectorMetadata
     ) -> tuple[int, int]:
         """Submit every layer not already pipelined (trailing mamba
-        # segment, hooks that never fired), one put per group. The
-        # drain lives in get_finished. Returns (pages, boundaries)."""
+        # segment, hooks that never fired), one put per layer in
+        # execution order. The drain lives in get_finished. Returns
+        # (pages, boundaries)."""
         candidates = self._gather_save_candidates(metadata)
-        per_group: dict[int, dict[str, Any]] = {}
-        nbound = 0
-        for bkey, cand in candidates.items():
-            blk_hash, g_idx = bkey
-            expected = sorted(self._groups[g_idx].layer_names)
-            if sorted(cand["pages"]) != expected:
-                logger.warning(
-                    "chunk_save skip commit g%d h=%s: expected %d "
-                    "layers, stored %d (%s)", g_idx, blk_hash,
-                    len(expected), len(cand.pages),
-                    set(expected) ^ set(cand.pages))
+        nbound = len(candidates)
+        for ln in self._layer_names:
+            if ln in self._saved_layers:
                 continue
-            nbound += 1
-            blob = per_group.setdefault(g_idx, {"entries": [],
-                                                "req_ids": set()})
-            key, gpu_block_id = cand["pages"][expected[0]]
-            blob["entries"].append((gpu_block_id, key.hash_str))
-            blob["req_ids"] |= cand["req_ids"]
-        for g_idx, blob in per_group.items():
-            remaining = [ln for ln in self._groups[g_idx].layer_names
-                         if ln not in self._saved_layers]
-            if not remaining:
+            g_idx = self._layer_group[ln]
+            entries: list[tuple[int, str]] = []
+            req_ids: set[str] = set()
+            for (h, cand_g), cand in candidates.items():
+                if cand_g != g_idx:
+                    continue
+                entries.append((cand["gpu"], h))
+                req_ids |= cand["req_ids"]
+            if not entries:
                 continue
-            tasks = self._submit_group_layers_save(
-                g_idx, remaining, blob["entries"])
-            for rid in blob["req_ids"]:
+            tasks = self._submit_group_layers_save(g_idx, [ln], entries)
+            for rid in req_ids:
                 self._current_put_tasks.setdefault(rid, []).append(tasks)
-            self._saved_layers.update(remaining)
-            self._step_save_pages += len(blob["entries"]) * len(remaining)
+            self._saved_layers.add(ln)
+            self._step_save_pages += len(entries)
         if self._step_save_pages:
             logger.info(
                 "chunk_save: %d pages submitted, %d boundaries "
