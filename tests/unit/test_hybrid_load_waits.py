@@ -23,9 +23,7 @@ import pytest
 
 from conftest import HybridWorker, drive_start_load, make_spec
 from kvshrink.kvshrink_connector import (
-    RequestMetadata,
-    CacheKey, GroupInfo, GroupTransferMeta, KVShrinkConnectorMetadata,
-    ReqMeta)
+    RequestMetadata, GroupInfo, KVShrinkConnectorMetadata, ReqMeta)
 
 PAGE = 4096
 
@@ -81,14 +79,14 @@ def _worker(store=None, order=ORDER, gdn=None):
     return w
 
 
-def _load_meta(layers, group_idx, req_id="r1"):
-    """One load op covering ``layers`` for a single block."""
-    keys = tuple(CacheKey(block_hash=7, group_idx=group_idx,
-                          layer_name=ln) for ln in layers)
-    op = GroupTransferMeta(group_idx=group_idx, keys=keys,
-                           gpu_block_ids=(5,) * len(layers))
+def _load_meta(group_idx, req_id="r1"):
+    """One load plan: a single block for group ``group_idx`` (the
+    group's own config decides which layers it reaches)."""
+    group_ids = [(), ()]
+    group_ids[group_idx] = ("5",)
     md = RequestMetadata()
-    md.requests[req_id] = ReqMeta(group_ops=(op,))
+    md.requests[req_id] = ReqMeta(
+        block_hashes=("7",), group_block_ids=tuple(group_ids))
     return KVShrinkConnectorMetadata(reqs_to_load=md)
 
 
@@ -118,7 +116,7 @@ def test_every_recurrent_layer_is_waited_before_forward():
     that reaches forward unrestored is silent output corruption."""
     be = _FakeStore()
     w = _worker(be)
-    drive_start_load(w, _load_meta(GDN, 1))
+    drive_start_load(w, _load_meta(1))
     assert sorted(be.submitted) == sorted(GDN)
     assert sorted(be.waited) == sorted(GDN), be.waited
     # the batch stays open until the last attention hook (main's rule)
@@ -130,9 +128,9 @@ def test_attention_pages_stay_pipelined():
     the layer is about to read them, not up front."""
     be = _FakeStore()
     w = _worker(be)
-    meta = _load_meta(ATTN, 0)
+    meta = _load_meta(0)
     meta.reqs_to_load.requests.update(
-        _load_meta(GDN, 1, req_id="r2").reqs_to_load.requests)
+        _load_meta(1, req_id="r2").reqs_to_load.requests)
     drive_start_load(w, meta)
     # GDN waited already; no attention layer has been waited yet
     assert sorted(be.waited) == sorted(GDN), be.waited
@@ -154,17 +152,14 @@ def test_failed_blocking_wait_raises():
     be.get_wait = _boom
     w = _worker(be)
     with pytest.raises(RuntimeError, match="h2d failed"):
-        drive_start_load(w, _load_meta(GDN, 1))
+        drive_start_load(w, _load_meta(1))
 
 
-def test_empty_ops_are_skipped():
-    """A group with nothing to load (empty keys) contributes no engine
-    call -- regression: an empty op once produced a get with no
-    tensors, tripping the engine's not-empty assert."""
+def test_attention_layers_of_an_idle_group_get_no_call():
+    """A group with nothing to load (empty block ids) contributes no
+    engine call for its layers -- regression: an empty op once produced
+    a get with no tensors, tripping the engine's not-empty assert."""
     be = _FakeStore()
     w = _worker(be)
-    meta = _load_meta(GDN, 1)
-    req = next(iter(meta.reqs_to_load.requests.values()))
-    req.group_ops = (GroupTransferMeta(group_idx=0),) + req.group_ops
-    drive_start_load(w, meta)
-    assert sorted(be.submitted) == sorted(GDN), be.submitted
+    drive_start_load(w, _load_meta(1))
+    assert not (set(ATTN) & set(be.submitted)), be.submitted
