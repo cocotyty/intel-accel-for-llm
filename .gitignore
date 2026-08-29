@@ -54,3 +54,4 @@
 *.swp
 _build
 _lib
+_data
