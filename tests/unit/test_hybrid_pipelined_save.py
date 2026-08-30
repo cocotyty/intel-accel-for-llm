@@ -4,7 +4,7 @@ vLLM calls save_kv_layer on exit of every attention layer during
 forward. The connector submits that layer's async put immediately
 (overlapping the remaining layers' compute); the mamba segment
 preceding an attention layer rides the same hook, and the trailing
-segment submits in submit_saves (post-forward). Nothing is waited
+segment submits in wait_for_save (post-forward). Nothing is waited
 inside the step: writes drain in get_finished, which also releases
 finished requests' blocks (finished_sending). These tests use a fake
 store and fake canonicalizer -- no GPU, no disk, no model.
@@ -81,7 +81,7 @@ def test_pipelined_attention_submits_during_forward():
     assert submits_during_fwd[0][1] == ["a0"]  # one layer per call
     assert submits_during_fwd[1][1] == ["a1"]
 
-    c.submit_saves(meta)
+    c.wait_for_save()
     # attention layers were NOT re-submitted; mamba submitted post-forward
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
@@ -99,13 +99,14 @@ def test_fallback_when_hook_never_fired():
     """Older vLLM / decorator missing: attention submits post-forward,
     commits still correct (idempotent full coverage)."""
     c = _worker()
-    _pages, nbound = c.submit_saves(_save_meta())  # no save_kv_layer first
+    c.bind_connector_metadata(_save_meta())  # no save_kv_layer first
+    c.wait_for_save()
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
     # every layer goes out in its own post-forward call
     assert ["a0"] in submit_layers
     assert ["a1"] in submit_layers
     assert ["m0"] in submit_layers
-    assert nbound == 2
+    assert len(c.kvstore.submits) == 3
 
 
 def test_mamba_segment_rides_the_next_attention_hook():
@@ -120,7 +121,7 @@ def test_mamba_segment_rides_the_next_attention_hook():
     assert ["m0"] in submit_layers  # mamba segment piggybacked on the hook
     assert ["a0"] in submit_layers
     c.save_kv_layer("a1", None, None)
-    c.submit_saves(meta)
+    c.wait_for_save()
     # everything submitted during forward; nothing left post-forward
     assert len(c.kvstore.submits) == 3
 
@@ -156,8 +157,9 @@ def test_write_is_the_commit():
     get_finished.
     """
     w = _worker()
-    pages, boundaries = w.submit_saves(_save_meta())
-    assert pages > 0 and boundaries > 0
+    w.bind_connector_metadata(_save_meta())
+    w.wait_for_save()
+    assert w.kvstore.submits, "nothing was submitted"
     assert w.kvstore.waits == 0, "submission must not block the step"
     sending, _ = w.get_finished({"r1"})
     assert sending == {"r1"}
