@@ -92,7 +92,7 @@ class HybridHitPolicy:
         self, block_hashes: list[int], max_length: int
     ) -> int:
         """Fixed-point convergence over all groups; returns the
-        # restorable prefix in tokens (the snapshot boundary)."""
+        restorable prefix in tokens (the snapshot boundary)."""
         candidate = max_length
         if self._mamba_align is not None:
             # the last prompt token is always recomputed (logprobs + state)
