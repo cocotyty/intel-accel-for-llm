@@ -149,6 +149,33 @@ def test_async_tasks_live_outside_the_step_tasks():
     assert "r1" in w._pending_load_tasks
 
 
+def test_sync_loads_queue_ahead_of_async_loads():
+    """The engine stream runs transfers FIFO, so submission order is
+    the service order: this pass's blocking loads must all be enqueued
+    before a parked request's, one call per layer, in execution order
+    (the order forward consumes the layers)."""
+    calls = []
+
+    class _Recorder(_FakeStore):
+        def get(self, block_indices, block_hashs, layer_names,
+                label=None):
+            calls.append((layer_names[0], block_indices[0]))
+            return super().get(block_indices, block_hashs,
+                               layer_names, label)
+
+    w = _worker(_Recorder())
+    md = RequestMetadata()
+    md.requests["sync1"] = ReqMeta(
+        block_hashes=("7",), group_block_ids=(("5",), ("5",)))
+    md.requests["async1"] = ReqMeta(
+        block_hashes=("7",), group_block_ids=(("9",), ("9",)),
+        is_async=True, async_load_layers=1)
+    drive_start_load(w, KVShrinkConnectorMetadata(reqs_to_load=md))
+
+    assert calls == ([(ln, "5") for ln in ORDER]
+                     + [(ln, "9") for ln in ORDER])
+
+
 def test_remaining_layers_are_drained_by_the_layer_hooks():
     b = _FakeStore()
     w = _worker(b)
