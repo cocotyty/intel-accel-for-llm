@@ -691,45 +691,56 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._step_save_pages = 0
         npages = 0
         _t0 = time.monotonic()
-        merged: dict[str, Task] = {}
-        async_tasks: dict[str, dict[str, Task]] = {}
-        async_gate: dict[str, int] = {}
-        npages = 0
+        sync_tasks: dict[str, Task] = {}
         for ln in self._layer_names:
             g_idx = self._layer_group[ln]
             mamba = self._groups[g_idx].kind == "mamba"
-            sync_entries: list[tuple[int, str]] = []
+            sync_block_ids: list[int] = []
+            sync_block_hashes: list[str] = []
             for req_id, req_meta in metadata.reqs_to_load.requests.items():
+                if req_meta.is_async:
+                    continue
                 gids = req_meta.group_block_ids[g_idx]
                 if not gids:
                     continue
                 entries = ((gids[0], req_meta.block_hashes[-1]),) if mamba \
                     else tuple(zip(gids, req_meta.block_hashes))
+                sync_block_ids.extend(gpu for gpu, _ in entries)
+                sync_block_hashes.extend(h for _, h in entries)
+            if sync_block_ids:
+                npages += len(sync_block_ids)
+                sync_tasks.update(self._store().get(
+                    block_indices=sync_block_ids,
+                    block_hashs=sync_block_hashes,
+                    layer_names=[ln], label=f"g{g_idx}"))
+        if sync_tasks:
+            self._current_get_tasks = sync_tasks
+        async_tasks: dict[str, dict[str, Task]] = {}
+        for ln in self._layer_names:
+            g_idx = self._layer_group[ln]
+            mamba = self._groups[g_idx].kind == "mamba"
+            for req_id, req_meta in metadata.reqs_to_load.requests.items():
                 if not req_meta.is_async:
-                    sync_entries.extend(entries)
                     continue
+                gids = req_meta.group_block_ids[g_idx]
+                if not gids:
+                    continue
+                entries = ((gids[0], req_meta.block_hashes[-1]),) if mamba \
+                    else tuple(zip(gids, req_meta.block_hashes))
                 npages += len(entries)
                 async_tasks.setdefault(req_id, {}).update(
                     self._store().get(
                         block_indices=[gpu for gpu, _ in entries],
                         block_hashs=[h for _, h in entries],
                         layer_names=[ln], label=f"g{g_idx}"))
-                async_gate[req_id] = req_meta.async_load_layers
-            if sync_entries:
-                npages += len(sync_entries)
-                merged.update(self._store().get(
-                    block_indices=[gpu for gpu, _ in sync_entries],
-                    block_hashs=[h for _, h in sync_entries],
-                    layer_names=[ln], label=f"g{g_idx}"))
-        if merged:
-            self._current_get_tasks = merged
         for req_id, tasks in async_tasks.items():
             self._pending_load_tasks[req_id] = tasks
-            self._pending_load_layers[req_id] = async_gate[req_id]
-        recurrent = [ln for ln in merged if ln in self._mamba_layers]
+            self._pending_load_layers[req_id] = (
+                metadata.reqs_to_load.requests[req_id].async_load_layers)
+        recurrent = [ln for ln in sync_tasks if ln in self._mamba_layers]
         if recurrent:
             if not self._store().get_wait(
-                    get_results=merged, layer_names=recurrent, wait=True):
+                    get_results=sync_tasks, layer_names=recurrent, wait=True):
                 raise RuntimeError(
                     "kvshrink load failed: recurrent pages did not land; "
                     "forward would read unrestored state")
