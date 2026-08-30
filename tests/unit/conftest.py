@@ -22,7 +22,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 # Knobs that change connector behaviour. Cleared for every test so a
 # developer's shell environment can never alter the results.
 _KVSHRINK_ENV = (
-    "KVSHRINK_DEBUG_DUMP",
     "KVSHRINK_PERSIST_DIR",
 )
 
@@ -59,8 +58,8 @@ def HybridRequestScheduler(groups, store, hash_block_size,
     conn.kvstore = store
     conn._hash_block_size = hash_block_size
     conn._async_load_layer_config = async_load_config
-    conn._attention_layers = tuple(
-        ln for g in groups if g.kind != "mamba" for ln in g.layer_names)
+    conn._num_attn_layers = sum(
+        len(g.layer_names) for g in groups if g.kind != "mamba")
     conn._req_states = {}
     conn._async_load_pending = set()
     return conn

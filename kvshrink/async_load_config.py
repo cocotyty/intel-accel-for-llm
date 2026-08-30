@@ -225,5 +225,3 @@ def load_async_load_layer_config_from_env(
         num_layers=num_layers,
         dynamic_map_configured=True,
     )
-
-
