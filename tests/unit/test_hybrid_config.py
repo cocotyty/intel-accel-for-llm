@@ -77,9 +77,6 @@ def test_parse_real_config():
     # 32 layers, all mapped
     for g in groups:
         assert len(g.layer_names) == 8
-    mamba = groups[0]
-    assert mamba.mamba_align_size == 528
-
 
 def test_recurrent_page_spec_declares_both_states():
     """A GDN page is the conv state and the ssm state back to back, and

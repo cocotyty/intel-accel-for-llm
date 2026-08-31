@@ -23,7 +23,6 @@ from conftest import HybridRequestScheduler
 def _sched(block_size=16):
     groups = [GroupInfo(group_idx=0, kind="attention",
                         layer_names=("a0",), block_size=block_size,
-                        mamba_align_size=None,
                         spec=make_spec("attention", block_size))]
     return HybridRequestScheduler(
         groups, store=None, hash_block_size=block_size)

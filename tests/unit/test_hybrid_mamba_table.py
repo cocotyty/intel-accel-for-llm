@@ -45,12 +45,11 @@ class _Store:
         return [h in self.committed]
 
 
-def _group(g_idx, kind, block_size, align=None):
+def _group(g_idx, kind, block_size):
     return GroupInfo(
         group_idx=g_idx, kind=kind,
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
-        block_size=block_size,
-        mamba_align_size=align, spec=make_spec(kind, block_size))
+        block_size=block_size, spec=make_spec(kind, block_size))
 
 
 def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
@@ -74,7 +73,7 @@ def _make(groups, committed, block_ids_per_group):
 def test_save_meta_single_element_table():
     """545-token request: mamba table [X] (no null prefix). Snapshot at
     the 544 boundary must be saved (regression: old len(ids)>1 skip)."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5]])  # ids=[5] only
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
     # progress = 0 + 544 = 544 -> boundary -> idx=0 -> hash0 committed
@@ -84,7 +83,7 @@ def test_save_meta_single_element_table():
 
 def test_save_meta_null_prefixed_table():
     """Null-prefixed [0,0,X]: last non-null block is used."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
     assert meta.block_hashes == ("0",), meta
@@ -93,7 +92,7 @@ def test_save_meta_null_prefixed_table():
 
 def test_save_meta_skips_partial_tail():
     """progress 1088+472 = 1560 (not a boundary) -> no mamba snapshot."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0, 1}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1560)
     # partial tail never saved
@@ -102,7 +101,7 @@ def test_save_meta_skips_partial_tail():
 
 def test_save_meta_multi_block_boundary():
     """progress 1088 = 2 complete blocks -> hash idx=1 (hash1)."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
     assert meta.block_hashes == ("1",), meta
@@ -117,7 +116,7 @@ def test_load_meta_curr_slot_is_last_scheduled_block():
     0 of that gather, where seq_len = computed + scheduled. Restoring
     boundary 544 with 544 scheduled tokens therefore targets table index
     (544 + 544 - 1) // 544 = 1 -> block 6."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5, 6]])
     sched._req_states["r1"].num_computed_tokens = 544
     sched._req_states["r1"].pending_load_tokens = 544
@@ -134,7 +133,7 @@ def test_load_meta_chunk_tail_table_index():
     """Real shape [0,1,6], boundary 1088, sched 472 (1560-token prompt):
     (1088 + 472 - 1) // 544 = 2 -> block 6, the only slot the kernel
     reads this step."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1, 6]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -150,7 +149,7 @@ def test_load_meta_null_prefixed_table():
     """Null-prefixed table [0, 7, 9]: boundary 1088 + 544 scheduled ->
     index 2 -> block 9. Leading nulls are reserved placeholders, never
     load targets."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 7, 9]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -165,7 +164,7 @@ def test_load_meta_null_prefixed_table():
 def test_load_meta_decode_tail():
     """Decode tail (sched == 1, e.g. a 1089-token prompt with boundary
     1088): (1088 + 1 - 1) // 544 = 2 -> block 6."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1, 6]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -183,7 +182,7 @@ def test_load_meta_curr_null_fail_stop():
     There is no second slot to fall back on: the kernel reads exactly
     the gathered column, so a null there means the state cannot be
     restored at all."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1, 0]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -202,7 +201,7 @@ def test_load_meta_curr_null_fail_stop():
 def test_load_meta_curr_null_decode_fail_stop():
     """Decode tail (sched == 1) with a null CURR slot -> FAIL-STOP:
     never enter forward with unrestored state."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1, 0]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -221,7 +220,7 @@ def test_load_meta_curr_null_decode_fail_stop():
 def test_load_meta_curr_out_of_range_fail_stop():
     """Chunk path (sched >= 2): the gathered index is beyond the table
     -> FAIL-STOP (the block the kernel will read was never allocated)."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -239,7 +238,7 @@ def test_load_meta_curr_out_of_range_fail_stop():
 
 def test_load_meta_curr_out_of_range_decode_fail_stop():
     """Decode tail (sched == 1): gathered index beyond table -> FAIL-STOP."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 1]])
     sched._req_states["r1"].num_computed_tokens = 1088
     sched._req_states["r1"].pending_load_tokens = 1088
@@ -260,7 +259,7 @@ def test_load_meta_table_idx_null_fail_closed():
     """Gathered table index resolves to a null block -> FAIL-STOP:
     get_num_new_matched_tokens already credited the external boundary,
     so proceeding would enter forward with unrestored state."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0, 6]])
     sched._req_states["r1"].num_computed_tokens = 544
     sched._req_states["r1"].pending_load_tokens = 544  # idx (544+1-1)//544 = 1
@@ -278,7 +277,7 @@ def test_load_meta_table_idx_null_fail_closed():
 
 def test_load_meta_table_idx_out_of_range_fail_closed():
     """Gathered table index beyond the table length -> FAIL-STOP."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = HybridRequestScheduler(groups, _Store({2}), 16)
     track_new_request(sched, "r1", block_hashes=[0, 1, 2],
                          num_computed_tokens=0)
@@ -302,7 +301,7 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
 def test_load_meta_fail_closed_without_boundary():
     """No external credit (pending_load_tokens=0) -> 0 keys, never
     guess by recomputing."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5]])
     meta = sched.build_load_meta(
         type("R", (), {"req_id": "r1", "num_tokens": 545,
@@ -312,7 +311,7 @@ def test_load_meta_fail_closed_without_boundary():
 
 def test_save_meta_all_null_table_skipped():
     """All-null table [0,0] -> no mamba save keys."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0]])
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
@@ -320,7 +319,7 @@ def test_save_meta_all_null_table_skipped():
 
 def test_load_meta_all_null_table_fail_closed():
     """All-null table with boundary > 0 -> FAIL-STOP (curr slot null)."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0]])
     sched._req_states["r1"].num_computed_tokens = 544
     sched._req_states["r1"].pending_load_tokens = 544
@@ -340,7 +339,7 @@ def test_load_meta_hit_sched_zero_fail_stop():
     """External HIT with scheduled_tokens=0 -> FAIL-STOP. A production
     hit always schedules at least one token; sched=0 is a test-only
     path that must never drive a real mamba load."""
-    groups = [_group(0, "mamba", 544, align=544)]
+    groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5, 9]])
     sched._req_states["r1"].num_computed_tokens = 544
     sched._req_states["r1"].pending_load_tokens = 544
@@ -356,38 +355,22 @@ def test_load_meta_hit_sched_zero_fail_stop():
 
 
 def test_completeness_intact_boundary_unchanged():
-    """Lookup: all pages present -> boundary unchanged (1088)."""
+    """Lookup: every group complete at the first boundary -> restore
+    it whole. The last block boundary is never lent out (the last
+    prompt token is always recomputed), so 1088 committed tokens
+    restore 544."""
     groups = [_group(0, "attention", 544), _group(1, "mamba", 544)]
-    backend = _Store(set(), committed_pairs=_hybrid_pairs([0, 1], [1]))
+    backend = _Store(set(), committed_pairs=_hybrid_pairs([0, 1], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544)
     req = type("R", (), {
         "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
-    assert ext == 1088, ext
+    assert ext == 544, ext
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
-        FakeBlocks(([9], [9])), 1088)
+        FakeBlocks(([9], [9])), 544)
     # the credit landed num_computed_tokens exactly on the boundary
-    assert sched._req_states["r1"].num_computed_tokens == 1088
-
-
-def test_mamba_align_granularity():
-    """mamba_align_size > block_size (32 vs 16): final boundary 96 with
-    a missing attention hash2 page -> mamba snapshot only at 96 -> full
-    MISS (no intermediate boundary usable)."""
-    groups = [
-        _group(0, "attention", 16),
-        _group(1, "mamba", 16, align=32),
-    ]
-    backend = _Store(
-        set(),
-        committed_pairs=_hybrid_pairs([0, 1, 3, 4, 5], [5]))
-    sched = HybridRequestScheduler(groups, backend, 544)
-    req = type("R", (), {
-        "request_id": "r1", "block_hashes": [0, 1, 2, 3, 4, 5],
-        "num_tokens": 96})
-    ext, _ = sched.get_num_new_matched_tokens(req, 0)
-    assert ext == 0, ext  # mamba snapshot unusable below 96 -> MISS
+    assert sched._req_states["r1"].num_computed_tokens == 544
 
 
 def test_mamba_partial_recovery_with_earlier_snapshot():

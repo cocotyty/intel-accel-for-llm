@@ -134,7 +134,6 @@ class GroupInfo:
     kind: str  # "attention" | "mamba"
     layer_names: tuple[str, ...]
     block_size: int  # tokens per block for this group
-    mamba_align_size: Optional[int]  # offload chunk alignment for mamba
     # vLLM's own spec for this group, kept so the hit policy can hand it
     # back to vLLM's matching code instead of reimplementing it.
     spec: object = None
@@ -166,8 +165,6 @@ def parse_kv_cache_config(
             kind=kind,
             layer_names=tuple(g.layer_names),
             block_size=int(spec.block_size),
-            mamba_align_size=(int(spec.block_size)
-                              if kind == "mamba" else None),
             spec=spec,
         ))
     return groups
@@ -249,7 +246,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_intel_accel()
 
         pc = vllm_config.parallel_config
-        tp_size = pc.tensor_parallel_size
         # Fail-closed: pipeline parallelism shards LAYERS across ranks,
         # so one rank holds half the model's KV and its pages alone name
         # only half a block. Every key would silently address a partial
@@ -290,16 +286,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # layer_name -> group idx, every cached layer.
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
-            # attention layer_name -> group idx (mamba layers map out).
-            self._attn_layer_group = {
-                ln: g.group_idx for g in groups if g.kind != "mamba"
-                for ln in g.layer_names}
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
             "hash_block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            tp_size, self.rank, self._hash_block_size,
+            self.tp_size, self.rank, self._hash_block_size,
             [(g.group_idx, g.kind, g.block_size) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
@@ -793,7 +785,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Attention layers in model execution order, used by the async
         # release gate ("the first N layers" means nothing otherwise).
         self._attn_order = tuple(
-            ln for ln in execution_order if ln in self._attn_layer_group)
+            ln for ln in execution_order
+            if ln not in self._mamba_layers)
         # Save pipelining segments: the mamba layers between attention
         # layer i-1 and attention layer i are final when i's save hook
         # fires, so they ride that hook (the trailing segment is
@@ -803,7 +796,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for ln in execution_order:
             if ln in self._mamba_layers:
                 pending.append(ln)
-            elif ln in self._attn_layer_group and pending:
+            elif pending:
                 segments[ln] = tuple(pending)
                 pending = []
         self._mamba_save_segments = segments
@@ -844,8 +837,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Submit all of this step's loads, then host-block on the
         # recurrent ones (no hook ever fires for them). Attention
         # pages are waited per layer by the forward hooks.
-        # Per-step reset; _saved_layers/_step_save_pages track
-        # what the save hooks have submitted.
+        # This is the first worker call of the step, so the save
+        # bookkeeping resets here -- before any save hook can fire.
         self._current_get_tasks = None
         self._saved_layers = set()
         self._step_save_pages = 0
@@ -1012,8 +1005,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Submit every layer no hook covered (the trailing mamba
         segment), then log the step's save volume. Submission only;
         the drain lives in get_finished."""
-        if self.kvstore is None:
-            return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")

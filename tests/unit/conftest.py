@@ -99,9 +99,6 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._active_promoted_tasks = {}
     conn._layer_group = {
         ln: g.group_idx for g in groups for ln in g.layer_names}
-    conn._attn_layer_group = {
-        ln: g.group_idx for g in groups if g.kind != "mamba"
-        for ln in g.layer_names}
     conn._mamba_layers = frozenset()
     conn._attn_order = ()
     conn._last_layer_name = None

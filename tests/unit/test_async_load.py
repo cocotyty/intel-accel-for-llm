@@ -36,7 +36,6 @@ def _group(g_idx, kind, layers):
     return GroupInfo(
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
         block_size=16,
-        mamba_align_size=16 if kind == "mamba" else None,
         spec=make_spec(kind, 16))
 
 
