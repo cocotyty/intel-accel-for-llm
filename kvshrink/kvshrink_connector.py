@@ -511,22 +511,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                                              range(start, num_hash))
                     gstate.next_stored_chunk_idx = num_hash
             else:
-                if state.block_hashes:
-                    block_pos = None
-                    for pos in range(len(ids) - 1, -1, -1):
-                        if ids[pos] != 0:
-                            block_pos = pos
-                            break
-                    if (block_pos is not None and progress > 0
-                            and progress % group.block_size == 0):
-                        idx = progress // group.block_size - 1
-                        if (idx >= gstate.next_stored_chunk_idx
-                                and idx < len(state.block_hashes)):
-                            if group is owner:
-                                hashes = [_hash_str(
-                                    state.block_hashes[idx])]
-                            group_ids[g_idx] = (ids[block_pos],)
-                            gstate.next_stored_chunk_idx = idx + 1
+                if (progress > 0
+                        and progress % group.block_size == 0):
+                    idx = progress // group.block_size - 1
+                    if (idx >= gstate.next_stored_chunk_idx
+                            and idx < len(state.block_hashes)):
+                        if idx >= len(ids) or ids[idx] == 0:
+                            raise RuntimeError(
+                                "kvshrink mamba save: boundary column "
+                                f"is NULL (req={req_id} "
+                                f"progress={progress} "
+                                f"table_idx={idx} table={ids})")
+                        if group is owner:
+                            hashes = [_hash_str(
+                                state.block_hashes[idx])]
+                        group_ids[g_idx] = (ids[idx],)
+                        gstate.next_stored_chunk_idx = idx + 1
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
