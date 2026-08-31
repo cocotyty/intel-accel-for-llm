@@ -279,12 +279,19 @@ def test_resumed_load_meta_restores_credited_pages():
 
 def test_resumed_load_meta_without_credit_is_quiet():
     """Resume covered entirely by the LOCAL prefix cache (ext=0, no
-    external boundary): empty load meta, no error."""
+    external boundary): no load plan is built at all."""
+    from types import SimpleNamespace
     sched = _hybrid_resumed_setup(set(range(34)), ext=0)
-    meta = sched.build_resumed_load_meta("r1", scheduled_tokens=64)
-    assert meta is not None
-    assert meta.block_hashes == ()
-    assert all(len(g) == 0 for g in meta.group_block_ids)
+    conn = _sched_side_connector(sched)
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r1"], resumed_req_ids={"r1"},
+            new_block_ids=[(list(range(100, 134)), [200, 201])],
+            num_computed_tokens=[544]),
+        num_scheduled_tokens={"r1": 64})
+    meta = conn.build_connector_meta(scheduler_output)
+    assert "r1" not in meta.reqs_to_load.requests
 
 
 def test_connector_meta_includes_resumed_load():
