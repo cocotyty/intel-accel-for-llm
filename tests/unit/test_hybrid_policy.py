@@ -9,12 +9,12 @@ from kvshrink.kvshrink_connector import GroupInfo
 from kvshrink.hybrid_hit import HybridHitPolicy
 
 
-def _group(g_idx, kind, block_size, align=None, mode="align"):
+def _group(g_idx, kind, block_size):
     return GroupInfo(
         group_idx=g_idx, kind=kind,
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
         block_size=block_size,
-        mamba_align_size=align, spec=make_spec(kind, block_size))
+        spec=make_spec(kind, block_size))
 
 
 def _hashes(committed: set[int], n_blocks: int):
@@ -33,31 +33,26 @@ def test_attention_prefix_only():
 
 def test_gdn_nearest_snapshot():
     """GDN finds the nearest snapshot walking right-to-left; no prefix
-    contiguity required. block_size=16, align=32, 4 blocks (64 tokens).
-
-    Only hash2 (48-token boundary) exists; 48 is NOT a multiple of the
-    alignment 32, so it cannot be used as a restore snapshot
-    (upstream MambaManager: `(i+1)*block_size % alignment_tokens` gate).
-    """
-    groups = [_group(0, "mamba", 16, align=32)]
-    b, hashes = _hashes({2}, 4)  # hash2 = 48-token boundary (not aligned)
+    contiguity required. block_size=16, 4 blocks (64 tokens). Only
+    hash2 (48-token boundary) exists -> restore 48."""
+    groups = [_group(0, "mamba", 16)]
+    b, hashes = _hashes({2}, 4)
     policy = HybridHitPolicy(groups, b, 16, 0)
-    assert policy.find_longest_cache_hit(hashes, 64) == 0
+    assert policy.find_longest_cache_hit(hashes, 64) == 48
 
 
 def test_gdn_walks_left_when_boundary_missing():
-    """Snapshot below the aligned candidate must itself be on an
-    alignment boundary. Only hash0 (16 tokens) exists; 16 % 32 != 0 ->
-    no usable snapshot -> MISS (upstream alignment gate)."""
-    groups = [_group(0, "mamba", 16, align=32)]
-    b, hashes = _hashes({0}, 4)  # only hash0 (16-token boundary) exists
+    """The snapshot nearest the candidate is missing; the scan keeps
+    walking left. Only hash0 (16 tokens) exists -> restore 16."""
+    groups = [_group(0, "mamba", 16)]
+    b, hashes = _hashes({0}, 4)
     policy = HybridHitPolicy(groups, b, 16, 0)
-    assert policy.find_longest_cache_hit(hashes, 64) == 0
+    assert policy.find_longest_cache_hit(hashes, 64) == 16
 
 
 def test_multi_group_convergence():
     """Attention and GDN groups, both fully present."""
-    groups = [_group(0, "attention", 32), _group(1, "mamba", 32, align=32)]
+    groups = [_group(0, "attention", 32), _group(1, "mamba", 32)]
     b, hashes = _hashes({0, 1, 2, 3}, 4)
     policy = HybridHitPolicy(groups, b, 32, 0)
     # the last prompt token is always recomputed: 128 -> 127, aligned
@@ -67,7 +62,7 @@ def test_multi_group_convergence():
 
 def test_align_down_and_minus_one():
     """Non-aligned boundary rounds down; -1 applied once."""
-    groups = [_group(0, "mamba", 16, align=32)]
+    groups = [_group(0, "mamba", 16)]
     b, hashes = _hashes({0, 1, 2, 3, 4, 5}, 6)  # 96 tokens
     policy = HybridHitPolicy(groups, b, 16, 0)
     # candidate = min(99, 99//32*32) = 96 -> idx 6/5 ... hash5 HIT -> 96
@@ -99,7 +94,7 @@ def test_no_hit():
 
 def test_boundary_table():
     """Table-driven: prompt lengths around block/alignment boundaries."""
-    groups = [_group(0, "attention", 32), _group(1, "mamba", 16, align=32)]
+    groups = [_group(0, "attention", 32), _group(1, "mamba", 16)]
     for length in (31, 32, 33, 63, 64, 65, 95, 96, 97):
         n_blocks = length // 16 + 2
         b, hashes = _hashes(set(range(n_blocks)), n_blocks)
@@ -113,33 +108,27 @@ def test_boundary_table():
                 f"len={length} got {boundary} want {expected}")
 
 
-def test_mamba_lookup_starts_left_of_boundary():
-    """Mamba right-to-left scan must start at the hash AT the aligned
-    boundary (aligned//gran - 1), never at the block AFTER the candidate.
-
-    with a longer hash
-    chain and another group shrinking the candidate, probing from
-    aligned//gran could hit a snapshot to the RIGHT of the candidate and
-    report a false boundary.
-    """
-    # attention block 16, mamba block 16 align 32; 6 blocks = 96 tokens
+def test_mamba_lookup_never_overshoots_the_candidate():
+    """The mamba scan may never report a boundary past what the other
+    groups already shrank the candidate to: attention misses hash4 ->
+    candidate 64; mamba's own lookup then only sees hashes 0..3 and
+    must settle at 64, not report a snapshot to the right of it."""
+    # attention and mamba both block_size 16; 6 blocks = 96 tokens
     groups = [
         _group(0, "attention", 16),
-        _group(1, "mamba", 16, align=32),
+        _group(1, "mamba", 16),
     ]
-    # candidate shrinks to 64 (attention only hashes 0..3 committed).
-    # hash4 (80-token boundary) is committed but lies AFTER candidate 64.
-    # Old bug: mamba started at aligned//gran = 64//16 = 4 -> HIT hash4
-    # -> boundary 80 > candidate 64 (false, never allowed).
-    b, hashes = _hashes({0, 1, 2, 3, 4}, 6)
+    # attention is missing hash4 (80-token boundary); mamba has all.
+    b, hashes = _hashes({0, 1, 2, 3, 5}, 6)
     policy = HybridHitPolicy(groups, b, 16, 0)
-    # mamba: 95//32*32=64 -> idx=64//16-1=3 -> hash3 HIT -> 64
+    # candidate = 95//16*16 = 80; attention stops at hash3 -> 64;
+    # mamba re-lookup under candidate 64: max_num_blocks=4 -> hash3
     assert policy.find_longest_cache_hit(hashes, 96) == 64
 
 
 def test_mamba_snapshot_exactly_at_boundary():
     """Aligned boundary 64 with only hash3 committed -> hit 64."""
-    groups = [_group(0, "mamba", 16, align=32)]
+    groups = [_group(0, "mamba", 16)]
     b, hashes = _hashes({3}, 4)  # hash3 = 64-token boundary
     policy = HybridHitPolicy(groups, b, 16, 0)
     # candidate = min(63, 63//32*32) = 32 -> idx=32//16-1=1 ->
@@ -150,7 +139,7 @@ def test_mamba_snapshot_exactly_at_boundary():
 def test_mamba_snapshot_at_candidate_cannot_overshoot():
     """Even if hash right of candidate is committed, boundary never
     exceeds candidate (fail closed on overrun)."""
-    groups = [_group(0, "mamba", 16, align=32)]
+    groups = [_group(0, "mamba", 16)]
     b, hashes = _hashes({5}, 6)  # hash5 = 96-token boundary
     policy = HybridHitPolicy(groups, b, 16, 0)
     # 96 > candidate 32 -> miss
@@ -159,14 +148,14 @@ def test_mamba_snapshot_at_candidate_cannot_overshoot():
 
 def test_mamba_empty_hashes_miss():
     """Empty hash list -> no scan -> MISS (no IndexError)."""
-    groups = [_group(0, "mamba", 16, align=32)]
+    groups = [_group(0, "mamba", 16)]
     policy = HybridHitPolicy(groups, lambda g, h: False, 16, 0)
     assert policy.find_longest_cache_hit([], 64) == 0
 
 
 def test_mamba_candidate_below_gran_miss():
     """candidate < gran (and < align): aligned=0 -> max_idx=-1 -> MISS."""
-    groups = [_group(0, "mamba", 16, align=32)]
+    groups = [_group(0, "mamba", 16)]
     b, hashes = _hashes({0}, 2)  # hash0 (16 tokens) committed
     policy = HybridHitPolicy(groups, b, 16, 0)
     # candidate = min(15, 15//32*32=0) = 0 -> MISS
