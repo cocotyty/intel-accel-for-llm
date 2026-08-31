@@ -57,12 +57,12 @@ class HybridHitPolicy:
         # full attention first (tighter initial bound)
         self._ordered: list[GroupInfo] = sorted(
             groups, key=lambda g: 0 if g.kind == "attention" else 1)
-        self._mamba_align: Optional[int] = None
-        for g in groups:
-            if g.kind == "mamba":
-                a = g.mamba_align_size
-                self._mamba_align = a if self._mamba_align is None \
-                    else min(self._mamba_align, a)
+        # A snapshot is restorable only on its group's own boundaries,
+        # so the candidate must be floored to the coarsest granularity
+        # any recurrent group enforces (they may differ per group).
+        self._mamba_floor = min(
+            (g.block_size for g in groups if g.kind == "mamba"),
+            default=None)
 
     # ------------------------------------------------------------------
     def _lookup(self, group: GroupInfo, block_hashes: list[int],
@@ -83,7 +83,7 @@ class HybridHitPolicy:
             block_pool=_StoreAsBlockPool(self._present),
             kv_cache_spec=group.spec,
             drop_eagle_block=False,
-            alignment_tokens=(self._mamba_align or group.block_size),
+            alignment_tokens=group.block_size,
         )
         return len(blocks[0]) * group.block_size
 
@@ -94,9 +94,9 @@ class HybridHitPolicy:
         """Fixed-point convergence over all groups; returns the
         restorable prefix in tokens (the snapshot boundary)."""
         candidate = max_length
-        if self._mamba_align is not None:
+        if self._mamba_floor is not None:
             # the last prompt token is always recomputed (logprobs + state)
-            a = self._mamba_align
+            a = self._mamba_floor
             candidate = min(candidate - 1, (candidate - 1) // a * a)
 
         while True:

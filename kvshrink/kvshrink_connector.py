@@ -108,7 +108,6 @@ class GroupInfo:
     kind: str
     layer_names: tuple[str, ...]
     block_size: int
-    mamba_align_size: Optional[int]
     spec: object = None
 
 def _hash_str(block_hash) -> str:
@@ -133,8 +132,6 @@ def parse_kv_cache_config(
             kind=kind,
             layer_names=tuple(g.layer_names),
             block_size=int(spec.block_size),
-            mamba_align_size=(int(spec.block_size)
-                              if kind == "mamba" else None),
             spec=spec,
         ))
     return groups
@@ -196,7 +193,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_intel_accel()
 
         pc = vllm_config.parallel_config
-        tp_size = pc.tensor_parallel_size
         if pc.pipeline_parallel_size != 1:
             raise RuntimeError(
                 "kvshrink hybrid: pipeline parallelism is not supported "
@@ -222,15 +218,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if role != KVConnectorRole.SCHEDULER:
             self._layer_group = {
                 ln: g.group_idx for g in groups for ln in g.layer_names}
-            self._attn_layer_group = {
-                ln: g.group_idx for g in groups if g.kind != "mamba"
-                for ln in g.layer_names}
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
             "hash_block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            tp_size, self.rank, self._hash_block_size,
+            self.tp_size, self.rank, self._hash_block_size,
             [(g.group_idx, g.kind, g.block_size) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
@@ -636,13 +629,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ln for g in self._groups if g.kind == "mamba"
             for ln in g.layer_names)
         self._attn_order = tuple(
-            ln for ln in execution_order if ln in self._attn_layer_group)
+            ln for ln in execution_order
+            if ln not in self._mamba_layers)
         segments: dict[str, tuple[str, ...]] = {}
         pending: list[str] = []
         for ln in execution_order:
             if ln in self._mamba_layers:
                 pending.append(ln)
-            elif ln in self._attn_layer_group and pending:
+            elif pending:
                 segments[ln] = tuple(pending)
                 pending = []
         self._mamba_save_segments = segments
@@ -817,8 +811,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Submit every layer no hook covered (the trailing mamba
         segment), then log the step's save volume. Submission only;
         the drain lives in get_finished."""
-        if self.kvstore is None:
-            return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
