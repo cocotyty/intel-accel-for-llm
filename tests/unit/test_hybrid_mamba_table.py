@@ -314,14 +314,18 @@ def test_load_meta_table_idx_out_of_range_fail_closed():
 
 
 def test_load_meta_fail_closed_without_boundary():
-    """No external credit (pending_load_tokens=0) -> 0 keys, never
-    guess by recomputing."""
+    """No external credit (pending_load_tokens=0): the meta builder is
+    never called for the request -- no plan, nothing to guess."""
+    from types import SimpleNamespace
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5]])
-    meta = sched.build_load_meta(
-        type("R", (), {"req_id": "r1", "num_tokens": 545,
-                       "block_ids": ([5],)}))
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+    meta = sched.build_connector_meta(SimpleNamespace(
+        scheduled_new_reqs=[type("R", (), {"req_id": "r1"})],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], resumed_req_ids=set(),
+            new_block_ids=[], num_computed_tokens=[]),
+        num_scheduled_tokens={"r1": 545}))
+    assert "r1" not in meta.reqs_to_load.requests, meta
 
 
 def test_save_meta_all_null_table_fail_closed():
