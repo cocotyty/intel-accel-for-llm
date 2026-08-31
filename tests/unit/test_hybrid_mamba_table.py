@@ -82,11 +82,12 @@ def test_save_meta_single_element_table():
 
 
 def test_save_meta_null_prefixed_table():
-    """Null-prefixed [0,0,X]: last non-null block is used."""
+    """Legal resumed shape [NULL, X]: the boundary column is the
+    formula slot, not the last non-null block by accident."""
     groups = [_group(0, "mamba", 544)]
-    sched = _make(groups, {0}, [[0, 0, 7]])
-    meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert meta.block_hashes == ("0",), meta
+    sched = _make(groups, {0}, [[0, 7]])
+    meta = sched.build_save_meta("r1", scheduled_tokens=1088)
+    assert meta.block_hashes == ("1",), meta
     assert meta.group_block_ids == ((7,),), meta
 
 
@@ -100,12 +101,26 @@ def test_save_meta_skips_partial_tail():
 
 
 def test_save_meta_multi_block_boundary():
-    """progress 1088 = 2 complete blocks -> hash idx=1 (hash1)."""
+    """progress 1088 = 2 complete blocks -> hash idx=1 (hash1), block
+    taken from the formula slot (same index the kernel wrote)."""
     groups = [_group(0, "mamba", 544)]
-    sched = _make(groups, {1}, [[0, 0, 7]])
+    sched = _make(groups, {1}, [[0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
     assert meta.block_hashes == ("1",), meta
     assert meta.group_block_ids == ((7,),), meta
+
+
+def test_save_meta_prev_and_curr_blocks_save_curr():
+    """Legal shape [NULL, prev, curr] at a 3-block boundary: the exit
+    state is in the LAST column (block 47), never the surviving prev
+    block 31 the old reverse scan could have preferred on a mis-sized
+    table."""
+    groups = [_group(0, "mamba", 544)]
+    sched = _make(groups, {1, 2}, [[0, 31, 47]])
+    sched._req_states["r1"].block_hashes = [0, 1, 2]
+    meta = sched.build_save_meta("r1", scheduled_tokens=1632)
+    assert meta.block_hashes == ("2",), meta
+    assert meta.group_block_ids == ((47,),), meta
 
 
 def test_load_meta_curr_slot_is_last_scheduled_block():
@@ -309,12 +324,20 @@ def test_load_meta_fail_closed_without_boundary():
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
-def test_save_meta_all_null_table_skipped():
-    """All-null table [0,0] -> no mamba save keys."""
+def test_save_meta_all_null_table_fail_closed():
+    """All-null table at a boundary -> FAIL-STOP, mirroring the load
+    path: the kernel cannot have left the exit state anywhere, so
+    saving any other block under the boundary hash would silently
+    poison the store."""
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0]])
-    meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+    raised = None
+    try:
+        sched.build_save_meta("r1", scheduled_tokens=1088)
+    except RuntimeError as e:
+        raised = e
+    assert raised is not None, "all-null table must raise"
+    assert "boundary column is NULL" in str(raised)
 
 
 def test_load_meta_all_null_table_fail_closed():
