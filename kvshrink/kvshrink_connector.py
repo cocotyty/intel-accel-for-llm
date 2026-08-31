@@ -413,66 +413,66 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         state = self._req_states[req_id]
         meta = self._build_load_meta_from_state(
             req_id, state, scheduled_tokens)
-        if state.pending_load_tokens > 0:
-            npages = sum(len(g) for g in meta.group_block_ids)
-            if npages == 0:
-                raise RuntimeError(
-                    "kvshrink resumed request has accepted external "
-                    "tokens but no restorable pages (req="
-                    f"{req_id} pending={state.pending_load_tokens} "
-                    f"boundary={state.num_computed_tokens} "
-                    f"sched={scheduled_tokens}): refusing to enter "
-                    "forward with unrestored state")
+        npages = sum(len(g) for g in meta.group_block_ids)
+        if npages == 0:
+            raise RuntimeError(
+                "kvshrink resumed request has accepted external "
+                "tokens but no restorable pages (req="
+                f"{req_id} pending={state.pending_load_tokens} "
+                f"boundary={state.num_computed_tokens} "
+                f"sched={scheduled_tokens}): refusing to enter "
+                "forward with unrestored state")
         return meta
 
     def _build_load_meta_from_state(
         self, req_id: str, state: ReqState, scheduled_tokens: int,
     ) -> ReqMeta:
-        """Build one request's load plan from its recorded state."""
+        """Build one request's load plan from its recorded state. The
+        caller only calls this for requests that accepted external
+        tokens (state.pending_load_tokens > 0)."""
         ext = state.pending_load_tokens
+        nc = state.num_computed_tokens
         hashes: list[str] = []
         group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
-        if ext > 0:
-            nc = state.num_computed_tokens
-            owner = next(
-                (g for g in self._groups if g.kind == "attention"),
-                self._groups[0])
-            for g_idx, group in enumerate(self._groups):
-                ids = state.groups[g_idx].block_ids
-                if group.kind == "attention":
-                    start = (nc - ext) // group.block_size
-                    end = nc // group.block_size
-                    if group is owner:
-                        hashes = [_hash_str(state.block_hashes[i])
-                                  for i in range(start, end)]
-                    group_ids[g_idx] = tuple(ids[i]
-                                             for i in range(start, end))
-                elif group.kind == "mamba":
-                    curr_idx = (nc + scheduled_tokens
-                                - 1) // group.block_size
+        owner = next(
+            (g for g in self._groups if g.kind == "attention"),
+            self._groups[0])
+        for g_idx, group in enumerate(self._groups):
+            ids = state.groups[g_idx].block_ids
+            if group.kind == "attention":
+                start = (nc - ext) // group.block_size
+                end = nc // group.block_size
+                if group is owner:
+                    hashes = [_hash_str(state.block_hashes[i])
+                              for i in range(start, end)]
+                group_ids[g_idx] = tuple(ids[i]
+                                         for i in range(start, end))
+            elif group.kind == "mamba":
+                curr_idx = (nc + scheduled_tokens
+                            - 1) // group.block_size
 
-                    if scheduled_tokens <= 0 and not state.is_async:
-                        raise RuntimeError(
-                            "kvshrink mamba external HIT with "
-                            "scheduled_tokens=0 "
-                            f"(req={req_id} "
-                            f"boundary={nc}): "
-                            "production hits must schedule >= 1 "
-                            "token; refusing to build load meta")
-                    if not (0 <= curr_idx < len(ids)
-                            and ids[curr_idx] != 0):
-                        raise RuntimeError(
-                            "kvshrink mamba load curr slot "
-                            f"invalid (req={req_id} "
-                            f"boundary={nc} "
-                            f"sched={scheduled_tokens} "
-                            f"table_idx={curr_idx} "
-                            f"table={ids}): refusing to enter "
-                            "forward with unrestored state")
-                    if group is owner:
-                        idx = nc // group.block_size - 1
-                        hashes = [_hash_str(state.block_hashes[idx])]
-                    group_ids[g_idx] = (ids[curr_idx],)
+                if scheduled_tokens <= 0 and not state.is_async:
+                    raise RuntimeError(
+                        "kvshrink mamba external HIT with "
+                        "scheduled_tokens=0 "
+                        f"(req={req_id} "
+                        f"boundary={nc}): "
+                        "production hits must schedule >= 1 "
+                        "token; refusing to build load meta")
+                if not (0 <= curr_idx < len(ids)
+                        and ids[curr_idx] != 0):
+                    raise RuntimeError(
+                        "kvshrink mamba load curr slot "
+                        f"invalid (req={req_id} "
+                        f"boundary={nc} "
+                        f"sched={scheduled_tokens} "
+                        f"table_idx={curr_idx} "
+                        f"table={ids}): refusing to enter "
+                        "forward with unrestored state")
+                if group is owner:
+                    idx = nc // group.block_size - 1
+                    hashes = [_hash_str(state.block_hashes[idx])]
+                group_ids[g_idx] = (ids[curr_idx],)
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
@@ -540,9 +540,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_sched = scheduler_output.num_scheduled_tokens
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            req_meta = self.build_load_meta(
-                new_req, num_sched[new_req.req_id])
-            if any(req_meta.group_block_ids):
+            if self._req_states[new_req.req_id].pending_load_tokens > 0:
+                req_meta = self.build_load_meta(
+                    new_req, num_sched[new_req.req_id])
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.block_hashes,
                     req_meta.group_block_ids, req_meta.is_async,
@@ -569,9 +569,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
-            req_meta = self.build_resumed_load_meta(
-                req_id, num_sched[req_id])
-            if any(req_meta.group_block_ids):
+            if self._req_states[req_id].pending_load_tokens > 0:
+                req_meta = self.build_resumed_load_meta(
+                    req_id, num_sched[req_id])
                 meta.reqs_to_load.add_request(
                     req_id, req_meta.block_hashes,
                     req_meta.group_block_ids, req_meta.is_async,
