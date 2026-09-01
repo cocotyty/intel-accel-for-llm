@@ -479,6 +479,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     idx = nc // self._block_size - 1
                     hashes = [_hash_str(state.block_hashes[idx])]
                 group_ids[g_idx] = (ids[curr_idx],)
+        skip_to = nc // self._block_size
+        for gstate in state.groups:
+            if gstate.next_stored_chunk_idx < skip_to:
+                gstate.next_stored_chunk_idx = skip_to
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
