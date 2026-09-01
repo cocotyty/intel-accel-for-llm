@@ -35,7 +35,6 @@ GDN = ["m0", "m2"]
 def _group(g_idx, kind, layers):
     return GroupInfo(
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
-        block_size=16,
         spec=make_spec(kind, 16))
 
 
@@ -237,7 +236,7 @@ def test_parked_request_still_gets_a_load_plan():
 
     groups = [_group(0, "attention", ATTN)]
     sched = HybridRequestScheduler(
-        groups, _FakeStore(), hash_block_size=16)
+        groups, _FakeStore(), 16)
     st = ReqState(
         block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
@@ -260,8 +259,7 @@ def test_async_plan_is_emitted_only_once():
     from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeStore(),
-        hash_block_size=16)
+        [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
         block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
@@ -296,8 +294,7 @@ def test_recurrent_models_can_go_async():
 
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
-        _FakeStore(), hash_block_size=16,
-        async_load_config=_Cfg())
+        _FakeStore(), 16, async_load_config=_Cfg())
     external, use_async = hybrid.get_num_new_matched_tokens(_Req(), 0)
     assert external == 32 and use_async is True
 
@@ -336,7 +333,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
 
     groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
     sched = HybridRequestScheduler(
-        groups, _FakeStore(), hash_block_size=16)
+        groups, _FakeStore(), 16)
     st = ReqState(
         block_hashes=[1, 2, 3, 4], num_computed_tokens=64,
         pending_load_tokens=64,
@@ -361,7 +358,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
+        [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
         block_hashes=[1, 2],
         groups=(ReqGroupState(block_ids=[4, 5]),))
@@ -401,7 +398,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     from conftest import HybridRequestScheduler
 
     sched = HybridRequestScheduler(
-        [_group(0, "attention", ATTN)], _FakeStore(), hash_block_size=16)
+        [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
         block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
