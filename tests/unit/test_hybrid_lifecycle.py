@@ -279,6 +279,61 @@ def test_resumed_load_meta_restores_credited_pages():
     assert meta.group_block_ids[1] == (237,), meta
 
 
+def test_restored_blocks_are_not_rewritten_on_first_save():
+    """The load plan reads the hit range back from the external store,
+    so the save cursors skip past it: the first post-restore save pass
+    must not re-write those blocks (attention pages and the restored
+    mamba snapshot alike)."""
+    sched = _hybrid_resumed_setup(set(range(34)))
+    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    st = sched._req_states["r1"]
+    # 544 credited tokens = 34 blocks: every cursor starts past them
+    assert all(g.next_stored_chunk_idx == 34 for g in st.groups), [
+        g.next_stored_chunk_idx for g in st.groups]
+    # Forward completes tokens up to 544+64=608: the ledger and the
+    # attention table grow past the restored range by 4 blocks
+    st.block_hashes.extend(range(34, 38))
+    st.groups[0].block_ids.extend(range(134, 138))
+    m = sched.build_save_meta("r1", scheduled_tokens=64)
+    # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
+    assert m.block_hashes == ("34", "35", "36", "37"), m
+    assert m.group_block_ids[0] == (134, 135, 136, 137), m
+    # the mamba snapshot at the 608 boundary is new past the skip too
+    assert m.group_block_ids[1] == (237,), m
+
+
+def test_incremental_boundaries_after_restore_are_saved():
+    """The skip is a floor, not a wall: once forward crosses boundaries
+    the restore did NOT cover, those blocks must still be saved."""
+    sched = _hybrid_resumed_setup(set(range(34)))
+    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    # Extend the ledger and both tables past the restored range
+    st = sched._req_states["r1"]
+    st.block_hashes.extend(range(34, 74))
+    st.groups[0].block_ids.extend(range(134, 174))
+    st.groups[1].block_ids.extend(range(238, 274))
+    # 544 + 640 = 1184 tokens = 74 blocks: 40 blocks past the skip
+    m = sched.build_save_meta("r1", scheduled_tokens=640)
+    assert len(m.block_hashes) == 40, m
+    assert m.group_block_ids[0] == tuple(range(134, 174)), m
+    # mamba snapshot at the 1184 boundary: table idx 73
+    assert m.group_block_ids[1] == (273,), m
+
+
+def test_resume_rollback_still_overrides_the_skip():
+    """Preemption after the restore rolls the cursors back per the
+    resumed progress -- the skip must never keep a cursor ahead of
+    what vLLM says is computed."""
+    sched = _hybrid_resumed_setup(set(range(34)))
+    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    # Preempted back to 32 tokens (2 blocks): every cursor rolls to 2
+    sched.on_cached_request("r1", (list(range(100, 102)), [200, 201]),
+                            resumed=True, num_computed_tokens=32)
+    st = sched._req_states["r1"]
+    assert all(g.next_stored_chunk_idx == 2 for g in st.groups), [
+        g.next_stored_chunk_idx for g in st.groups]
+
+
 def test_resumed_load_meta_without_credit_is_quiet():
     """Resume covered entirely by the LOCAL prefix cache (ext=0, no
     external boundary): no load plan is built at all."""
