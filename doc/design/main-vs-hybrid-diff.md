@@ -263,7 +263,7 @@ unzip_from_mem 会 raise（fail-stop 保留，只是换在更底层的自然位
 态），无游标无回滚可言。existence_cache 恰好兼做去重——已经在店的
 就不重发了。
 
-**我们**：`next_stored_chunk_idx` 每 group 一个，emit 即推进。判定上
+**我们**：`next_block_to_save` 每 group 一个，emit 即推进。判定上
 需要的结果相同，语义升级在于回答"哪些已发的可能其实没落地"——
 
 预占恢复时卷回 floor(N/bs)，哪怕 progress 缺失（fail-closed 到 0 重

@@ -67,7 +67,7 @@ class ReqMeta:
 class ReqGroupState:
     """Per-group mutable state for one request (scheduler side)."""
     block_ids: list[int] = field(default_factory=list)
-    next_stored_chunk_idx: int = 0
+    next_block_to_save: int = 0
 
 
 @dataclass
@@ -394,8 +394,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             for g_idx, group in enumerate(self._groups):
                 gstate = state.groups[g_idx]
                 safe = safe_n // self._block_size
-                if gstate.next_stored_chunk_idx > safe:
-                    gstate.next_stored_chunk_idx = safe
+                if gstate.next_block_to_save > safe:
+                    gstate.next_block_to_save = safe
         if new_block_ids:
             for gstate, ids in zip(state.groups, new_block_ids):
                 if resumed:
@@ -619,8 +619,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # nc//bs is the slot past that boundary's snapshot.
         skip_to = nc // self._block_size
         for gstate in state.groups:
-            if gstate.next_stored_chunk_idx < skip_to:
-                gstate.next_stored_chunk_idx = skip_to
+            if gstate.next_block_to_save < skip_to:
+                gstate.next_block_to_save = skip_to
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
@@ -650,14 +650,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if group.kind == "attention":
                 num_hash = min(progress // self._block_size, len(ids),
                                len(state.block_hashes))
-                start = gstate.next_stored_chunk_idx
+                start = gstate.next_block_to_save
                 if num_hash > start:
                     if group is owner:
                         hashes = [_hash_str(state.block_hashes[i])
                                   for i in range(start, num_hash)]
                     group_ids[g_idx] = tuple(ids[i] for i in
                                              range(start, num_hash))
-                    gstate.next_stored_chunk_idx = num_hash
+                    gstate.next_block_to_save = num_hash
             else:
                 # Save the running-state block. align mode pins the
                 # kernel to the table's last column, so at a boundary
@@ -669,7 +669,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if (progress > 0
                         and progress % self._block_size == 0):
                     idx = progress // self._block_size - 1
-                    if (idx >= gstate.next_stored_chunk_idx
+                    if (idx >= gstate.next_block_to_save
                             and idx < len(state.block_hashes)):
                         if idx >= len(ids) or ids[idx] == 0:
                             raise RuntimeError(
@@ -681,7 +681,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                             hashes = [_hash_str(
                                 state.block_hashes[idx])]
                         group_ids[g_idx] = (ids[idx],)
-                        gstate.next_stored_chunk_idx = idx + 1
+                        gstate.next_block_to_save = idx + 1
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),

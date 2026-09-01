@@ -70,11 +70,11 @@ def test_resume_to_zero_rolls_cursor_and_reemits():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=32)  # cursor -> 2
-    assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 2
+    assert sched._req_states["r1"].groups[0].next_block_to_save == 2
     sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=0)
     g = sched._req_states["r1"].groups[0]
-    assert g.next_stored_chunk_idx == 0, g
+    assert g.next_block_to_save == 0, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
     assert m.group_block_ids == ((10, 11),), m.group_block_ids
 
@@ -87,10 +87,10 @@ def test_mamba_resume_reemits_boundary_snapshot():
         type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
     m1 = sched.build_save_meta("r1", scheduled_tokens=544)
     assert len(m1.block_hashes) == 1
-    assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 1
+    assert sched._req_states["r1"].groups[0].next_block_to_save == 1
     sched.on_cached_request("r1", ([9],), resumed=True,
                             num_computed_tokens=0)
-    assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 0
+    assert sched._req_states["r1"].groups[0].next_block_to_save == 0
     m2 = sched.build_save_meta("r1", scheduled_tokens=544)
     assert len(m2.block_hashes) == 1  # re-emitted
     assert m2.group_block_ids == ((9,),)
@@ -105,7 +105,7 @@ def test_resume_to_nonzero_progress_rolls_to_floor():
     sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=32)
     g = sched._req_states["r1"].groups[0]
-    assert g.next_stored_chunk_idx == 2, g
+    assert g.next_block_to_save == 2, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
     assert m.group_block_ids == ((12, 13),), m.group_block_ids
 
@@ -116,7 +116,7 @@ def test_monotonic_progress_no_rollback():
     sched.build_save_meta("r1", scheduled_tokens=32)
     sched.on_cached_request("r1", None, resumed=False,
                             num_computed_tokens=32)
-    assert sched._req_states["r1"].groups[0].next_stored_chunk_idx == 2
+    assert sched._req_states["r1"].groups[0].next_block_to_save == 2
 
 
 def test_resumed_empty_table_clears_and_rolls_back():
@@ -127,7 +127,7 @@ def test_resumed_empty_table_clears_and_rolls_back():
                             num_computed_tokens=0)
     g = sched._req_states["r1"].groups[0]
     assert g.block_ids == []
-    assert g.next_stored_chunk_idx == 0
+    assert g.next_block_to_save == 0
 
 
 def test_progress_regression_without_resumed_flag_rolls_back():
@@ -139,7 +139,7 @@ def test_progress_regression_without_resumed_flag_rolls_back():
     sched.on_cached_request("r1", None, resumed=False,
                             num_computed_tokens=16)
     g = sched._req_states["r1"].groups[0]
-    assert g.next_stored_chunk_idx == 1, g  # floor(16/16)
+    assert g.next_block_to_save == 1, g  # floor(16/16)
 
 
 # ------------------------------------------------------------------
@@ -201,7 +201,7 @@ def test_resumed_missing_progress_rolls_back_to_zero():
     sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=None)
     g = sched._req_states["r1"].groups[0]
-    assert g.next_stored_chunk_idx == 0, g
+    assert g.next_block_to_save == 0, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
     assert m.group_block_ids == ((10, 11),)  # re-emitted
 
@@ -223,7 +223,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         sched.on_cached_request(rid, ([10, 11, 12, 13],), resumed=True,
                                 num_computed_tokens=0)
         g = sched._req_states[rid].groups[0]
-        assert g.next_stored_chunk_idx == 0, f"round {i}: no rollback"
+        assert g.next_block_to_save == 0, f"round {i}: no rollback"
         m = sched.build_save_meta(rid, scheduled_tokens=64)
         assert m.group_block_ids == ((10, 11, 12, 13),)
         free, delay = conn.request_finished(
@@ -288,8 +288,8 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
     # 544 credited tokens = 34 blocks: every cursor starts past them
-    assert all(g.next_stored_chunk_idx == 34 for g in st.groups), [
-        g.next_stored_chunk_idx for g in st.groups]
+    assert all(g.next_block_to_save == 34 for g in st.groups), [
+        g.next_block_to_save for g in st.groups]
     # Forward completes tokens up to 544+64=608: the ledger and the
     # attention table grow past the restored range by 4 blocks
     st.block_hashes.extend(range(34, 38))
@@ -330,8 +330,8 @@ def test_resume_rollback_still_overrides_the_skip():
     sched.on_cached_request("r1", (list(range(100, 102)), [200, 201]),
                             resumed=True, num_computed_tokens=32)
     st = sched._req_states["r1"]
-    assert all(g.next_stored_chunk_idx == 2 for g in st.groups), [
-        g.next_stored_chunk_idx for g in st.groups]
+    assert all(g.next_block_to_save == 2 for g in st.groups), [
+        g.next_block_to_save for g in st.groups]
 
 
 def test_resumed_load_meta_without_credit_is_quiet():
