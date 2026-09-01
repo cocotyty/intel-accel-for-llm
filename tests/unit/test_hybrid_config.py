@@ -70,7 +70,8 @@ def test_fixture_shape():
 
 def test_parse_real_config():
     cfg = _real_config()
-    groups = parse_kv_cache_config(cfg)
+    groups, block_size = parse_kv_cache_config(cfg)
+    assert block_size == 528
     assert len(groups) == 4
     kinds = [g.kind for g in groups]
     assert kinds == ["mamba", "mamba", "mamba", "attention"]
@@ -83,7 +84,7 @@ def test_recurrent_page_spec_declares_both_states():
     the two have different shapes AND different dtypes. That is why the
     page travels as opaque bytes (KVStore fuses the parts at bind)."""
     cfg = _real_config()
-    groups = parse_kv_cache_config(cfg)
+    groups, _ = parse_kv_cache_config(cfg)
     lin = groups[0].spec
     conv_bytes = 3 * 4096 * 2              # bf16
     ssm_bytes = 16 * 128 * 128 * 4         # fp32

@@ -49,7 +49,7 @@ def _group(g_idx, kind, block_size):
     return GroupInfo(
         group_idx=g_idx, kind=kind,
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
-        block_size=block_size, spec=make_spec(kind, block_size))
+        spec=make_spec(kind, block_size))
 
 
 def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
@@ -61,7 +61,7 @@ def _hybrid_pairs(attn_hashes, mamba_hashes, attn_g=0, mamba_g=1):
 
 
 def _make(groups, committed, block_ids_per_group):
-    sched = HybridRequestScheduler(groups, _Store(committed), 16)
+    sched = HybridRequestScheduler(groups, _Store(committed), 544)
     track_new_request(sched, "r1", block_hashes=[0, 1],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(
@@ -293,7 +293,7 @@ def test_load_meta_table_idx_null_fail_closed():
 def test_load_meta_table_idx_out_of_range_fail_closed():
     """Gathered table index beyond the table length -> FAIL-STOP."""
     groups = [_group(0, "mamba", 544)]
-    sched = HybridRequestScheduler(groups, _Store({2}), 16)
+    sched = HybridRequestScheduler(groups, _Store({2}), 544)
     track_new_request(sched, "r1", block_hashes=[0, 1, 2],
                          num_computed_tokens=0)
     sched.update_state_after_alloc(

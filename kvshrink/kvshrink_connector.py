@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -128,12 +127,12 @@ class KVShrinkConnectorMetadata(KVConnectorMetadata):
 @dataclass(frozen=True)
 class GroupInfo:
     """One vLLM KV cache group: a frozen snapshot of its storage
-    contract (kind, layers, block size, mamba alignment)."""
+    contract (kind, layers). The block size is shared by every group
+    and lives on the connector, not here."""
 
     group_idx: int
     kind: str  # "attention" | "mamba"
     layer_names: tuple[str, ...]
-    block_size: int  # tokens per block for this group
     # vLLM's own spec for this group, kept so the hit policy can hand it
     # back to vLLM's matching code instead of reimplementing it.
     spec: object = None
@@ -150,24 +149,34 @@ def _hash_str(block_hash) -> str:
 # ======================================================================
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
-) -> list[GroupInfo]:
-    """One GroupInfo per vLLM KV cache group. Per-layer geometry is not
-    parsed: KVStore binds pools from the live tensors, which carry their
-    own layout."""
+) -> tuple[list[GroupInfo], int]:
+    """One GroupInfo per vLLM KV cache group, plus the block size.
+    Per-layer geometry is not parsed: KVStore binds pools from the
+    live tensors, which carry their own layout.
+
+    v0.23 pads hybrid models to a single block size at startup
+    (_align_hybrid_block_size): every group shares it, so a mismatch
+    here is a broken vLLM contract and fails closed."""
     groups: list[GroupInfo] = []
+    sizes: set[int] = set()
     for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
         spec = g.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[g.layer_names[0]]
         kind = "mamba" if isinstance(spec, MambaSpec) else "attention"
+        sizes.add(int(spec.block_size))
         groups.append(GroupInfo(
             group_idx=g_idx,
             kind=kind,
             layer_names=tuple(g.layer_names),
-            block_size=int(spec.block_size),
             spec=spec,
         ))
-    return groups
+    if len(sizes) != 1:
+        raise RuntimeError(
+            "kvshrink hybrid: groups have mismatched block sizes "
+            f"{sorted(sizes)}; v0.23 pads hybrid models to one block "
+            "size at startup, so this cannot be a valid config")
+    return groups, sizes.pop()
 
 
 # ======================================================================
@@ -256,12 +265,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 f"(pipeline_parallel_size={pc.pipeline_parallel_size}); "
                 "each rank would persist only its own layers' pages. "
                 "Set pipeline_parallel_size=1 or the KV connector.")
-        groups = parse_kv_cache_config(kv_cache_config)
+        groups, block_size = parse_kv_cache_config(kv_cache_config)
         self._groups = groups
-        # Block-hash granularity, per v0.23.0's resolve_kv_cache_block_sizes:
-        # the GCD of the groups' block sizes (every group's block size is
-        # divisible by it). Single group -> that group's block size.
-        self._hash_block_size = math.gcd(*(g.block_size for g in groups))
+        # The one block size every group shares (v0.23 pads hybrid
+        # models to it at startup); the engine's block hashes are
+        # generated at exactly this granularity.
+        self._block_size = block_size
 
         # Fail-closed: spec decode moves the GDN running state into
         # per-draft speculative blocks; the boundary block is committed
@@ -289,10 +298,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
-            "hash_block_size=%d, groups=%s)",
+            "block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
-            self.tp_size, self.rank, self._hash_block_size,
-            [(g.group_idx, g.kind, g.block_size) for g in groups])
+            self.tp_size, self.rank, self._block_size,
+            [(g.group_idx, g.kind) for g in groups])
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
@@ -384,7 +393,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             safe_n = num_computed_tokens or 0
             for g_idx, group in enumerate(self._groups):
                 gstate = state.groups[g_idx]
-                safe = safe_n // group.block_size
+                safe = safe_n // self._block_size
                 if gstate.next_stored_chunk_idx > safe:
                     gstate.next_stored_chunk_idx = safe
         if new_block_ids:
@@ -420,7 +429,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._groups,
             lambda g, h: self._store().has(
                 [_hash_str(h)], label=f"g{g}")[0],
-            self._hash_block_size, num_computed_tokens)
+            self._block_size, num_computed_tokens)
         # Restorable boundary in tokens; 0 = miss. The policy already
         # gated on live chunk presence (engine Record), so a nonzero
         # boundary is complete by construction; only record it.
@@ -551,8 +560,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # physical pages). The credit landed
                 # num_computed_tokens exactly on the boundary, so
                 # this range is the last ext tokens.
-                start = (nc - ext) // group.block_size
-                end = nc // group.block_size
+                start = (nc - ext) // self._block_size
+                end = nc // self._block_size
                 if group is owner:
                     hashes = [_hash_str(state.block_hashes[i])
                               for i in range(start, end)]
@@ -566,7 +575,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # last entry: the snapshot lives at the boundary,
                 # which the credit made num_computed_tokens.
                 curr_idx = (nc + scheduled_tokens
-                            - 1) // group.block_size
+                            - 1) // self._block_size
 
                 # Fail-closed: a HIT already committed
                 # num_computed_tokens=boundary; a skipped
@@ -597,7 +606,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         f"table={ids}): refusing to enter "
                         "forward with unrestored state")
                 if group is owner:
-                    idx = nc // group.block_size - 1
+                    idx = nc // self._block_size - 1
                     hashes = [_hash_str(state.block_hashes[idx])]
                 group_ids[g_idx] = (ids[curr_idx],)
         return ReqMeta(
@@ -627,7 +636,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             gstate = state.groups[g_idx]
             ids = gstate.block_ids
             if group.kind == "attention":
-                num_hash = min(progress // group.block_size, len(ids),
+                num_hash = min(progress // self._block_size, len(ids),
                                len(state.block_hashes))
                 start = gstate.next_stored_chunk_idx
                 if num_hash > start:
@@ -646,8 +655,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # an older block under the new hash would silently
                 # poison the store.
                 if (progress > 0
-                        and progress % group.block_size == 0):
-                    idx = progress // group.block_size - 1
+                        and progress % self._block_size == 0):
+                    idx = progress // self._block_size - 1
                     if (idx >= gstate.next_stored_chunk_idx
                             and idx < len(state.block_hashes)):
                         if idx >= len(ids) or ids[idx] == 0:

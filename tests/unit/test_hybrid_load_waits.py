@@ -28,11 +28,10 @@ from kvshrink.kvshrink_connector import (
 PAGE = 4096
 
 
-def _group(g_idx, kind, layers, block_size=16):
+def _group(g_idx, kind, layers):
     return GroupInfo(
         group_idx=g_idx, kind=kind, layer_names=tuple(layers),
-        block_size=block_size,
-        spec=make_spec(kind, block_size))
+        spec=make_spec(kind, 16))
 
 
 class _FakeStore:

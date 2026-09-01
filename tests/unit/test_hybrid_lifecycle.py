@@ -23,13 +23,13 @@ PAGE = 64 * 1024
 def _attn(bs=16):
     return GroupInfo(
         group_idx=0, kind="attention", layer_names=("attn.0",),
-        block_size=bs, spec=make_spec("attention", bs))
+        spec=make_spec("attention", bs))
 
 
 def _mamba():
     return GroupInfo(
         group_idx=0, kind="mamba", layer_names=("m.0",),
-        block_size=544, spec=make_spec("mamba", 544))
+        spec=make_spec("mamba", 544))
 
 
 class _MissStore:
@@ -48,7 +48,8 @@ class _HitStore:
 
 
 def _sched(groups, store=None):
-    return HybridRequestScheduler(groups, store or _MissStore(), 16)
+    return HybridRequestScheduler(groups, store or _MissStore(),
+                                  groups[0].spec.block_size)
 
 
 def _setup_attn_req(sched, hashes, ids, tokens=0):
@@ -243,20 +244,21 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
 # unrestored KV and emitted wrong tokens (4B TP2 lifecycle gate).
 
 def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
-    """2-group hybrid (attention bs=16 + mamba bs=544 align 544) with a
+    """2-group hybrid (uniform bs=16, mamba snapshot at 544) with a
     request that re-entered after preemption: the lookup hook reset state and
     recorded a HIT at boundary 544, then the core allocated fresh blocks
     and credited ``ext`` external tokens."""
     groups = [
         _attn(),
         GroupInfo(group_idx=1, kind="mamba", layer_names=("m.0",),
-                  block_size=544, spec=make_spec("mamba", 544)),
+                  spec=make_spec("mamba", 16)),
     ]
     sched = HybridRequestScheduler(groups, _HitStore(committed), 16)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
     track_new_request(sched, "r1", block_hashes=hashes, num_computed_tokens=0)
     attn_ids = list(range(100, 134))  # 34 fresh attention blocks
-    mamba_ids = [200, 201]            # CURR slot for this step = idx 1
+    # CURR slot for this step: (544 + 64 - 1) // 16 = 37
+    mamba_ids = list(range(200, 238))
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks((attn_ids, mamba_ids)), ext)
@@ -274,7 +276,7 @@ def test_resumed_load_meta_restores_credited_pages():
     # slot only (v0.23.0 reads CURR in every kernel path)
     assert len(meta.block_hashes) == 34, meta
     assert meta.group_block_ids[0] == tuple(range(100, 134)), meta
-    assert meta.group_block_ids[1] == (201,), meta
+    assert meta.group_block_ids[1] == (237,), meta
 
 
 def test_resumed_load_meta_without_credit_is_quiet():

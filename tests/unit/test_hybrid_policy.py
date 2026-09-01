@@ -13,7 +13,6 @@ def _group(g_idx, kind, block_size):
     return GroupInfo(
         group_idx=g_idx, kind=kind,
         layer_names=(f"l{g_idx}.0", f"l{g_idx}.1"),
-        block_size=block_size,
         spec=make_spec(kind, block_size))
 
 
@@ -93,19 +92,19 @@ def test_no_hit():
 
 
 def test_boundary_table():
-    """Table-driven: prompt lengths around block/alignment boundaries."""
-    groups = [_group(0, "attention", 32), _group(1, "mamba", 16)]
+    """Table-driven: prompt lengths around block boundaries."""
+    groups = [_group(0, "attention", 16), _group(1, "mamba", 16)]
     for length in (31, 32, 33, 63, 64, 65, 95, 96, 97):
         n_blocks = length // 16 + 2
         b, hashes = _hashes(set(range(n_blocks)), n_blocks)
         policy = HybridHitPolicy(groups, b, 16, 0)
         boundary = policy.find_longest_cache_hit(hashes, length)
-        expected = (length - 1) // 32 * 32
+        expected = (length - 1) // 16 * 16
         if expected == 0:
             assert boundary == 0, f"len={length}"
         else:
             assert boundary == expected, (
-                f"len={length} got {boundary} want {expected}")
+                f"len={length} got={boundary} want={expected}")
 
 
 def test_mamba_lookup_never_overshoots_the_candidate():
