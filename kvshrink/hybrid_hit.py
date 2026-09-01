@@ -46,23 +46,20 @@ class HybridHitPolicy:
         self,
         groups: list[GroupInfo],
         present: Callable[[int, object], bool],
-        hash_block_size: int,
+        block_size: int,
         num_computed_tokens: int,
     ):
         """Configure the policy for one request."""
         self._groups: list[GroupInfo] = groups
         self._present: Callable[[int, object], bool] = present
-        self._hash_block_size: int = hash_block_size
+        self._block_size: int = block_size
         self._num_computed: int = num_computed_tokens
         # full attention first (tighter initial bound)
         self._ordered: list[GroupInfo] = sorted(
             groups, key=lambda g: 0 if g.kind == "attention" else 1)
-        # A snapshot is restorable only on its group's own boundaries,
-        # so the candidate must be floored to the coarsest granularity
-        # any recurrent group enforces (they may differ per group).
-        self._mamba_floor = min(
-            (g.block_size for g in groups if g.kind == "mamba"),
-            default=None)
+        # Snapshots are restorable only on block boundaries, and only
+        # a group of recurrent layers carries a snapshot to restore.
+        self._has_mamba = any(g.kind == "mamba" for g in groups)
 
     # ------------------------------------------------------------------
     def _lookup(self, group: GroupInfo, block_hashes: list[int],
@@ -75,7 +72,7 @@ class HybridHitPolicy:
         # gets this for free (the bound comes from the same request);
         # ours can be a boundary the request has not reached.
         max_length = min(candidate,
-                         len(block_hashes) * group.block_size)
+                         len(block_hashes) * self._block_size)
         blocks = manager_cls.find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_length,
@@ -83,9 +80,9 @@ class HybridHitPolicy:
             block_pool=_StoreAsBlockPool(self._present),
             kv_cache_spec=group.spec,
             drop_eagle_block=False,
-            alignment_tokens=group.block_size,
+            alignment_tokens=self._block_size,
         )
-        return len(blocks[0]) * group.block_size
+        return len(blocks[0]) * self._block_size
 
     # ------------------------------------------------------------------
     def find_longest_cache_hit(
@@ -94,10 +91,11 @@ class HybridHitPolicy:
         """Fixed-point convergence over all groups; returns the
         restorable prefix in tokens (the snapshot boundary)."""
         candidate = max_length
-        if self._mamba_floor is not None:
+        if self._has_mamba:
             # the last prompt token is always recomputed (logprobs + state)
-            a = self._mamba_floor
-            candidate = min(candidate - 1, (candidate - 1) // a * a)
+            candidate = min(candidate - 1,
+                            (candidate - 1) // self._block_size
+                            * self._block_size)
 
         while True:
             changed = False
