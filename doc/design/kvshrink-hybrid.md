@@ -77,7 +77,7 @@ fix it. Serving must use:
 | **chunk** | The storage layer's transfer unit. Each page is split into chunks that are compressed, named and persisted independently. |
 | **label** | A group's namespace inside the store, `{namespace}_g{group}_r{rank}`. A group's whole layer set is written in one call under its label, so the block is finalized by that write: there is no second step that could publish a boundary before its data. |
 | **snapshot boundary** | The token count a request restored to. Locked at lookup time and never recomputed afterwards, because by then the progress counters have already moved. |
-| **save cursor** (`next_stored_chunk_idx`) | Per group: what has already been emitted. Rolls **back** on resume, because saves issued before preemption may never have been persisted; re-emitting is an idempotent overwrite. |
+| **save cursor** (`next_block_to_save`) | Per group: what has already been emitted. Rolls **back** on resume, because saves issued before preemption may never have been persisted; re-emitting is an idempotent overwrite. |
 | **fail-closed** | The first principle. A false hit corrupts output silently; a false miss costs one recompute. Every uncertain case resolves to MISS, refuse, or raise. |
 
 ### 2.3 Processes
