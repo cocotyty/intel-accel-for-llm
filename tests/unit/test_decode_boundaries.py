@@ -38,8 +38,8 @@ class _LiveRequest:
 
 def _state(sched, live, hashes):
     st = ReqState(
-        live_source=live.block_hashes if live is not None else [],
-        block_hashes=list(hashes),
+        live_block_hashes=live.block_hashes if live is not None else [],
+        block_hashes_snapshot=list(hashes),
         groups=tuple(ReqGroupState() for _ in sched._groups))
     sched._req_states["r1"] = st
     return st
@@ -53,7 +53,7 @@ def test_hashes_added_during_decode_are_adopted():
     live.block_hashes.extend([4, 5])       # two blocks produced by decode
     sched.on_cached_request("r1", None, False, 80)
 
-    assert st.block_hashes == [1, 2, 3, 4, 5], (
+    assert st.block_hashes_snapshot == [1, 2, 3, 4, 5], (
         "decode-phase boundaries stayed invisible to the save plan")
 
 
@@ -65,7 +65,7 @@ def test_sync_is_append_only():
     st = _state(sched, live, [1, 2, 3])
 
     sched.on_cached_request("r1", None, False, 48)
-    assert st.block_hashes == [1, 2, 3]
+    assert st.block_hashes_snapshot == [1, 2, 3]
 
 
 def test_missing_request_object_is_not_fatal():
@@ -76,7 +76,7 @@ def test_missing_request_object_is_not_fatal():
     st = _state(sched, None, [1, 2])
 
     sched.on_cached_request("r1", None, False, 32)
-    assert st.block_hashes == [1, 2]
+    assert st.block_hashes_snapshot == [1, 2]
 
 
 def test_save_plan_reaches_the_new_boundaries():

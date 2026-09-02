@@ -46,7 +46,7 @@ worker 干活的最小单位。里面是每个组一条的搬运清单（搬哪�
 
 ### ReqGroupState / ReqState —— 调度侧给每个请求记的账
 每组要记两样：GPU 块表副本（vLLM 分配了哪些块给我们）、增量保存游标
-（存到第几块了）。请求级最值钱的是 `live_source`：它直接引用
+（存到第几块了）。请求级最值钱的是 `live_block_hashes`：它直接引用
 vLLM Request 身上那个不断变长的列表。为什么？因为 vLLM 只在请求刚进
 来时通知我们一次，之后请求边 decode 边完成的块**没有任何回调**会告
 诉我们——只能自己盯着人家的列表看长了多少。snapshot_boundary 是查
