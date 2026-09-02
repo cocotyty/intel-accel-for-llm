@@ -292,7 +292,7 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
         g.next_block_to_save for g in st.groups]
     # Forward completes tokens up to 544+64=608: the ledger and the
     # attention table grow past the restored range by 4 blocks
-    st.block_hashes.extend(range(34, 38))
+    st.block_hashes_snapshot.extend(range(34, 38))
     st.groups[0].block_ids.extend(range(134, 138))
     m = sched.build_save_meta("r1", scheduled_tokens=64)
     # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
@@ -309,7 +309,7 @@ def test_incremental_boundaries_after_restore_are_saved():
     sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     # Extend the ledger and both tables past the restored range
     st = sched._req_states["r1"]
-    st.block_hashes.extend(range(34, 74))
+    st.block_hashes_snapshot.extend(range(34, 74))
     st.groups[0].block_ids.extend(range(134, 174))
     st.groups[1].block_ids.extend(range(238, 274))
     # 544 + 640 = 1184 tokens = 74 blocks: 40 blocks past the skip

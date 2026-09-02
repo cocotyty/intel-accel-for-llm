@@ -117,7 +117,7 @@ def test_save_meta_prev_and_curr_blocks_save_curr():
     table."""
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1, 2}, [[0, 31, 47]])
-    sched._req_states["r1"].block_hashes = [0, 1, 2]
+    sched._req_states["r1"].block_hashes_snapshot = [0, 1, 2]
     meta = sched.build_save_meta("r1", scheduled_tokens=1632)
     assert meta.block_hashes == ("2",), meta
     assert meta.group_block_ids == ((47,),), meta
