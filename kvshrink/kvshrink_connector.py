@@ -658,28 +658,38 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     gstate.next_block_to_save = num_hash
             else:
                 # Save the running-state block. align mode pins the
-                # kernel to the table's last column, so at a boundary
-                # the exit state is always ids[progress//block_size-1]
-                # (vLLM's own worker computes the same slot in
-                # preprocess_mamba). Fail closed on a null tail: saving
-                # an older block under the new hash would silently
-                # poison the store.
-                if (progress > 0
-                        and progress % self._block_size == 0):
-                    idx = progress // self._block_size - 1
-                    if (idx >= gstate.next_block_to_save
-                            and idx < len(state.block_hashes_snapshot)):
-                        if idx >= len(ids) or ids[idx] == 0:
-                            raise RuntimeError(
-                                "kvshrink mamba save: boundary column "
-                                f"is NULL (req={req_id} "
-                                f"progress={progress} "
-                                f"table_idx={idx} table={ids})")
-                        if group is owner:
-                            hashes = [_hash_str(
-                                state.block_hashes_snapshot[idx])]
-                        group_ids[g_idx] = (ids[idx],)
-                        gstate.next_block_to_save = idx + 1
+                # kernel to the table's tail column, and the hash list
+                # only grows when a block completes, so the newest
+                # completed boundary is always len(live)-1 -- no
+                # progress arithmetic, no boundary-timing window. The
+                # prev column holds the boundary state for the whole
+                # next block cycle (released only when the following
+                # block completes), so a save that runs a few steps
+                # late still reads the right slot. A multi-boundary
+                # pass physically materialises only the tail state;
+                # the skipped middle boundaries get no entry (same
+                # semantics as vLLM's own offloading connector), and
+                # the cursor jumps to cover them.
+                idx = len(state.live_block_hashes) - 1
+                if idx >= gstate.next_block_to_save:
+                    if idx >= len(ids):
+                        # Resumed request: the engine's hash list is
+                        # longer than the freshly replaced table. The
+                        # physical slot does not exist yet -- the table
+                        # grows back as forward crosses boundaries, so
+                        # just wait (the cursor stays put and the save
+                        # happens once the slot is real).
+                        continue
+                    if ids[idx] == 0:
+                        raise RuntimeError(
+                            "kvshrink mamba save: boundary column "
+                            f"is NULL (req={req_id} "
+                            f"progress={progress} "
+                            f"table_idx={idx} table={ids})")
+                    if group is owner:
+                        hashes = [_hash_str(state.live_block_hashes[idx])]
+                    group_ids[g_idx] = (ids[idx],)
+                    gstate.next_block_to_save = idx + 1
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
