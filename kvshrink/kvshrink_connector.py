@@ -67,16 +67,13 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    # Two fields cooperate to observe the engine's newly appended
-    # block_hashes:
-    # - live_block_hashes is a reference to the vLLM request object's
-    #   block_hashes list (on decode, vLLM appends a new hash to it
-    #   in place for every completed block; there is no callback);
-    # - block_hashes_snapshot is our own copy, reconciled from the
-    #   reference every pass. Load/save plans address through the
-    #   snapshot only, immune to later engine-side mutation.
+    # A reference to the vLLM request object's block_hashes list.
+    # On decode, vLLM appends a new hash to it in place for every
+    # completed block (there is no callback); preemption never
+    # truncates it. Append-only and content-addressed, so reading it
+    # directly at any point yields the same hashes (plus any newer
+    # ones) a copied snapshot would have held.
     live_block_hashes: list = field(default_factory=list)
-    block_hashes_snapshot: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     # External tokens accepted this pass (drives the load plan).
@@ -369,14 +366,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         regression) roll the save cursor back so boundaries emitted
         before a preemption get re-emitted (overwrite is idempotent)."""
         state = self._req_states[req_id]
-        # Adopt block hashes vLLM has appended since we registered
-        # (decode completes blocks too; without this, generated tokens
-        # are never offloaded). Only ever extends -- hashes are
-        # content-addressed and append-only.
-        live = state.live_block_hashes
-        if len(live) > len(state.block_hashes_snapshot):
-            state.block_hashes_snapshot.extend(
-                live[len(state.block_hashes_snapshot):])
         old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
         regression = (num_computed_tokens is not None
@@ -416,7 +405,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # by the engine rather than re-derived (kvshrink-hybrid.md §8).
         self._req_states[request.request_id] = ReqState(
             live_block_hashes=request.block_hashes,
-            block_hashes_snapshot=list(request.block_hashes),
             num_computed_tokens=num_computed_tokens,
             groups=tuple(ReqGroupState() for _ in self._groups),
         )
@@ -431,7 +419,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # gated on live chunk presence (engine Record), so a nonzero
         # boundary is complete by construction; only record it.
         boundary = policy.find_longest_cache_hit(
-            self._req_states[request.request_id].block_hashes_snapshot,
+            request.block_hashes,
             request.num_tokens)
         state = self._req_states[request.request_id]
         external = max(0, boundary - num_computed_tokens)
@@ -561,7 +549,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 start = (nc - ext) // self._block_size
                 end = nc // self._block_size
                 if group is owner:
-                    hashes = [_hash_str(state.block_hashes_snapshot[i])
+                    hashes = [_hash_str(state.live_block_hashes[i])
                               for i in range(start, end)]
                 group_ids[g_idx] = tuple(ids[i]
                                          for i in range(start, end))
@@ -605,7 +593,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         "forward with unrestored state")
                 if group is owner:
                     idx = nc // self._block_size - 1
-                    hashes = [_hash_str(state.block_hashes_snapshot[idx])]
+                    hashes = [_hash_str(state.live_block_hashes[idx])]
                 group_ids[g_idx] = (ids[curr_idx],)
         # The plan reads every group's hit range back from the store;
         # those blocks are already there, so the save cursors skip
@@ -647,11 +635,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ids = gstate.block_ids
             if group.kind == "attention":
                 num_hash = min(progress // self._block_size, len(ids),
-                               len(state.block_hashes_snapshot))
+                               len(state.live_block_hashes))
                 start = gstate.next_block_to_save
                 if num_hash > start:
                     if group is owner:
-                        hashes = [_hash_str(state.block_hashes_snapshot[i])
+                        hashes = [_hash_str(state.live_block_hashes[i])
                                   for i in range(start, num_hash)]
                     group_ids[g_idx] = tuple(ids[i] for i in
                                              range(start, num_hash))
