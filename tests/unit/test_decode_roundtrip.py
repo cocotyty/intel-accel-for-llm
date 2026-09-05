@@ -7,7 +7,7 @@ prefix gets an external hit that extends into the decode-produced range.
 
 This is the multi-turn-conversation scenario: turn one generates tokens
 past its prompt, turn two arrives carrying both the prompt and those
-tokens. If the decode-phase hashes were never adopted or never saved,
+tokens. If the decode-phase hashes were never saved,
 turn two's hit stops at turn one's prompt and the whole span is
 recomputed with a warm cache sitting right there.
 
@@ -62,17 +62,16 @@ def test_second_request_hits_decode_produced_blocks():
     live = _LiveRequest([1, 2])
     st = ReqState(
         live_block_hashes=live.block_hashes,
-        block_hashes_snapshot=[1, 2],
         num_computed_tokens=32,
         groups=(ReqGroupState(block_ids=[10, 11, 12, 13]),))
     sched._req_states["r1"] = st
 
     # Decode completed two more blocks; the engine appended their
-    # hashes to the live list. The adoption pass pulls them in.
+    # hashes to the live list in place.
     live.block_hashes.extend([3, 4])
     sched.on_cached_request("r1", None, False, 64)
 
-    # The save plan reaches the adopted boundaries and the store
+    # The save plan reaches the new boundaries and the store
     # commits them.
     meta = sched.build_save_meta("r1", scheduled_tokens=0)
     store.committed.update(int(h) for h in meta.block_hashes)

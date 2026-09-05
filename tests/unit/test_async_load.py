@@ -238,7 +238,7 @@ def test_parked_request_still_gets_a_load_plan():
     sched = HybridRequestScheduler(
         groups, _FakeStore(), 16)
     st = ReqState(
-        block_hashes_snapshot=[1, 2], num_computed_tokens=32,
+        live_block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
@@ -261,7 +261,7 @@ def test_async_plan_is_emitted_only_once():
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
-        block_hashes_snapshot=[1, 2], num_computed_tokens=32,
+        live_block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
@@ -335,7 +335,7 @@ def test_sync_still_refuses_zero_scheduled_tokens():
     sched = HybridRequestScheduler(
         groups, _FakeStore(), 16)
     st = ReqState(
-        block_hashes_snapshot=[1, 2, 3, 4], num_computed_tokens=64,
+        live_block_hashes=[1, 2, 3, 4], num_computed_tokens=64,
         pending_load_tokens=64,
         groups=(ReqGroupState(block_ids=[1, 2, 3, 4]),
                 ReqGroupState(block_ids=[7, 8, 9, 10])))
@@ -360,7 +360,7 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
-        block_hashes_snapshot=[1, 2],
+        live_block_hashes=[1, 2],
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True
     sched._req_states["r1"] = st
@@ -400,7 +400,7 @@ def test_request_is_synchronous_again_after_its_async_plan_is_emitted():
     sched = HybridRequestScheduler(
         [_group(0, "attention", ATTN)], _FakeStore(), 16)
     st = ReqState(
-        block_hashes_snapshot=[1, 2], num_computed_tokens=32,
+        live_block_hashes=[1, 2], num_computed_tokens=32,
         pending_load_tokens=32,
         groups=(ReqGroupState(block_ids=[4, 5]),))
     st.is_async = True

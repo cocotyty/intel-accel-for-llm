@@ -70,7 +70,6 @@ def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0):
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     sched._req_states[req_id] = ReqState(
         live_block_hashes=list(block_hashes),
-        block_hashes_snapshot=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
         groups=tuple(ReqGroupState() for _ in sched._groups),
     )
