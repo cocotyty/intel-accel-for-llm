@@ -9,7 +9,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from kvshrink.kvshrink_connector import (
-    parse_kv_cache_config)
+    check_hash_block_size, parse_kv_cache_config)
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixture_kvconfig_4b_tp2.json")
@@ -92,3 +92,29 @@ def test_recurrent_page_spec_declares_both_states():
     # is that one page holds both states, which is why it is moved as
     # opaque bytes rather than as tensors.
     assert lin.page_size_bytes >= conv_bytes + ssm_bytes
+
+
+def test_hash_block_size_override_is_refused():
+    """vLLM hashes block boundaries at hash_block_size, not at the group
+    block size (kv_cache_utils.get_request_block_hasher). For a
+    multi-group model with a connector attached, a user-set
+    cache_config.hash_block_size wins outright -- none of the engine's
+    three fallbacks to the block size apply to us. Our plans index
+    those hashes as "hash i names the i-th block_size block", so an
+    override would restore state from the wrong offsets, silently.
+    """
+    cfg = _real_config()
+    _, block_size = parse_kv_cache_config(cfg)
+    assert block_size == 528
+
+    # Unset and matching values are the supported cases.
+    check_hash_block_size(None, block_size)
+    check_hash_block_size(block_size, block_size)
+
+    raised = None
+    try:
+        check_hash_block_size(16, block_size)
+    except RuntimeError as e:
+        raised = e
+    assert raised is not None, "a finer hash granularity must be refused"
+    assert "hash_block_size" in str(raised)

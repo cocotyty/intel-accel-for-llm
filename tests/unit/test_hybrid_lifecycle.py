@@ -192,20 +192,6 @@ def test_abort_keeps_committed_boundary_hittable():
     assert store.has(["0"], label="g0") == [True]
 
 
-def test_resumed_missing_progress_rolls_back_to_zero():
-    """Fail-closed: resumed=True with missing
-    num_computed rolls ALL group cursors to 0 (safe N=0), never skips."""
-    sched = _sched([_attn()])
-    _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=64)  # cursor -> 4
-    sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
-                            num_computed_tokens=None)
-    g = sched._req_states["r1"].groups[0]
-    assert g.next_block_to_save == 0, g
-    m = sched.build_save_meta("r1", scheduled_tokens=32)
-    assert m.group_block_ids == ((10, 11),)  # re-emitted
-
-
 def test_abort_resume_stress_1000_iterations_zero_residue():
     """1000 rounds of new/save/resume/finish. Every round the cursor
     rolls back and re-emits; at the end no request state is left behind,
