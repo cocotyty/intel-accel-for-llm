@@ -33,11 +33,29 @@ def _clean_kvshrink_env(monkeypatch):
     # The exporter binds a port; unit tests never need it.
 
 
+class FakeBlock:
+    """KVCacheBlock stand-in. vLLM's null block is the pool's first
+    block (block_id 0) with is_null set, which is the convention these
+    tests already used for an empty slot."""
+
+    __slots__ = ("block_id",)
+
+    def __init__(self, block_id):
+        self.block_id = block_id
+
+    @property
+    def is_null(self):
+        return self.block_id == 0
+
+
 class FakeBlocks:
-    """KVCacheBlocks stand-in: production only calls get_block_ids()."""
+    """KVCacheBlocks stand-in: production reads get_block_ids() for the
+    per-group tables and .blocks for the load plan's destinations."""
 
     def __init__(self, ids_per_group):
         self._ids = tuple(tuple(ids) for ids in ids_per_group)
+        self.blocks = tuple(
+            tuple(FakeBlock(i) for i in ids) for ids in self._ids)
 
     def get_block_ids(self):
         return self._ids

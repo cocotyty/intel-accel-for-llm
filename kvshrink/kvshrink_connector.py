@@ -81,19 +81,20 @@ class ReqState:
     live_block_hashes: list = field(default_factory=list)
     num_computed_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
-    # External tokens accepted this pass (drives the load plan).
-    pending_load_tokens: int = 0
+    # This request's load plan, built in update_state_after_alloc from
+    # the block objects the engine hands over there, and handed out
+    # once by build_connector_meta. None = nothing to restore.
+    load_plan: Optional[ReqMeta] = None
     # Last authoritative progress seen by the save path
     # (num_computed + scheduled of the last save plan). Used for
     # fail-closed regression detection: any drop below this value rolls
     # save cursors back even if the resumed flag is missing.
     last_known_progress: int = 0
-    # Async load bookkeeping: while is_async, the request is
+    # Async load decision, made in get_num_new_matched_tokens and
+    # consumed when the plan is built: while is_async, the request is
     # parked and its plan ships from build_connector_meta.
     is_async: bool = False
     async_load_layers: int = -1
-    # Whether the async load plan was already handed out.
-    async_plan_emitted: bool = False
 
 
 @dataclass
@@ -156,9 +157,12 @@ def parse_kv_cache_config(
     Per-layer geometry is not parsed: KVStore binds pools from the
     live tensors, which carry their own layout.
 
-    v0.23 pads hybrid models to a single block size at startup
-    (_align_hybrid_block_size): every group shares it, so a mismatch
-    here is a broken vLLM contract and fails closed."""
+    Requires every group to share one block size. That is a limit of
+    this connector, not of vLLM: v0.23 supports heterogeneous groups
+    and schedules on lcm(group block sizes) (kv_cache_utils
+    get_block_size_config), e.g. DeepSeek V4 mixes 256/64/4. Our plans
+    address a single block size throughout, so anything else fails
+    closed here rather than mis-addressing later."""
     groups: list[GroupInfo] = []
     sizes: set[int] = set()
     for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
@@ -176,9 +180,38 @@ def parse_kv_cache_config(
     if len(sizes) != 1:
         raise RuntimeError(
             "kvshrink hybrid: groups have mismatched block sizes "
-            f"{sorted(sizes)}; v0.23 pads hybrid models to one block "
-            "size at startup, so this cannot be a valid config")
+            f"{sorted(sizes)}, which this connector does not support "
+            "(every plan addresses one block size). vLLM itself allows "
+            "them -- it schedules on lcm(group block sizes) -- so this "
+            "is our limit, not a broken config.")
     return groups, sizes.pop()
+
+
+def check_hash_block_size(hash_block_size: Optional[int],
+                          block_size: int) -> None:
+    """Refuse a block-hash granularity our plans cannot address.
+
+    Every plan here indexes Request.block_hashes as "hash i names the
+    i-th block_size-sized block". vLLM does not build those hashes at
+    the group block size, though: get_request_block_hasher is given
+    hash_block_size, which for a multi-group model is
+    cache_config.hash_block_size when the user set it and only falls
+    back to gcd(group block sizes) otherwise. The three ways that
+    resolves to the block size on its own all miss us -- the
+    single-group early return needs one group, the "no prefix caching
+    and no connector" early return needs the connector off, and the
+    mamba backoff needs align mode off -- so a user-set override lands
+    straight in our indexing and silently addresses the wrong
+    boundaries.
+    """
+    if hash_block_size is not None and hash_block_size != block_size:
+        raise RuntimeError(
+            f"kvshrink hybrid: cache_config.hash_block_size="
+            f"{hash_block_size} differs from the KV cache group block "
+            f"size {block_size}; the engine would hash block "
+            "boundaries at a granularity our plans do not address, "
+            "restoring state from the wrong offsets. Unset "
+            "hash_block_size or the KV connector.")
 
 
 # ======================================================================
@@ -269,10 +302,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 "Set pipeline_parallel_size=1 or the KV connector.")
         groups, block_size = parse_kv_cache_config(kv_cache_config)
         self._groups = groups
-        # The one block size every group shares (v0.23 pads hybrid
-        # models to it at startup); the engine's block hashes are
-        # generated at exactly this granularity.
+        # The block size every group shares (parse_kv_cache_config
+        # refuses anything else). Every plan here indexes the engine's
+        # block hashes at this granularity.
         self._block_size = block_size
+
+        # Fail-closed: the engine's block hashes are not necessarily
+        # generated at this block size (see check_hash_block_size).
+        check_hash_block_size(
+            vllm_config.cache_config.hash_block_size, self._block_size)
 
         # Fail-closed: spec decode moves the GDN running state into
         # per-draft speculative blocks; the boundary block is committed
@@ -367,28 +405,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     def on_cached_request(
         self, req_id: str, new_block_ids: tuple[list[int], ...],
-        resumed: bool, num_computed_tokens: Optional[int],
+        resumed: bool, num_computed_tokens: int,
     ) -> None:
         """Every pass, for each running request: sync the block
-        tables and hashes from upstream; on resume (or progress
-        regression) roll the save cursor back so boundaries emitted
-        before a preemption get re-emitted (overwrite is idempotent)."""
+        tables from upstream; on resume (or progress regression) roll
+        the save cursor back so boundaries emitted before a preemption
+        get re-emitted (overwrite is idempotent)."""
         state = self._req_states[req_id]
         old_progress = max(state.num_computed_tokens,
                            state.last_known_progress)
-        regression = (num_computed_tokens is not None
-                      and num_computed_tokens < old_progress)
-        if num_computed_tokens is not None:
-            state.num_computed_tokens = num_computed_tokens
-            state.last_known_progress = num_computed_tokens
+        regression = num_computed_tokens < old_progress
+        state.num_computed_tokens = num_computed_tokens
+        state.last_known_progress = num_computed_tokens
         if resumed or regression:
-            # fail-closed: a missing progress on resume is treated as
-            # N=0 (roll everything back) rather than skipping the
-            # rollback.
-            safe_n = num_computed_tokens or 0
             for g_idx, group in enumerate(self._groups):
                 gstate = state.groups[g_idx]
-                safe = safe_n // self._block_size
+                safe = num_computed_tokens // self._block_size
                 if gstate.next_block_to_save > safe:
                     gstate.next_block_to_save = safe
         if new_block_ids:
@@ -458,23 +490,97 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        """Record the allocated block tables per group and the
-        external-token count the core accepted (drives the load
-        plan). For async requests this is also where the load plan
-        is emitted, since a parked request never appears in
-        build_connector_meta."""
+        """Record the allocated block tables per group, and -- while the
+        engine still hands us block OBJECTS -- build this request's load
+        plan from them.
+
+        This is the only callback that sees KVCacheBlocks. Deriving the
+        destination slots later, from token counts, would be
+        re-answering a question the engine has already answered (and is
+        what the in-tree connectors avoid: mooncake keeps the ids from
+        here in _reqs_need_recv, the offloading scheduler builds its
+        whole TransferJob here)."""
         req_id = request.request_id
         state = self._req_states[req_id]
         state.num_computed_tokens = (
             state.num_computed_tokens + num_external_tokens)
-        state.pending_load_tokens = num_external_tokens
-        all_block_ids = blocks.get_block_ids()
-        for g_idx, ids in enumerate(all_block_ids):
+        for g_idx, ids in enumerate(blocks.get_block_ids()):
             state.groups[g_idx].block_ids = list(ids)
-        if (state.is_async and not state.async_plan_emitted
-                and num_external_tokens > 0):
-        # The ONLY moment we hear about an async request: it is
-        # parked, so build_connector_meta never sees it scheduled.
+        if num_external_tokens <= 0:
+            # vLLM calls this a SECOND time for an async request, once
+            # its transfer lands and the request is promoted back out of
+            # WAITING_FOR_REMOTE_KVS. That pass can only carry 0: the
+            # promotion left num_computed_tokens non-zero (scheduler.py
+            # :822), which skips the branch that asks the connector for
+            # external tokens, so num_external_computed_tokens keeps its
+            # initial 0. Returning here is what stops a second transfer
+            # being queued for a request that is RUNNING by then.
+            return
+
+        nc = state.num_computed_tokens
+        hashes: list[str] = []
+        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
+        owner = next(
+            (g for g in self._groups if g.kind == "attention"),
+            self._groups[0])
+        for g_idx, group in enumerate(self._groups):
+            group_blocks = blocks.blocks[g_idx]
+            if group.kind == "attention":
+                # Restore only the external range: the core's own
+                # prefix-hit blocks already hold their data (shared
+                # physical pages). The credit landed num_computed_tokens
+                # exactly on the boundary, so this range is the last
+                # num_external_tokens.
+                start = (nc - num_external_tokens) // self._block_size
+                end = nc // self._block_size
+                if end > len(group_blocks):
+                    raise RuntimeError(
+                        "kvshrink load: attention table shorter than the "
+                        f"credited range (req={req_id} boundary={nc} "
+                        f"blocks={len(group_blocks)} need={end})")
+                if group is owner:
+                    hashes = [_hash_str(state.live_block_hashes[i])
+                              for i in range(start, end)]
+                group_ids[g_idx] = tuple(
+                    b.block_id for b in group_blocks[start:end])
+            else:
+                # The snapshot goes into the running-state slot, which
+                # is the table's LAST entry: align mode nulls every
+                # other column (MambaManager.allocate_new_blocks), and
+                # the table already accounts for the tokens scheduled
+                # this step. So the engine names the slot -- no token
+                # arithmetic, and nothing here depends on how many
+                # tokens the step happens to schedule.
+                dst = group_blocks[-1] if group_blocks else None
+                if dst is None or dst.is_null:
+                    raise RuntimeError(
+                        "kvshrink mamba load: the state slot is a null "
+                        f"block (req={req_id} boundary={nc} "
+                        f"blocks={len(group_blocks)}): refusing to "
+                        "enter forward with unrestored state")
+                if group is owner:
+                    idx = nc // self._block_size - 1
+                    hashes = [_hash_str(state.live_block_hashes[idx])]
+                group_ids[g_idx] = (dst.block_id,)
+        # The plan reads every group's hit range back from the store;
+        # those blocks are already there, so the save cursors skip them
+        # instead of re-writing them on the first post-restore save
+        # pass. For attention, nc//bs is the number of hit blocks; for
+        # mamba, the credit landed nc exactly on a boundary, so nc//bs
+        # is the slot past that boundary's snapshot.
+        skip_to = nc // self._block_size
+        for gstate in state.groups:
+            if gstate.next_block_to_save < skip_to:
+                gstate.next_block_to_save = skip_to
+        state.load_plan = ReqMeta(
+            block_hashes=tuple(hashes),
+            group_block_ids=tuple(group_ids),
+            is_async=state.is_async,
+            async_load_layers=state.async_load_layers,
+        )
+        if state.is_async:
+            # The ONLY moment we hear about an async request: it is
+            # parked, so build_connector_meta never sees it scheduled.
             self._async_load_pending.add(req_id)
 
     def request_finished(
@@ -503,11 +609,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def build_load_meta(
         self, new_req: "NewRequestData", scheduled_tokens: int = 0
     ) -> ReqMeta:
-        """Load plan for a NewRequestData entry."""
-        req_id = new_req.req_id
-        state = self._req_states[req_id]
-        return self._build_load_meta_from_state(
-            req_id, state, scheduled_tokens)
+        """Hand out the plan built at alloc time."""
+        return self._take_load_plan(new_req.req_id)
 
     def build_resumed_load_meta(
         self, req_id: str, scheduled_tokens: int = 0
@@ -515,112 +618,25 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         """Load plan for a PREEMPTION-RESUMED request: v1 carries
         them in scheduled_cached_reqs.resumed_req_ids, not in
         scheduled_new_reqs, so they need their own loop."""
-        state = self._req_states[req_id]
-        meta = self._build_load_meta_from_state(
-            req_id, state, scheduled_tokens)
+        meta = self._take_load_plan(req_id)
         npages = sum(len(g) for g in meta.group_block_ids)
         if npages == 0:
             raise RuntimeError(
                 "kvshrink resumed request has accepted external "
                 "tokens but no restorable pages (req="
-                f"{req_id} pending={state.pending_load_tokens} "
-                f"boundary={state.num_computed_tokens} "
-                f"sched={scheduled_tokens}): refusing to enter "
-                "forward with unrestored state")
+                f"{req_id} boundary="
+                f"{self._req_states[req_id].num_computed_tokens}): "
+                "refusing to enter forward with unrestored state")
         return meta
 
-    def _build_load_meta_from_state(
-        self, req_id: str, state: ReqState, scheduled_tokens: int,
-    ) -> ReqMeta:
-        """Build one request's load plan from its recorded state. The
-        caller only calls this for requests that accepted external
-        tokens (state.pending_load_tokens > 0)."""
-        ext = state.pending_load_tokens
-        nc = state.num_computed_tokens
-        hashes: list[str] = []
-        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
-        owner = next(
-            (g for g in self._groups if g.kind == "attention"),
-            self._groups[0])
-        for g_idx, group in enumerate(self._groups):
-            # The group table is always populated by alloc before
-            # scheduling; a missing table with ext > 0 is a bug
-            # that must index out of range loudly below, not skip
-            # silently.
-            ids = state.groups[g_idx].block_ids
-            if group.kind == "attention":
-                # Load only the external range: the core's own
-                # prefix-hit blocks already hold their data (shared
-                # physical pages). The credit landed
-                # num_computed_tokens exactly on the boundary, so
-                # this range is the last ext tokens.
-                start = (nc - ext) // self._block_size
-                end = nc // self._block_size
-                if group is owner:
-                    hashes = [_hash_str(state.live_block_hashes[i])
-                              for i in range(start, end)]
-                group_ids[g_idx] = tuple(ids[i]
-                                         for i in range(start, end))
-            elif group.kind == "mamba":
-                # Load the snapshot into the CURR state block only
-                # (v0.23 align mode pins execution to column 0 =
-                # the block holding the last scheduled token, for
-                # both prefill and decode). Its hash is the plan's
-                # last entry: the snapshot lives at the boundary,
-                # which the credit made num_computed_tokens.
-                curr_idx = (nc + scheduled_tokens
-                            - 1) // self._block_size
-
-                # Fail-closed: a HIT already committed
-                # num_computed_tokens=boundary; a skipped
-                # slot would let forward read unrestored
-                # state.
-                if scheduled_tokens <= 0 and not state.is_async:
-                    # Sync restore with no scheduled tokens
-                    # means no forward, so the slot would stay
-                    # unrestored while the core already
-                    # credited the tokens: fail-stop. (Async is
-                    # correct here: vLLM's prev->curr copy
-                    # carries the snapshot in at schedule time.)
-                    raise RuntimeError(
-                        "kvshrink mamba external HIT with "
-                        "scheduled_tokens=0 "
-                        f"(req={req_id} "
-                        f"boundary={nc}): "
-                        "production hits must schedule >= 1 "
-                        "token; refusing to build load meta")
-                if not (0 <= curr_idx < len(ids)
-                        and ids[curr_idx] != 0):
-                    raise RuntimeError(
-                        "kvshrink mamba load curr slot "
-                        f"invalid (req={req_id} "
-                        f"boundary={nc} "
-                        f"sched={scheduled_tokens} "
-                        f"table_idx={curr_idx} "
-                        f"table={ids}): refusing to enter "
-                        "forward with unrestored state")
-                if group is owner:
-                    idx = nc // self._block_size - 1
-                    hashes = [_hash_str(state.live_block_hashes[idx])]
-                group_ids[g_idx] = (ids[curr_idx],)
-        # The plan reads every group's hit range back from the store;
-        # those blocks are already there, so the save cursors skip
-        # them instead of re-writing them on the first post-restore
-        # save pass (main's existence_cache did this job with a
-        # presence snapshot; ours is the restore event itself).
-        # For attention, nc//bs is the number of hit blocks; for
-        # mamba, the credit landed nc exactly on a boundary, so
-        # nc//bs is the slot past that boundary's snapshot.
-        skip_to = nc // self._block_size
-        for gstate in state.groups:
-            if gstate.next_block_to_save < skip_to:
-                gstate.next_block_to_save = skip_to
-        return ReqMeta(
-            block_hashes=tuple(hashes),
-            group_block_ids=tuple(group_ids),
-            is_async=state.is_async,
-            async_load_layers=state.async_load_layers,
-        )
+    def _take_load_plan(self, req_id: str) -> ReqMeta:
+        """Pop the request's plan: a plan is emitted exactly once per
+        allocation, and a later allocation (resume) builds a fresh one.
+        Every caller checks load_plan is not None first."""
+        state = self._req_states[req_id]
+        plan = state.load_plan
+        state.load_plan = None
+        return plan
 
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
@@ -699,7 +715,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_sched = scheduler_output.num_scheduled_tokens
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if self._req_states[new_req.req_id].pending_load_tokens > 0:
+            if self._req_states[new_req.req_id].load_plan is not None:
                 req_meta = self.build_load_meta(
                     new_req, num_sched[new_req.req_id])
                 meta.reqs_to_load.add_request(
@@ -720,12 +736,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         pending = sorted(self._async_load_pending
                          - set(meta.reqs_to_load.requests))
         for req_id in pending:
-            state = self._req_states[req_id]
-            req_meta = self._build_load_meta_from_state(
-                req_id, state, scheduled_tokens=0)
-            state.async_plan_emitted = True
-            # Downgrade to synchronous once released.
-            state.is_async = False
+            req_meta = self._take_load_plan(req_id)
             meta.reqs_to_load.add_request(
                 req_id, req_meta.block_hashes, req_meta.group_block_ids,
                 req_meta.is_async, req_meta.async_load_layers)
@@ -738,7 +749,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # already skips recompute -- silent garbage output.
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
-            if self._req_states[req_id].pending_load_tokens > 0:
+            if self._req_states[req_id].load_plan is not None:
                 req_meta = self.build_resumed_load_meta(
                     req_id, num_sched[req_id])
                 meta.reqs_to_load.add_request(
