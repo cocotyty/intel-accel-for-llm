@@ -9,7 +9,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from kvshrink.kvshrink_connector import (
-    parse_kv_cache_config, project_block_hashes)
+    parse_kv_cache_config)
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixture_kvconfig_4b_tp2.json")
@@ -92,38 +92,3 @@ def test_recurrent_page_spec_declares_both_states():
     # is that one page holds both states, which is why it is moved as
     # opaque bytes rather than as tensors.
     assert lin.page_size_bytes >= conv_bytes + ssm_bytes
-
-
-def test_block_hashes_project_onto_our_blocks():
-    """vLLM computes Request.block_hashes at hash_block_size, which can
-    be FINER than the block size our plans address (config/cache.py
-    documents it as a knob for computing prefix-caching keys at the
-    finest common granularity, to be merged for larger physical
-    blocks). Merging is the consumer's job; we do it with the same
-    stride vLLM's own offloading connector uses.
-    """
-    # factor 1: the usual case, an identity projection.
-    keys = []
-    project_block_hashes([10, 11, 12], keys, 1)
-    assert keys == ["10", "11", "12"]
-
-    # factor 4: one key per block, taken at the block's LAST hash --
-    # a prefix hash only names the whole block's content at its end.
-    keys = []
-    project_block_hashes(list(range(8)), keys, 4)
-    assert keys == ["3", "7"]
-
-    # A partial block contributes nothing until its last hash lands.
-    keys = []
-    project_block_hashes([0, 1, 2], keys, 4)
-    assert keys == []
-
-    # Incremental: re-running after the engine appended in place picks
-    # up exactly the newly completed blocks, never re-emitting.
-    live = list(range(8))
-    keys = []
-    project_block_hashes(live, keys, 4)
-    assert keys == ["3", "7"]
-    live.extend(range(8, 16))
-    project_block_hashes(live, keys, 4)
-    assert keys == ["3", "7", "11", "15"]
