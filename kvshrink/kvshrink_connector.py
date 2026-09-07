@@ -7,7 +7,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from itertools import islice
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -73,21 +72,15 @@ class ReqGroupState:
 
 @dataclass
 class ReqState:
-    # A reference to the vLLM request object's block_hashes list.
-    # On decode, vLLM appends a new hash to it in place for every
-    # completed block (there is no callback); preemption never
+    # A reference to the vLLM request object's block_hashes list:
+    # live_block_hashes[i] names block i, and is what every plan
+    # addresses. On decode, vLLM appends a new hash to it in place for
+    # every completed block (there is no callback); preemption never
     # truncates it. Append-only and content-addressed, so reading it
     # directly at any point yields the same hashes (plus any newer
-    # ones) a copied snapshot would have held.
-    #
-    # These are at hash_block_size granularity, which is NOT
-    # necessarily ours -- nothing addresses this list directly.
+    # ones) a copied snapshot would have held -- which is why we hold
+    # the reference instead of tracking our own copy.
     live_block_hashes: list = field(default_factory=list)
-    # The projection of that list onto our blocks: block_keys[i] names
-    # block i, whatever the engine's hash granularity. Grown in place
-    # by project_block_hashes, so it inherits the append-only property
-    # above. This is what every plan addresses.
-    block_keys: list[str] = field(default_factory=list)
     num_computed_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     # This request's load plan, built in update_state_after_alloc from
@@ -196,30 +189,6 @@ def parse_kv_cache_config(
     return groups, sizes.pop()
 
 
-def project_block_hashes(live: list, keys: list[str], factor: int) -> None:
-    """Extend ``keys`` -- one hash per PHYSICAL block -- from the
-    engine's raw hash list.
-
-    vLLM computes Request.block_hashes at hash_block_size, which for a
-    multi-group model may be FINER than the block size our plans
-    address: cache_config.hash_block_size lets prefix-caching keys be
-    computed at the finest common granularity and merged for larger
-    physical blocks (config/cache.py). Merging is the consumer's job,
-    and this is it -- the same stride vLLM's own offloading connector
-    uses (ReqContext.update_offload_keys): take every factor-th hash,
-    offset to land on each block's LAST one, because a prefix hash only
-    names the whole block's content at the block's end.
-
-    Append-only and incremental, so it keeps the property the raw list
-    has: the engine grows its list in place as decode completes blocks,
-    and re-running this picks up exactly the new ones. factor == 1 (the
-    usual case) makes it a plain copy of whatever arrived since.
-    """
-    start = factor * len(keys) + factor - 1
-    keys.extend(_hash_str(h) for h in islice(live, start, None, factor))
-
-
-
 # ======================================================================
 # worker bookkeeping
 # ======================================================================
@@ -312,18 +281,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # refuses anything else). Every plan here indexes the engine's
         # block hashes at this granularity.
         self._block_size = block_size
-
-        # How many engine hashes make up one of our blocks. vLLM hashes
-        # at hash_block_size, which can be finer than the block size we
-        # address; every read of a request's hashes goes through
-        # project_block_hashes with this stride. Divisibility is the
-        # engine's own invariant (HybridKVCacheCoordinator asserts
-        # block_size % hash_block_size == 0 for every group;
-        # UnitaryKVCacheCoordinator asserts outright equality), so
-        # there is nothing left for us to check here.
-        hash_bs = (vllm_config.cache_config.hash_block_size
-                   or self._block_size)
-        self._hash_factor = self._block_size // hash_bs
 
         # Fail-closed: spec decode moves the GDN running state into
         # per-draft speculative blocks; the boundary block is committed
@@ -446,15 +403,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 elif ids:
                     gstate.block_ids.extend(ids)
 
-    # ------------------------------------------------------------------
-    def _sync_block_keys(self, state: ReqState) -> None:
-        """Pick up the blocks the engine has completed since last time.
-        Every read of a request's block keys goes through here first:
-        vLLM appends to its hash list in place with no callback, so
-        this is what makes decode-completed blocks visible."""
-        project_block_hashes(state.live_block_hashes, state.block_keys,
-                             self._hash_factor)
-
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -471,7 +419,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             groups=tuple(ReqGroupState() for _ in self._groups),
         )
         self._req_states[request.request_id] = state
-        self._sync_block_keys(state)
         if num_computed_tokens >= request.num_tokens:
             return 0, False
         policy = HybridHitPolicy(
@@ -483,7 +430,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # gated on live chunk presence (engine Record), so a nonzero
         # boundary is complete by construction; only record it.
         boundary = policy.find_longest_cache_hit(
-            state.block_keys,
+            state.live_block_hashes,
             request.num_tokens)
         external = max(0, boundary - num_computed_tokens)
         # Async when there are external tokens to stream and the
@@ -529,7 +476,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.num_computed_tokens + num_external_tokens)
         for g_idx, ids in enumerate(blocks.get_block_ids()):
             state.groups[g_idx].block_ids = list(ids)
-        self._sync_block_keys(state)
         if num_external_tokens <= 0:
             # vLLM calls this a SECOND time for an async request, once
             # its transfer lands and the request is promoted back out of
@@ -563,7 +509,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         f"credited range (req={req_id} boundary={nc} "
                         f"blocks={len(group_blocks)} need={end})")
                 if group is owner:
-                    hashes = state.block_keys[start:end]
+                    hashes = [_hash_str(h) for h
+                              in state.live_block_hashes[start:end]]
                 group_ids[g_idx] = tuple(
                     b.block_id for b in group_blocks[start:end])
             else:
@@ -583,7 +530,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         "enter forward with unrestored state")
                 if group is owner:
                     idx = nc // self._block_size - 1
-                    hashes = [state.block_keys[idx]]
+                    hashes = [_hash_str(state.live_block_hashes[idx])]
                 group_ids[g_idx] = (dst.block_id,)
         # The plan reads every group's hit range back from the store;
         # those blocks are already there, so the save cursors skip them
@@ -670,7 +617,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         state up to computed+scheduled tokens. A partial boundary
         (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
-        self._sync_block_keys(state)
         progress = state.num_computed_tokens + scheduled_tokens
         state.last_known_progress = max(state.last_known_progress,
                                         progress)
@@ -683,11 +629,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             ids = gstate.block_ids
             if group.kind == "attention":
                 num_hash = min(progress // self._block_size, len(ids),
-                               len(state.block_keys))
+                               len(state.live_block_hashes))
                 start = gstate.next_block_to_save
                 if num_hash > start:
                     if group is owner:
-                        hashes = state.block_keys[start:num_hash]
+                        hashes = [_hash_str(h) for h in
+                                  state.live_block_hashes[start:num_hash]]
                     group_ids[g_idx] = tuple(ids[i] for i in
                                              range(start, num_hash))
                     gstate.next_block_to_save = num_hash
@@ -705,7 +652,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # the skipped middle boundaries get no entry (same
                 # semantics as vLLM's own offloading connector), and
                 # the cursor jumps to cover them.
-                idx = len(state.block_keys) - 1
+                idx = len(state.live_block_hashes) - 1
                 if idx >= gstate.next_block_to_save:
                     if idx >= len(ids):
                         # Resumed request: the engine's hash list is
@@ -722,7 +669,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                             f"progress={progress} "
                             f"table_idx={idx} table={ids})")
                     if group is owner:
-                        hashes = [state.block_keys[idx]]
+                        hashes = [
+                            _hash_str(state.live_block_hashes[idx])]
                     group_ids[g_idx] = (ids[idx],)
                     gstate.next_block_to_save = idx + 1
         return ReqMeta(
