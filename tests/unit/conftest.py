@@ -75,6 +75,10 @@ def HybridRequestScheduler(groups, store, block_size,
     conn._groups = list(groups)
     conn.kvstore = store
     conn._block_size = block_size
+    # Engine hash granularity == our block size unless a test says
+    # otherwise, which is what an unset cache_config.hash_block_size
+    # resolves to.
+    conn._hash_factor = 1
     conn._async_load_layer_config = async_load_config
     conn._num_attn_layers = sum(
         len(g.layer_names) for g in groups if g.kind != "mamba")

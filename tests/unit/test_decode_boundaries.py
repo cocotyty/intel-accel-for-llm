@@ -72,3 +72,33 @@ def test_save_plan_reaches_the_new_boundaries():
     meta = sched.build_save_meta("r1", scheduled_tokens=0)
     assert list(meta.block_hashes) == ["1", "2", "3", "4"], (
         f"save plan stopped short of the decode boundaries: {meta}")
+
+
+def test_finer_engine_hashes_still_name_our_blocks():
+    """The engine may hash at a finer granularity than our block size.
+
+    cache_config.hash_block_size lets prefix-caching keys be computed at
+    the finest common granularity of a multi-group model and merged for
+    larger physical blocks; the merge is the consumer's job. Here one of
+    our 16-token blocks spans two engine hashes, so the plan must name
+    each block by the LAST hash it covers -- the only one whose prefix
+    reaches the block's end. Naming it by the first would let a request
+    that shares just the first half restore the whole block.
+    """
+    sched = _sched()
+    sched._hash_factor = 2
+    live = _LiveRequest([1, 2, 3, 4])       # 4 engine hashes = 2 blocks
+    st = _state(sched, live, [])
+    st.groups[0].block_ids = [10, 11, 12, 13]
+
+    meta = sched.build_save_meta("r1", scheduled_tokens=32)
+    assert list(meta.block_hashes) == ["2", "4"], (
+        f"blocks must be named by their last engine hash: {meta}")
+    assert meta.group_block_ids == ((10, 11),), meta
+
+    # Decode completes one more block: two more engine hashes arrive,
+    # and exactly one new key appears.
+    live.block_hashes.extend([5, 6])
+    meta = sched.build_save_meta("r1", scheduled_tokens=48)
+    assert list(meta.block_hashes) == ["6"], meta
+    assert meta.group_block_ids == ((12,),), meta
