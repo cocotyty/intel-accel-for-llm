@@ -628,10 +628,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             gstate = state.groups[g_idx]
             ids = gstate.block_ids
             if group.kind == "attention":
-                num_hash = min(progress // self._block_size, len(ids),
+                # How many boundaries are real after this forward:
+                # the two progress clocks. The third ledger -- the
+                # group's block table -- is not a clock but a
+                # prerequisite, kept out of the min on purpose.
+                num_hash = min(progress // self._block_size,
                                len(state.live_block_hashes))
                 start = gstate.next_block_to_save
                 if num_hash > start:
+                    if num_hash > len(ids):
+                        # Resume window: the engine may report a
+                        # table shorter than the credit (replace
+                        # semantics include the EMPTY table, :402).
+                        # Wait it out like the mamba branch does;
+                        # the deficit closes within one pass.
+                        continue
                     if group is owner:
                         hashes = [_hash_str(h) for h in
                                   state.live_block_hashes[start:num_hash]]
