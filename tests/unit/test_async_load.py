@@ -233,6 +233,10 @@ def _alloc(sched, block_ids, hashes, ext, is_async, layers=-1,
         groups=tuple(ReqGroupState() for _ in sched._groups))
     st.is_async = is_async
     st.async_load_layers = layers
+    if ext > 0:
+        # Layer 1: what get_num_new_matched_tokens would have decided
+        # (fresh request, no local hit -> range [0, ext//bs)).
+        st.load_range = (0, ext // sched._block_size)
     sched._req_states[req_id] = st
     sched.update_state_after_alloc(
         type("R", (), {"request_id": req_id}),
