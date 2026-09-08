@@ -52,7 +52,7 @@ def test_missing_request_object_is_not_fatal():
     sched = _sched()
     st = _state(sched, None, [1, 2])
 
-    sched.on_cached_request("r1", None, False, 32)
+    sched.sync_running_request("r1", None, False, 32)
     assert st.live_block_hashes == [1, 2]
 
 
@@ -67,7 +67,7 @@ def test_save_plan_reaches_the_new_boundaries():
     st.groups[0].block_ids = [10, 11, 12, 13]
 
     live.block_hashes.extend([3, 4])       # two blocks produced by decode
-    sched.on_cached_request("r1", None, False, 64)
+    sched.sync_running_request("r1", None, False, 64)
 
     meta = sched.build_save_meta("r1", scheduled_tokens=0)
     assert list(meta.block_hashes) == ["1", "2", "3", "4"], (

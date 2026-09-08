@@ -71,12 +71,13 @@ def test_resume_to_zero_rolls_cursor_and_reemits():
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=32)  # cursor -> 2
     assert sched._req_states["r1"].groups[0].next_block_to_save == 2
-    sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
+    sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=0)
-    g = sched._req_states["r1"].groups[0]
-    assert g.next_block_to_save == 0, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
+    g = sched._req_states["r1"].groups[0]
+    # this pass re-crosses boundaries 0,1 -> re-emitted now
     assert m.group_block_ids == ((10, 11),), m.group_block_ids
+    assert g.next_block_to_save == 2, g
 
 
 def test_mamba_resume_reemits_boundary_snapshot():
@@ -88,10 +89,10 @@ def test_mamba_resume_reemits_boundary_snapshot():
     m1 = sched.build_save_meta("r1", scheduled_tokens=544)
     assert len(m1.block_hashes) == 1
     assert sched._req_states["r1"].groups[0].next_block_to_save == 1
-    sched.on_cached_request("r1", ([9],), resumed=True,
+    sched.sync_running_request("r1", ([9],), resumed=True,
                             num_computed_tokens=0)
-    assert sched._req_states["r1"].groups[0].next_block_to_save == 0
     m2 = sched.build_save_meta("r1", scheduled_tokens=544)
+    assert sched._req_states["r1"].groups[0].next_block_to_save == 1
     assert len(m2.block_hashes) == 1  # re-emitted
     assert m2.group_block_ids == ((9,),)
 
@@ -102,19 +103,19 @@ def test_resume_to_nonzero_progress_rolls_to_floor():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=64)  # cursor -> 4
-    sched.on_cached_request("r1", ([10, 11, 12, 13],), resumed=True,
+    sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=32)
-    g = sched._req_states["r1"].groups[0]
-    assert g.next_block_to_save == 2, g
     m = sched.build_save_meta("r1", scheduled_tokens=32)
+    g = sched._req_states["r1"].groups[0]
     assert m.group_block_ids == ((12, 13),), m.group_block_ids
+    assert g.next_block_to_save == 4, g
 
 
 def test_monotonic_progress_no_rollback():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=32)
-    sched.on_cached_request("r1", None, resumed=False,
+    sched.sync_running_request("r1", None, resumed=False,
                             num_computed_tokens=32)
     assert sched._req_states["r1"].groups[0].next_block_to_save == 2
 
@@ -123,8 +124,9 @@ def test_resumed_empty_table_clears_and_rolls_back():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1], [10, 11])
     sched.build_save_meta("r1", scheduled_tokens=32)
-    sched.on_cached_request("r1", ([],), resumed=True,
+    sched.sync_running_request("r1", ([],), resumed=True,
                             num_computed_tokens=0)
+    sched.build_save_meta("r1", scheduled_tokens=32)
     g = sched._req_states["r1"].groups[0]
     assert g.block_ids == []
     assert g.next_block_to_save == 0
@@ -136,10 +138,12 @@ def test_progress_regression_without_resumed_flag_rolls_back():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=64)  # cursor -> 4
-    sched.on_cached_request("r1", None, resumed=False,
+    sched.sync_running_request("r1", None, resumed=False,
                             num_computed_tokens=16)
+    m = sched.build_save_meta("r1", scheduled_tokens=16)
     g = sched._req_states["r1"].groups[0]
-    assert g.next_block_to_save == 1, g  # floor(16/16)
+    assert m.group_block_ids == ((11,),), m.group_block_ids  # floor(16/16)=1
+    assert g.next_block_to_save == 2, g
 
 
 # ------------------------------------------------------------------
@@ -206,12 +210,10 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
             FakeBlocks(([10, 11, 12, 13],)), 0)
         sched.build_save_meta(rid, scheduled_tokens=64)  # cursor -> 4
         # preempt + resume to zero
-        sched.on_cached_request(rid, ([10, 11, 12, 13],), resumed=True,
+        sched.sync_running_request(rid, ([10, 11, 12, 13],), resumed=True,
                                 num_computed_tokens=0)
-        g = sched._req_states[rid].groups[0]
-        assert g.next_block_to_save == 0, f"round {i}: no rollback"
         m = sched.build_save_meta(rid, scheduled_tokens=64)
-        assert m.group_block_ids == ((10, 11, 12, 13),)
+        assert m.group_block_ids == ((10, 11, 12, 13),), f"round {i}"
         free, delay = conn.request_finished(
             type("R", (), {"request_id": rid}), None)
         assert (free, delay) == (True, None)
@@ -317,8 +319,12 @@ def test_resume_rollback_still_overrides_the_skip():
     sched = _hybrid_resumed_setup(set(range(34)))
     sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     # Preempted back to 32 tokens (2 blocks): every cursor rolls to 2
-    sched.on_cached_request("r1", (list(range(100, 102)), [200, 201]),
+    # the brake lives in build_save_meta now; the replaced tables are
+    # shorter than the frontier, so the paired emit waits (resume
+    # window) and the cursors stay at the floor
+    sched.sync_running_request("r1", (list(range(100, 102)), [200, 201]),
                             resumed=True, num_computed_tokens=32)
+    sched.build_save_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
     assert all(g.next_block_to_save == 2 for g in st.groups), [
         g.next_block_to_save for g in st.groups]

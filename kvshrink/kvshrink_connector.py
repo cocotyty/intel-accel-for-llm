@@ -86,7 +86,7 @@ class ReqState:
     # ---- Layer 1: token/hash space, group-agnostic ----
     # Number of boundaries OFFERED to the groups for saving so far.
     # build_save_meta advances it to the token frontier (min of credit
-    # and keyed-hash count); on_cached_request caps it when the engine
+    # and keyed-hash count); sync_running_request caps it when the engine
     # rolls credit back. Group cursors never exceed this.
     save_watermark: int = 0
     # Boundary range [start, end) to restore from the store, decided
@@ -377,36 +377,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
-    def on_cached_request(
+    def sync_running_request(
         self, req_id: str, new_block_ids: tuple[list[int], ...],
         resumed: bool, num_computed_tokens: int,
     ) -> None:
-        """Every pass, for each running request: sync the block tables
-        from upstream, and cap the save cursor at the boundary the
-        engine currently credits (`num_computed_tokens // block_size`).
-        The cap is a no-op in normal flow -- the snapshot already
-        includes the previous pass's scheduled tokens -- and the only
-        brake when the engine rolls progress back (failed-load
-        recovery, pure-attention spec rejection): the rolled-back
-        boundaries get re-emitted with the recomputed pages (store
-        overwrite is idempotent). Same guarantee as the offloading
-        connector's advance_stored_idx, which recomputes its cursor
-        from the current arithmetic."""
+        """Every pass, for each running request: pull the engine's
+        snapshots into our state -- the credit (Layer 1's input) and
+        the per-group block tables (Layer 2's maps). No save decisions
+        here; build_save_meta owns the watermark lifecycle."""
         state = self._req_states[req_id]
         state.num_computed_tokens = num_computed_tokens
-        # Layer 1: the offered prefix cannot exceed the frontier the
-        # engine currently credits. A no-op in normal flow (the
-        # snapshot already includes the previous pass's scheduled
-        # tokens); the only brake when credit rolls back (failed-load
-        # recovery, pure-attention spec rejection). Group cursors are
-        # consumption offsets into the offered prefix, so clamping
-        # them to the watermark keeps the invariant cursor <= offer.
-        safe = num_computed_tokens // self._block_size
-        if state.save_watermark > safe:
-            state.save_watermark = safe
-        for gstate in state.groups:
-            if gstate.next_block_to_save > state.save_watermark:
-                gstate.next_block_to_save = state.save_watermark
         if new_block_ids:
             for gstate, ids in zip(state.groups, new_block_ids):
                 if resumed:
@@ -657,10 +637,31 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         hold state up to computed+scheduled tokens. A partial boundary
         (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
+        # Layer 1: the frontier, and the rollback brake, in one place.
+        # The brake clamps the group cursors to the frontier the engine
+        # last credits -- a no-op in normal flow (the previous pass's
+        # progress IS this pass's credit snapshot) and the only brake
+        # when credit rolls back (failed-load recovery, pure-attention
+        # spec rejection): the rolled-back boundaries get re-emitted
+        # with the recomputed pages (store overwrite is idempotent).
+        # Same guarantee as the offloading connector's
+        # advance_stored_idx, which recomputes its cursor from the
+        # current arithmetic. The brake MUST land on the cursors
+        # before the watermark raise below -- a watermark-only rewind
+        # would be erased by the raise and the re-emit lost.
+        # current_token_block: the index of the token block currently
+        # being computed (= the count of complete boundaries). The
+        # brake anchors here: cursors may never sit ahead of it.
+        current_token_block = (
+            state.num_computed_tokens // self._block_size)
+        for gstate in state.groups:
+            if gstate.next_block_to_save > current_token_block:
+                gstate.next_block_to_save = current_token_block
         end = min((state.num_computed_tokens + scheduled_tokens)
                   // self._block_size,
                   len(state.live_block_hashes))
-        state.save_watermark = max(state.save_watermark, end)
+        state.save_watermark = max(
+            min(state.save_watermark, current_token_block), end)
         owner = next((g for g in self._groups if g.kind == "attention"),
                      self._groups[0])
         hashes: list[str] = []
@@ -780,13 +781,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     req_meta.async_load_layers)
 
         # Running requests cross boundaries in later steps too (chunked
-        # prefill tails, decode-time crossings): sync their tables first,
-        # then emit incremental saves.
+        # prefill tails, decode-time crossings). The two calls are a
+        # LOAD-BEARING PAIR, in this order: the rollback brake inside
+        # build_save_meta must observe the credit sync_running_request
+        # just pulled in, and it must land on the group cursors before
+        # the watermark raise -- reordering or splitting them silently
+        # drops the re-emission of rolled-back boundaries.
         resumed = cr.resumed_req_ids
         new_bids = cr.new_block_ids
         ncts = cr.num_computed_tokens
         for i, req_id in enumerate(cr.req_ids):
-            self.on_cached_request(
+            self.sync_running_request(
                 req_id, new_bids[i], req_id in resumed, ncts[i])
             save_meta = self.build_save_meta(
                 req_id, num_sched[req_id])
