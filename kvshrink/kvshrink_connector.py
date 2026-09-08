@@ -87,11 +87,6 @@ class ReqState:
     # the block objects the engine hands over there, and handed out
     # once by build_connector_meta. None = nothing to restore.
     load_plan: Optional[ReqMeta] = None
-    # Last authoritative progress seen by the save path
-    # (num_computed + scheduled of the last save plan). Used for
-    # fail-closed regression detection: any drop below this value rolls
-    # save cursors back even if the resumed flag is missing.
-    last_known_progress: int = 0
     # Async load decision, made in get_num_new_matched_tokens and
     # consumed when the plan is built: while is_async, the request is
     # parked and its plan ships from build_connector_meta.
@@ -377,22 +372,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, req_id: str, new_block_ids: tuple[list[int], ...],
         resumed: bool, num_computed_tokens: int,
     ) -> None:
-        """Every pass, for each running request: sync the block
-        tables from upstream; on resume (or progress regression) roll
-        the save cursor back so boundaries emitted before a preemption
-        get re-emitted (overwrite is idempotent)."""
+        """Every pass, for each running request: sync the block tables
+        from upstream, and cap the save cursor at the boundary the
+        engine currently credits (`num_computed_tokens // block_size`).
+        The cap is a no-op in normal flow -- the snapshot already
+        includes the previous pass's scheduled tokens -- and the only
+        brake when the engine rolls progress back (failed-load
+        recovery, pure-attention spec rejection): the rolled-back
+        boundaries get re-emitted with the recomputed pages (store
+        overwrite is idempotent). Same guarantee as the offloading
+        connector's advance_stored_idx, which recomputes its cursor
+        from the current arithmetic."""
         state = self._req_states[req_id]
-        old_progress = max(state.num_computed_tokens,
-                           state.last_known_progress)
-        regression = num_computed_tokens < old_progress
         state.num_computed_tokens = num_computed_tokens
-        state.last_known_progress = num_computed_tokens
-        if resumed or regression:
-            for g_idx, group in enumerate(self._groups):
-                gstate = state.groups[g_idx]
-                safe = num_computed_tokens // self._block_size
-                if gstate.next_block_to_save > safe:
-                    gstate.next_block_to_save = safe
+        safe = num_computed_tokens // self._block_size
+        for gstate in state.groups:
+            if gstate.next_block_to_save > safe:
+                gstate.next_block_to_save = safe
         if new_block_ids:
             for gstate, ids in zip(state.groups, new_block_ids):
                 if resumed:
@@ -618,8 +614,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
         progress = state.num_computed_tokens + scheduled_tokens
-        state.last_known_progress = max(state.last_known_progress,
-                                        progress)
         owner = next((g for g in self._groups if g.kind == "attention"),
                      self._groups[0])
         hashes: list[str] = []
