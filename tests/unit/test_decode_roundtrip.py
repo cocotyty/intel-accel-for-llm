@@ -69,7 +69,7 @@ def test_second_request_hits_decode_produced_blocks():
     # Decode completed two more blocks; the engine appended their
     # hashes to the live list in place.
     live.block_hashes.extend([3, 4])
-    sched.on_cached_request("r1", None, False, 64)
+    sched.sync_running_request("r1", None, False, 64)
 
     # The save plan reaches the new boundaries and the store
     # commits them.

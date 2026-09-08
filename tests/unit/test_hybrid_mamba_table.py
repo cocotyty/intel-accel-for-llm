@@ -142,7 +142,7 @@ def test_save_meta_resumed_short_table_waits():
     st = sched._req_states["r1"]
     # resumed: vLLM replaced the table with just the curr slot
     st.groups[0].block_ids = [200, 201]
-    sched.on_cached_request("r1", ([202],), resumed=True,
+    sched.sync_running_request("r1", ([202],), resumed=True,
                             num_computed_tokens=0)
     meta = sched.build_save_meta("r1", scheduled_tokens=64)
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
