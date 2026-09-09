@@ -83,8 +83,7 @@ def _meta(async_layers, req_id="r1"):
     """A load plan covering every layer, split per group."""
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(
-        block_hashes=("7",),
-        group_block_ids=(("5",), ("5",)),
+        block_hashes=("7",), group_block_ids=(("5",), ("5",)),
         is_async=True, async_load_layers=async_layers)
     return KVShrinkConnectorMetadata(reqs_to_load=md)
 

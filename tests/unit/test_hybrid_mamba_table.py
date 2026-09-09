@@ -88,8 +88,8 @@ def test_save_meta_null_prefixed_table():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
-    assert meta.block_hashes == ("1",), meta
-    assert meta.group_block_ids == ((7,),), meta
+    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.group_block_ids == ((0, 7),), meta
 
 
 def test_save_meta_partial_tail_still_saves_completed_blocks():
@@ -101,8 +101,8 @@ def test_save_meta_partial_tail_still_saves_completed_blocks():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0, 1}, [[0, 7, 9]], hashes=(0, 1))
     meta = sched.build_save_meta("r1", scheduled_tokens=1560)
-    assert meta.block_hashes == ("1",), meta
-    assert meta.group_block_ids == ((7,),), meta
+    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.group_block_ids == ((0, 7),), meta
 
 
 def test_save_meta_decode_boundary_late_hash_still_saved():
@@ -122,6 +122,8 @@ def test_save_meta_decode_boundary_late_hash_still_saved():
     # real shape at progress 2641: cdiv(2641,528)=6 columns, the prev
     # column (idx 4) still holds the boundary-2640 state
     st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
+    # real flow: boundaries 0-3 were offered and put in earlier passes
+    st.save_watermark = 4
     # the step AFTER the crossing: progress is off the boundary now
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
     assert meta.block_hashes == ("4",), meta
@@ -131,30 +133,22 @@ def test_save_meta_decode_boundary_late_hash_still_saved():
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
-def test_save_meta_prefill_waits_for_the_tail_slot():
-    """Prefill: hashes are pre-computed for the whole prompt at
-    construction while the table lags behind chunk by chunk. The tail
-    boundary's slot is not real until the chunk that completes it, so
-    every earlier pass offers but waits -- and the engine's aligned
-    splitting (scheduler :300-333) guarantees the slot is real exactly
-    when the boundary is fully computed, so the tail column always
-    holds a boundary state when it is read."""
+def test_save_meta_prefill_puts_every_boundary():
+    """Prefill: the engine's block-aligned splitting (scheduler
+    :300-333) ends every chunk at a boundary, so each pass offers
+    exactly the boundary it completed -- the save fires every pass,
+    one snapshot per boundary, and the store covers the whole prompt
+    (the offloading premise: the store is capacity)."""
     groups = [_group(0, "mamba", 544)]
     sched = HybridRequestScheduler(groups, _Store(set()), 544)
     track_new_request(sched, "r1", block_hashes=list(range(34)),
                      num_computed_tokens=0)
-    for k in range(1, 34):
+    for k in range(1, 35):
         sched.sync_running_request("r1", ([100 + k],), resumed=False,
                                 num_computed_tokens=(k - 1) * 544)
         meta = sched.build_save_meta("r1", scheduled_tokens=544)
-        assert meta.block_hashes == (), (k, meta)
-    # the chunk that completes boundary 33: the tail slot is real and
-    # holds the boundary state -- the save fires, once
-    sched.sync_running_request("r1", ([134],), resumed=False,
-                            num_computed_tokens=33 * 544)
-    meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert meta.block_hashes == ("33",), meta
-    assert meta.group_block_ids == ((134,),), meta
+        assert meta.block_hashes == (f"{k - 1}",), (k, meta)
+        assert meta.group_block_ids == ((100 + k,),), (k, meta)
     # the next pass: credit catches up (nc = 34 blocks), the offer is
     # empty -- no duplicate put
     sched.sync_running_request("r1", ([],), resumed=False,
@@ -169,20 +163,20 @@ def test_save_meta_multi_block_boundary():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
-    assert meta.block_hashes == ("1",), meta
-    assert meta.group_block_ids == ((7,),), meta
+    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.group_block_ids == ((0, 7),), meta
 
 
-def test_save_meta_prev_and_curr_blocks_save_curr():
-    """Legal shape [NULL, prev, curr] at a 3-block boundary: the exit
-    state is in the LAST column (block 47), never the surviving prev
-    block 31 the old reverse scan could have preferred on a mis-sized
-    table. The engine hashed all three completed blocks."""
+def test_save_meta_prev_and_curr_blocks_save_both():
+    """Legal shape [NULL, prev, curr] at a 3-block boundary: both
+    materialized boundaries go out under their own keys -- greedy
+    puts every real column in the offer (the null prefix is skipped;
+    a boundary left out is a future full mamba recompute)."""
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1, 2}, [[0, 31, 47]], hashes=(0, 1, 2))
     meta = sched.build_save_meta("r1", scheduled_tokens=1632)
-    assert meta.block_hashes == ("2",), meta
-    assert meta.group_block_ids == ((47,),), meta
+    assert meta.block_hashes == ("0", "1", "2"), meta
+    assert meta.group_block_ids == ((0, 31, 47),), meta
 
 
 def _load_plan(block_ids, committed, hashes, nc_before, ext):
@@ -216,16 +210,17 @@ def test_load_meta_targets_the_tables_state_slot():
     resume and a decode tail, and none of them needs the scheduled
     token count to resolve."""
     cases = [
-        ([5, 6], 544, "0"),        # boundary 544, one block scheduled
-        ([0, 1, 6], 1088, "1"),    # 1560-token prompt, chunk tail
-        ([0, 7, 9], 1088, "1"),    # null-prefixed table
-        ([0, 1, 6], 1088, "1"),    # decode tail
+        ([5, 6], 544, ("0",)),          # boundary 544, one block scheduled
+        ([0, 1, 6], 1088, ("0", "1")),  # 1560-token prompt, chunk tail
+        ([0, 7, 9], 1088, ("0", "1")),  # null-prefixed table
+        ([0, 1, 6], 1088, ("0", "1")),  # decode tail
     ]
-    for block_ids, nc, want_hash in cases:
-        meta = _load_plan(block_ids, {int(want_hash)}, (0, 1),
+    for block_ids, nc, want_keys in cases:
+        meta = _load_plan(block_ids, {int(want_keys[-1])}, (0, 1),
                           nc_before=0, ext=nc)
-        assert meta.block_hashes == (want_hash,), (block_ids, meta)
-        assert meta.group_block_ids == ((block_ids[-1],),), \
+        assert meta.block_hashes == want_keys, (block_ids, meta)
+        assert meta.group_block_ids == (tuple([0] * (len(want_keys) - 1)
+                                        + [block_ids[-1]]),), \
             (block_ids, meta)
 
 
@@ -260,20 +255,19 @@ def test_load_meta_fail_closed_without_boundary():
     assert "r1" not in meta.reqs_to_load.requests, meta
 
 
-def test_save_meta_all_null_table_fail_closed():
-    """All-null table at a boundary -> FAIL-STOP, mirroring the load
-    path: the kernel cannot have left the exit state anywhere, so
-    saving any other block under the boundary hash would silently
-    poison the store."""
+def test_save_meta_all_null_table_puts_nothing():
+    """All-null columns in the offer -> nothing is put. A null column
+    means the state was never materialized (multi-boundary chunks
+    write only their tail); the hit policy gates mamba hits on store
+    presence, so the gap narrows a future hit range instead of
+    poisoning it. The fail-closed raise stays on the LOAD path, where
+    a null state slot means forward would read garbage."""
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 0]])
-    raised = None
-    try:
-        sched.build_save_meta("r1", scheduled_tokens=1088)
-    except RuntimeError as e:
-        raised = e
-    assert raised is not None, "all-null table must raise"
-    assert "boundary column is NULL" in str(raised)
+    meta = sched.build_save_meta("r1", scheduled_tokens=1088)
+    # the shared key list spans the offer; both columns ride as 0
+    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.group_block_ids == ((0, 0),), meta
 
 
 def test_load_meta_all_null_table_fail_closed():
