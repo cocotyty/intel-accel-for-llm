@@ -656,9 +656,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # mamba consumes one state column per boundary with 0 where
             # the column was never materialized (middles of multi-boundary chunks).
             if end > start:
-                group_ids[g_idx] = tuple(
-                    x if x != 0 else 0
-                    for x in ids[start:end])
+                group_ids[g_idx] = tuple(ids[start:end])
         return ReqMeta(
             block_hashes=hashes,
             group_block_ids=tuple(group_ids),
