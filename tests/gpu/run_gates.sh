@@ -50,6 +50,7 @@ fi
 if [[ -n "$ATTENTION_MODEL" ]]; then
     run_gate "$ATTENTION_MODEL" probe_pure_attention.sh
     run_gate "$ATTENTION_MODEL" probe_decode_reuse_attn.sh
+    run_gate "$ATTENTION_MODEL" probe_flashinfer.sh
 else
     echo "skipping the pure-attention regression gate:" \
          "set GATE_MODEL_ATTENTION to an attention-only model"
