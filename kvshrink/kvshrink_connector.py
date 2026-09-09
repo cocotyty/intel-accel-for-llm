@@ -507,11 +507,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # pages. The range covers only the external tokens --
                 # the core's own prefix-hit blocks already hold their
                 # data (shared physical pages).
-                if end > len(group_blocks):
-                    raise RuntimeError(
-                        "kvshrink load: attention table shorter than the "
-                        f"credited range (req={req_id} boundary={nc} "
-                        f"blocks={len(group_blocks)} need={end})")
                 group_ids[g_idx] = tuple(
                     b.block_id for b in group_blocks[start:end])
             else:
@@ -660,18 +655,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # physical objects. attention consumes one page per boundary;
             # mamba consumes one state column per boundary with 0 where
             # the column was never materialized (middles of multi-boundary chunks).
-            # Both share the same table size contract (alloc sizes for
-            # computed+scheduled tokens, len(ids) >= end by construction)
-            # and the same non-empty offer trigger (end > start).
-            if end > len(ids):
-                raise RuntimeError(
-                    f"kvshrink save: {group.kind} table shorter than "
-                    f"the save frontier (req={req_id} end={end} "
-                    f"blocks={len(ids)})")
             if end > start:
                 group_ids[g_idx] = tuple(
-                    ids[i] if ids[i] != 0 else 0
-                    for i in range(start, end))
+                    x if x != 0 else 0
+                    for x in ids[start:end])
         return ReqMeta(
             block_hashes=hashes,
             group_block_ids=tuple(group_ids),

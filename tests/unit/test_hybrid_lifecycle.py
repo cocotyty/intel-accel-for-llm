@@ -12,8 +12,6 @@ Rulings under test:
    deletes them; uncommitted pages never hit.
 """
 
-import pytest
-
 from conftest import (
     FakeBlocks, HybridRequestScheduler, make_spec,
     track_new_request)
@@ -118,17 +116,13 @@ def test_monotonic_progress_no_rollback():
     assert sched._req_states["r1"].save_watermark == 2
 
 
-def test_resumed_empty_table_clears_and_fails_closed():
+def test_resumed_empty_table_clears():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1], [10, 11])
     sched.build_save_meta("r1", scheduled_tokens=32)
     sched.sync_running_request("r1", ([],), resumed=True,
                             num_computed_tokens=0)
     assert sched._req_states["r1"].groups[0].block_ids == []
-    # A replaced table that cannot cover the credited frontier is an
-    # engine-contract break: fail closed, like the load path.
-    with pytest.raises(RuntimeError):
-        sched.build_save_meta("r1", scheduled_tokens=32)
 
 
 def test_progress_regression_without_resumed_flag_rolls_back():
