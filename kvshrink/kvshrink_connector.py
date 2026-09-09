@@ -405,7 +405,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     # upstream semantics: for resumed requests
                     # new_block_ids IS the table (replace), per group --
                     # including an EMPTY list, which clears stale blocks
-                    gstate.block_ids = list(ids) if ids else []
+                    gstate.block_ids = list(ids)
                 elif ids:
                     gstate.block_ids.extend(ids)
 
@@ -521,8 +521,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # the full offer width with 0 in every non-slot
                 # position; the worker's positional pairing + the 0
                 # filter lands the snapshot on hashes[end - 1].
-                dst = group_blocks[-1] if group_blocks else None
-                if dst is None or dst.is_null:
+                dst = group_blocks[-1]
+                if dst.is_null:
                     raise RuntimeError(
                         "kvshrink mamba load: the state slot is a null "
                         f"block (req={req_id} boundary={nc} "
@@ -648,18 +648,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # bad store copies.
         hashes = tuple(
             _hash_str(h) for h in state.live_block_hashes[start:end])
-        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
-        for g_idx, group in enumerate(self._groups):
-            ids = state.groups[g_idx].block_ids
-            # Layer 2: map the offered range [start, end) onto this group's
-            # physical objects. attention consumes one page per boundary;
-            # mamba consumes one state column per boundary with 0 where
-            # the column was never materialized (middles of multi-boundary chunks).
-            if end > start:
-                group_ids[g_idx] = tuple(ids[start:end])
+        # Layer 2: map the offered range [start, end) onto each group's
+        # block table. If start == end, the slices are empty.
+        group_ids = tuple(
+            tuple(g.block_ids[start:end]) for g in state.groups)
         return ReqMeta(
             block_hashes=hashes,
-            group_block_ids=tuple(group_ids),
+            group_block_ids=group_ids,
         )
 
     def build_connector_meta(
@@ -678,7 +673,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     req_meta.async_load_layers)
             save_meta = self.build_save_meta(
                 new_req.req_id, num_sched[new_req.req_id])
-            if any(save_meta.group_block_ids):
+            if save_meta.block_hashes:
                 meta.reqs_to_save.add_request(
                     new_req.req_id, save_meta.block_hashes,
                     save_meta.group_block_ids)
@@ -725,7 +720,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 req_id, new_bids[i], req_id in resumed, ncts[i])
             save_meta = self.build_save_meta(
                 req_id, num_sched[req_id])
-            if any(save_meta.group_block_ids):
+            if save_meta.block_hashes:
                 meta.reqs_to_save.add_request(
                     req_id, save_meta.block_hashes,
                     save_meta.group_block_ids)

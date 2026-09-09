@@ -93,9 +93,7 @@ class HybridHitPolicy:
         candidate = max_length
         if self._has_mamba:
             # the last prompt token is always recomputed (logprobs + state)
-            candidate = min(candidate - 1,
-                            (candidate - 1) // self._block_size
-                            * self._block_size)
+            candidate = (candidate - 1) // self._block_size * self._block_size
 
         while True:
             changed = False
