@@ -59,9 +59,8 @@ class ReqMeta:
     width for every group: an attention group carries one page per
     boundary; a mamba group carries its state column per boundary
     with 0 where no column is real (never-materialized middles of
-    multi-boundary chunks, and the restore slot until a forward's
-    tail overwrites it). The worker pairs positionally and drops the
-    0 slots."""
+    multi-boundary chunks). The worker pairs positionally and drops
+    the 0 slots."""
     block_hashes: tuple[str, ...] = ()
     group_block_ids: tuple[tuple[int, ...], ...] = ()
     is_async: bool = False
@@ -72,16 +71,10 @@ class ReqMeta:
 class ReqGroupState:
     """Per-group mutable state for one request (scheduler side).
 
-    block_ids: this group's block table. restore_slot (mamba only):
-    the column the restore wrote its snapshot into -- the table's
-    last entry at restore time. The snapshot's boundary identity is
-    the hit boundary, NOT that column's positional index, so the
-    save scan must not key it until a forward's tail has overwritten
-    it (which happens exactly when the scan's tail column == this
-    index). Save progress itself is NOT per group: attention's save
-    cursor IS save_watermark, and mamba consumes the same offer."""
+    block_ids: this group's block table. Save progress itself is NOT
+    per group: attention's save cursor IS save_watermark, and mamba
+    consumes the same offer."""
     block_ids: list[int] = field(default_factory=list)
-    restore_slot: int = -1
 
 
 @dataclass
@@ -558,11 +551,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                         "enter forward with unrestored state")
                 group_ids[g_idx] = tuple(
                     [0] * (end - start - 1) + [dst.block_id])
-                # The snapshot's boundary identity is the hit boundary,
-                # not this column's positional index -- remember the
-                # slot so the save scan never keys it before a forward
-                # overwrites it with the matching boundary state.
-                state.groups[g_idx].restore_slot = len(group_blocks) - 1
         # Layer 1: the restored prefix is covered -- the watermark
         # (= attention's save cursor) jumps past it so the first
         # post-restore save pass offers only newly computed
@@ -727,24 +715,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # multi-boundary chunk writes only its tail column;
                 # the engine's block-aligned splitting, scheduler
                 # :300-333, guarantees the tail column's content is
-                # the boundary state once computed), and the restore
-                # slot -- the snapshot's identity is the hit boundary,
-                # not that column's positional index, so it is
-                # keyable only when this pass's tail overwrites it.
-                # The hit policy gates mamba hits on store presence,
-                # so a dropped slot only narrows a future hit range,
-                # never corrupts it.
+                # the boundary state once computed). The hit policy
+                # gates mamba hits on store presence, so a dropped slot
+                # only narrows a future hit range, never corrupts it.
                 if end > len(ids):
                     raise RuntimeError(
                         "kvshrink save: mamba table shorter than "
                         f"the save frontier (req={req_id} end={end} "
                         f"blocks={len(ids)})")
                 if end > start:
-                    tail = len(ids) - 1
-                    slot = gstate.restore_slot
                     group_ids[g_idx] = tuple(
-                        ids[i] if ids[i] != 0 and not (
-                            i == slot and i != tail) else 0
+                        ids[i] if ids[i] != 0 else 0
                         for i in range(start, end))
         return ReqMeta(
             block_hashes=hashes,

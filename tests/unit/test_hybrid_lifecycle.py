@@ -313,9 +313,11 @@ def test_incremental_boundaries_after_restore_are_saved():
     m = sched.build_save_meta("r1", scheduled_tokens=640)
     assert len(m.block_hashes) == 40, m
     assert m.group_block_ids[0] == tuple(range(134, 174)), m
-    # mamba snapshot at the 1184 boundary: table idx 73; the restore
-    # slot (idx 37) holds the hit-boundary snapshot and stays unkeyed
-    assert m.group_block_ids[1] == tuple([0] * 39 + [273]), m
+    # mamba snapshots at the 608 and 1184 boundaries: table idx 37 and 73
+    want_mamba = [0] * 40
+    want_mamba[37 - 34] = 237
+    want_mamba[73 - 34] = 273
+    assert m.group_block_ids[1] == tuple(want_mamba), m
 
 
 def test_resume_rollback_still_overrides_the_skip():
