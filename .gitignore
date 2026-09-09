@@ -55,3 +55,4 @@
 _build
 _lib
 _data
+.wheels/

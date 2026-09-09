@@ -730,14 +730,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
 
-        static_context = self.vllm_config.compilation_config.static_forward_context
-        for layer in static_context.values():
-            get_backend = getattr(layer, "get_attn_backend", None)
-            if get_backend is not None:
-                if "FLASHINFER" in get_backend().get_name().upper():
-                    raise RuntimeError("FlashInfer is not supported")
-                break
-
         from vllm.model_executor.models.utils import extract_layer_index
 
         # Execution order feeds the async release gate.
