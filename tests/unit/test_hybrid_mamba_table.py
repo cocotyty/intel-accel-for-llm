@@ -186,11 +186,6 @@ def _load_plan(block_ids, committed, hashes, nc_before, ext):
     sched = HybridRequestScheduler(groups, _Store(committed), 544)
     track_new_request(sched, "r1", block_hashes=list(hashes),
                       num_computed_tokens=nc_before)
-    if ext > 0:
-        # Layer 1: what the lookup hook would have decided -- the hit
-        # boundary is nc_before + ext, no earlier local hit.
-        sched._req_states["r1"].load_range = (
-            nc_before // 544, (nc_before + ext) // 544)
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks((block_ids,)), ext)

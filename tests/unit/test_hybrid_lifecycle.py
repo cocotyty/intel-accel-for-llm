@@ -242,10 +242,6 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     sched = HybridRequestScheduler(groups, _HitStore(committed), 16)
     hashes = list(range(34))  # 34 hash blocks * 16 = 544 tokens
     track_new_request(sched, "r1", block_hashes=hashes, num_computed_tokens=0)
-    if ext > 0:
-        # Layer 1: the lookup hook's decision -- hit at boundary 544,
-        # no local hit -> restore range [0, 34).
-        sched._req_states["r1"].load_range = (0, ext // sched._block_size)
     attn_ids = list(range(100, 134))  # 34 fresh attention blocks
     # CURR slot for this step: (544 + 64 - 1) // 16 = 37. align mode
     # nulls every column but the restore slot (the table's last
