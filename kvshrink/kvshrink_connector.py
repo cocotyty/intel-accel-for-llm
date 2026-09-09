@@ -509,9 +509,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 group_ids[g_idx] = tuple(
                     b.block_id for b in group_blocks[start:end])
             else:
-                # Layer 2: mamba consumes the range's LAST boundary --
-                # the snapshot goes into the running-state slot (the table's
-                # last entry), with 0 sentinels in every preceding position.
+                # Layer 2: mamba restore slot and worker timing:
+                # In vLLM (gpu_model_runner.py:4167 vs 4276), the engine's
+                # `preprocess_mamba` runs BEFORE the connector's
+                # `start_load_kv`. In `preprocess_mamba`, vLLM copies
+                # prev_state_idx ((num_computed - 1) // bs) to curr_state_idx
+                # (len(group_blocks) - 1). Because this copy happens before
+                # our external load, loading into prev_state_idx would be
+                # futile -- the copy has already finished.
+                # Therefore, the external snapshot MUST be loaded directly
+                # into the running state slot `group_blocks[-1]`
+                # (curr_state_idx), where `_model_forward` will execute.
+                # The plan spans the offer [start, end) with 0 sentinels
+                # in all preceding positions so the worker's positional
+                # zip lands `hashes[-1]` (the hit boundary key) squarely
+                # onto `group_blocks[-1].block_id`.
                 group_ids[g_idx] = tuple(
                     [0] * (end - start - 1) + [group_blocks[-1].block_id])
         # Layer 1: the restored prefix is covered -- the watermark
@@ -1009,7 +1021,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     del self._pending_load_layers[req_id]
                     finished_recving.add(req_id)
             else:
-                # recurrent layers union the first-N attention prefix
+                # Recurrent layers union the first-N attention prefix.
+                # All recurrent (Mamba/GDN) layers MUST be waited here before
+                # releasing the request: vLLM's `preprocess_mamba` runs once
+                # per batch in `gpu_model_runner.py` before any layer forward,
+                # and Mamba layers have no per-layer forward hooks.
+                # Therefore, only attention layers can be streamed in the
+                # background and waited on-demand via `wait_for_layer_load`.
                 gate_layers = (
                     [ln for ln in tasks if ln in self._mamba_layers]
                     + [ln for ln in self._attn_order
