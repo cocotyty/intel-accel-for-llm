@@ -252,7 +252,7 @@ def test_resumed_load_meta_restores_credited_pages():
     carrying all 34 attention pages + the mamba snapshot written into
     the CURR slot only (v0.23.0 reads CURR in every kernel path)."""
     sched = _hybrid_resumed_setup(set(range(34)))
-    meta = sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    meta = sched.build_load_meta("r1", scheduled_tokens=64)
     assert meta is not None
     # 34 attention pages + the mamba snapshot written into the CURR
     # slot only (v0.23.0 reads CURR in every kernel path)
@@ -268,7 +268,7 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     must not re-write those blocks (attention pages and the restored
     mamba snapshot alike)."""
     sched = _hybrid_resumed_setup(set(range(34)))
-    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    sched.build_load_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
     # 544 credited tokens = 34 blocks: the watermark starts past the
     # restored range; the mamba skip is structural (the tail rule
@@ -291,7 +291,7 @@ def test_incremental_boundaries_after_restore_are_saved():
     """The skip is a floor, not a wall: once forward crosses boundaries
     the restore did NOT cover, those blocks must still be saved."""
     sched = _hybrid_resumed_setup(set(range(34)))
-    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    sched.build_load_meta("r1", scheduled_tokens=64)
     # Extend the ledger and both tables past the restored range
     st = sched._req_states["r1"]
     st.live_block_hashes.extend(range(34, 74))
@@ -315,7 +315,7 @@ def test_resume_rollback_still_overrides_the_skip():
     resumed progress -- the skip must never keep the save cursor ahead
     of what vLLM says is computed."""
     sched = _hybrid_resumed_setup(set(range(34)))
-    sched.build_resumed_load_meta("r1", scheduled_tokens=64)
+    sched.build_load_meta("r1", scheduled_tokens=64)
     # Preempted back to 32 tokens (2 blocks); the replaced tables
     # cover the resumed frontier (6 blocks after this pass's sched):
     # the brake rolls the watermark to 2, so the re-crossed
