@@ -593,37 +593,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.request_finished(request, [])
 
     # ------------------------------------------------------------------
-    def build_load_meta(
-        self, new_req: "NewRequestData", scheduled_tokens: int = 0
-    ) -> ReqMeta:
-        """Hand out the plan built at alloc time."""
-        return self._take_load_plan(new_req.req_id)
-
-    def build_resumed_load_meta(
-        self, req_id: str, scheduled_tokens: int = 0
-    ) -> ReqMeta:
-        """Load plan for a PREEMPTION-RESUMED request: v1 carries
-        them in scheduled_cached_reqs.resumed_req_ids, not in
-        scheduled_new_reqs, so they need their own loop."""
-        meta = self._take_load_plan(req_id)
-        npages = sum(len(g) for g in meta.group_block_ids)
-        if npages == 0:
-            raise RuntimeError(
-                "kvshrink resumed request has accepted external "
-                "tokens but no restorable pages (req="
-                f"{req_id} boundary="
-                f"{self._req_states[req_id].num_computed_tokens}): "
-                "refusing to enter forward with unrestored state")
-        return meta
-
     def _take_load_plan(self, req_id: str) -> ReqMeta:
         """Pop the request's plan: a plan is emitted exactly once per
-        allocation, and a later allocation (resume) builds a fresh one.
-        Every caller checks load_plan is not None first."""
+        allocation, and a later allocation (resume) builds a fresh one."""
         state = self._req_states[req_id]
         plan = state.load_plan
         state.load_plan = None
         return plan
+
+    def build_load_meta(
+        self, req: "NewRequestData" | str, scheduled_tokens: int = 0
+    ) -> ReqMeta:
+        """Hand out the plan built at alloc time (test helper)."""
+        req_id = req.req_id if hasattr(req, "req_id") else req
+        return self._take_load_plan(req_id)
+
+    build_resumed_load_meta = build_load_meta
 
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
@@ -686,47 +671,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             _hash_str(h) for h in state.live_block_hashes[start:end])
         group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
         for g_idx, group in enumerate(self._groups):
-            gstate = state.groups[g_idx]
-            ids = gstate.block_ids
-            if group.kind == "attention":
-                # Layer 2: consume the offered range [start, end) --
-                # one page per boundary, keyed in order. A table
-                # shorter than the frontier would be an engine-contract
-                # break (alloc sizes the table for computed+scheduled
-                # tokens, so len(ids) >= end by construction) -- fail
-                # closed, like the load path.
-                if end > len(ids):
-                    raise RuntimeError(
-                        "kvshrink save: attention table shorter than "
-                        f"the save frontier (req={req_id} end={end} "
-                        f"blocks={len(ids)})")
-                if end > start:
-                    group_ids[g_idx] = tuple(ids[i] for i in
-                                             range(start, end))
-            else:
-                # Layer 2: mamba consumes the same offer at the same
-                # per-boundary granularity -- one state column per
-                # boundary. The store is capacity (the offloading
-                # premise): a boundary left out is a future full mamba
-                # recompute, since mamba cannot restore into the
-                # middle of a prefix without a snapshot. A column that
-                # holds no real state goes out as 0 and the worker
-                # drops it: never-materialized middles (a
-                # multi-boundary chunk writes only its tail column;
-                # the engine's block-aligned splitting, scheduler
-                # :300-333, guarantees the tail column's content is
-                # the boundary state once computed). The hit policy
-                # gates mamba hits on store presence, so a dropped slot
-                # only narrows a future hit range, never corrupts it.
-                if end > len(ids):
-                    raise RuntimeError(
-                        "kvshrink save: mamba table shorter than "
-                        f"the save frontier (req={req_id} end={end} "
-                        f"blocks={len(ids)})")
-                if end > start:
-                    group_ids[g_idx] = tuple(
-                        ids[i] if ids[i] != 0 else 0
-                        for i in range(start, end))
+            ids = state.groups[g_idx].block_ids
+            # Layer 2: map the offered range [start, end) onto this group's
+            # physical objects. attention consumes one page per boundary;
+            # mamba consumes one state column per boundary with 0 where
+            # the column was never materialized (middles of multi-boundary chunks).
+            # Both share the same table size contract (alloc sizes for
+            # computed+scheduled tokens, len(ids) >= end by construction)
+            # and the same non-empty offer trigger (end > start).
+            if end > len(ids):
+                raise RuntimeError(
+                    f"kvshrink save: {group.kind} table shorter than "
+                    f"the save frontier (req={req_id} end={end} "
+                    f"blocks={len(ids)})")
+            if end > start:
+                group_ids[g_idx] = tuple(
+                    ids[i] if ids[i] != 0 else 0
+                    for i in range(start, end))
         return ReqMeta(
             block_hashes=hashes,
             group_block_ids=tuple(group_ids),
@@ -741,8 +702,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_req in scheduler_output.scheduled_new_reqs:
             if self._req_states[new_req.req_id].load_plan is not None:
-                req_meta = self.build_load_meta(
-                    new_req, num_sched[new_req.req_id])
+                req_meta = self._take_load_plan(new_req.req_id)
                 meta.reqs_to_load.add_request(
                     new_req.req_id, req_meta.block_hashes,
                     req_meta.group_block_ids, req_meta.is_async,
@@ -775,8 +735,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         cr = scheduler_output.scheduled_cached_reqs
         for req_id in cr.resumed_req_ids:
             if self._req_states[req_id].load_plan is not None:
-                req_meta = self.build_resumed_load_meta(
-                    req_id, num_sched[req_id])
+                req_meta = self._take_load_plan(req_id)
                 meta.reqs_to_load.add_request(
                     req_id, req_meta.block_hashes,
                     req_meta.group_block_ids, req_meta.is_async,
