@@ -247,8 +247,10 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
         # no local hit -> restore range [0, 34).
         sched._req_states["r1"].load_range = (0, ext // sched._block_size)
     attn_ids = list(range(100, 134))  # 34 fresh attention blocks
-    # CURR slot for this step: (544 + 64 - 1) // 16 = 37
-    mamba_ids = list(range(200, 238))
+    # CURR slot for this step: (544 + 64 - 1) // 16 = 37. align mode
+    # nulls every column but the restore slot (the table's last
+    # entry) -- model it, the save scan keys only real columns.
+    mamba_ids = [0] * 37 + [237]
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks((attn_ids, mamba_ids)), ext)
@@ -266,7 +268,8 @@ def test_resumed_load_meta_restores_credited_pages():
     # slot only (v0.23.0 reads CURR in every kernel path)
     assert len(meta.block_hashes) == 34, meta
     assert meta.group_block_ids[0] == tuple(range(100, 134)), meta
-    assert meta.group_block_ids[1] == (237,), meta
+    # the mamba plan spans the offer; only the last slot is real
+    assert meta.group_block_ids[1] == tuple([0] * 33 + [237]), meta
 
 
 def test_restored_blocks_are_not_rewritten_on_first_save():
@@ -289,8 +292,9 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
     assert m.block_hashes == ("34", "35", "36", "37"), m
     assert m.group_block_ids[0] == (134, 135, 136, 137), m
-    # the mamba snapshot at the 608 boundary is new past the skip too
-    assert m.group_block_ids[1] == (237,), m
+    # the mamba tail column is the scan's output at boundary 37; the
+    # restore slot (37) is keyed only because this pass overwrites it
+    assert m.group_block_ids[1] == (0, 0, 0, 237), m
 
 
 def test_incremental_boundaries_after_restore_are_saved():
@@ -302,13 +306,16 @@ def test_incremental_boundaries_after_restore_are_saved():
     st = sched._req_states["r1"]
     st.live_block_hashes.extend(range(34, 74))
     st.groups[0].block_ids.extend(range(134, 174))
-    st.groups[1].block_ids.extend(range(238, 274))
+    # one 640-token pass materializes only its tail column: the new
+    # columns arrive null except the scan's output at idx 73
+    st.groups[1].block_ids.extend([0] * 35 + [273])
     # 544 + 640 = 1184 tokens = 74 blocks: 40 blocks past the skip
     m = sched.build_save_meta("r1", scheduled_tokens=640)
     assert len(m.block_hashes) == 40, m
     assert m.group_block_ids[0] == tuple(range(134, 174)), m
-    # mamba snapshot at the 1184 boundary: table idx 73
-    assert m.group_block_ids[1] == (273,), m
+    # mamba snapshot at the 1184 boundary: table idx 73; the restore
+    # slot (idx 37) holds the hit-boundary snapshot and stays unkeyed
+    assert m.group_block_ids[1] == tuple([0] * 39 + [273]), m
 
 
 def test_resume_rollback_still_overrides_the_skip():
@@ -323,7 +330,7 @@ def test_resume_rollback_still_overrides_the_skip():
     # boundaries re-emit instead of staying hidden behind the skip
     sched.sync_running_request("r1",
                             (list(range(100, 106)),
-                             list(range(200, 206))),
+                             [0, 0, 0, 0, 0, 205]),
                             resumed=True, num_computed_tokens=32)
     m = sched.build_save_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
@@ -341,7 +348,9 @@ def test_resumed_load_meta_without_credit_is_quiet():
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=["r1"], resumed_req_ids={"r1"},
-            new_block_ids=[(list(range(100, 134)), [200, 201])],
+            # the resumed table covers the credited frontier: align
+            # mode nulls every mamba column but the running slot
+            new_block_ids=[(list(range(100, 134)), [0] * 37 + [201])],
             num_computed_tokens=[544]),
         num_scheduled_tokens={"r1": 64})
     meta = conn.build_connector_meta(scheduler_output)
@@ -359,7 +368,9 @@ def test_connector_meta_includes_resumed_load():
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=["r1"], resumed_req_ids={"r1"},
-            new_block_ids=[(list(range(100, 134)), [200, 201])],
+            # the resumed table covers the credited frontier: align
+            # mode nulls every mamba column but the running slot
+            new_block_ids=[(list(range(100, 134)), [0] * 37 + [201])],
             num_computed_tokens=[544]),
         num_scheduled_tokens={"r1": 64})
     meta = conn.build_connector_meta(scheduler_output)
