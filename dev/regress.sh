@@ -22,7 +22,7 @@ docker run --rm --name iaxl-regress \
   -e TP_SIZE=2 \
   --entrypoint bash "$IMG" -c '
 set -e
-pip install -q xxhash 2>&1 | tail -1
+pip install -q --no-index --find-links=/w/.wheels xxhash 2>/dev/null || pip install --retries 5 --timeout 60 -q xxhash
 export PYTHONPATH=/w
 
 echo "################ UNIT TESTS ################"
