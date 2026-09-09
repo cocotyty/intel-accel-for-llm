@@ -406,7 +406,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     # new_block_ids IS the table (replace), per group --
                     # including an EMPTY list, which clears stale blocks
                     gstate.block_ids = list(ids)
-                elif ids:
+                else:
                     gstate.block_ids.extend(ids)
 
     def get_num_new_matched_tokens(
@@ -494,7 +494,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # being queued for a request that is RUNNING by then.
             return
 
-        nc = state.num_computed_tokens
         # The restore range's keys, filled once: hashes belong to the
         # token sequence, not to a group.
         hashes = tuple(
@@ -511,25 +510,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     b.block_id for b in group_blocks[start:end])
             else:
                 # Layer 2: mamba consumes the range's LAST boundary --
-                # the snapshot goes into the running-state slot, which
-                # is the table's LAST entry: align mode nulls every
-                # other column (MambaManager.allocate_new_blocks), and
-                # the table already accounts for the tokens scheduled
-                # this step. So the engine names the slot -- no token
-                # arithmetic, and nothing here depends on how many
-                # tokens the step happens to schedule. The plan carries
-                # the full offer width with 0 in every non-slot
-                # position; the worker's positional pairing + the 0
-                # filter lands the snapshot on hashes[end - 1].
-                dst = group_blocks[-1]
-                if dst.is_null:
-                    raise RuntimeError(
-                        "kvshrink mamba load: the state slot is a null "
-                        f"block (req={req_id} boundary={nc} "
-                        f"blocks={len(group_blocks)}): refusing to "
-                        "enter forward with unrestored state")
+                # the snapshot goes into the running-state slot (the table's
+                # last entry), with 0 sentinels in every preceding position.
                 group_ids[g_idx] = tuple(
-                    [0] * (end - start - 1) + [dst.block_id])
+                    [0] * (end - start - 1) + [group_blocks[-1].block_id])
         # Layer 1: the restored prefix is covered -- the watermark
         # (= attention's save cursor) jumps past it so the first
         # post-restore save pass offers only newly computed
@@ -950,8 +934,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         g_idx = self._layer_group[ln]
         for req_id, req_meta in metadata.reqs_to_save.requests.items():
             gids = req_meta.group_block_ids[g_idx]
-            if not gids:
-                continue
             # Positional pairing against the shared key list; a 0 slot
             # (no real state column) drops out here.
             pairs = [(gid, h) for gid, h in

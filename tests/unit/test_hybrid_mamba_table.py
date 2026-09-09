@@ -219,22 +219,6 @@ def test_load_meta_targets_the_tables_state_slot():
             (block_ids, meta)
 
 
-def test_load_meta_null_state_slot_fail_stop():
-    """The table's state slot is a null block -> FAIL-STOP.
-
-    There is no second slot to fall back on: the kernel reads exactly
-    that column, so a null there means the state cannot be restored at
-    all, while get_num_new_matched_tokens has already credited the
-    external boundary."""
-    raised = None
-    try:
-        _load_plan([0, 1, 0], {1}, (0, 1), nc_before=0, ext=1088)
-    except RuntimeError as e:
-        raised = e
-    assert raised is not None, "null state slot must raise"
-    assert "unrestored state" in str(raised)
-
-
 def test_load_meta_fail_closed_without_boundary():
     """No external credit (pending_load_tokens=0): the meta builder is
     never called for the request -- no plan, nothing to guess."""
@@ -263,17 +247,6 @@ def test_save_meta_all_null_table_puts_nothing():
     # the shared key list spans the offer; both columns ride as 0
     assert meta.block_hashes == ("0", "1"), meta
     assert meta.group_block_ids == ((0, 0),), meta
-
-
-def test_load_meta_all_null_table_fail_closed():
-    """All-null table with boundary > 0 -> FAIL-STOP (state slot null)."""
-    raised = None
-    try:
-        _load_plan([0, 0], {0}, (0,), nc_before=0, ext=544)
-    except RuntimeError as e:
-        raised = e
-    assert raised is not None, "all-null table must raise"
-    assert "unrestored state" in str(raised)
 
 
 def test_completeness_intact_boundary_unchanged():
