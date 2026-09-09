@@ -104,9 +104,6 @@ class ReqState:
     # restore skip is structural (the tail rule only ever targets
     # the newest boundary).
     save_watermark: int = 0
-    # Boundary range [start, end) to restore from the store, decided
-    # once at the external lookup and consumed at allocation.
-    load_range: Optional[tuple[int, int]] = None
     # This request's load plan, built in update_state_after_alloc from
     # the block objects the engine hands over there, and handed out
     # once by build_connector_meta. None = nothing to restore.
@@ -442,13 +439,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.live_block_hashes,
             request.num_tokens)
         external = max(0, boundary - num_computed_tokens)
-        if external > 0:
-            # Layer 1: the restore range, decided once here (boundary
-            # space) and consumed at allocation. Both ends are
-            # block-aligned: the engine's local hit and our boundary
-            # both land on multiples of the block size.
-            state.load_range = (num_computed_tokens // self._block_size,
-                                boundary // self._block_size)
         # Async when there are external tokens to stream and the
         # concurrency-tuned layer count is nonzero.
         use_async = external > 0 and self._async_load_layer_config is not None
@@ -488,8 +478,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         whole TransferJob here)."""
         req_id = request.request_id
         state = self._req_states[req_id]
-        state.num_computed_tokens = (
-            state.num_computed_tokens + num_external_tokens)
+        start = state.num_computed_tokens // self._block_size
+        state.num_computed_tokens += num_external_tokens
+        end = state.num_computed_tokens // self._block_size
         for g_idx, ids in enumerate(blocks.get_block_ids()):
             state.groups[g_idx].block_ids = list(ids)
         if num_external_tokens <= 0:
@@ -503,13 +494,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # being queued for a request that is RUNNING by then.
             return
 
-        # Layer 1: consume the restore range decided at lookup time.
-        if state.load_range is None:
-            raise RuntimeError(
-                "kvshrink load: external tokens accepted but no "
-                f"restore range (req={req_id})")
-        start, end = state.load_range
-        state.load_range = None
         nc = state.num_computed_tokens
         # The restore range's keys, filled once: hashes belong to the
         # token sequence, not to a group.
