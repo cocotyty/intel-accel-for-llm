@@ -1,8 +1,8 @@
 """Abort / preemption / resume lifecycle tests.
 
 Rulings under test:
-1. resume (or any authoritative progress regression) rolls every
-   group's incremental save cursor back to floor(N / block_size) --
+1. resume (or any authoritative progress regression) rolls the save
+   watermark and the mamba dedup back to floor(N / block_size) --
    emitted-but-unproven boundaries are re-emitted (idempotent, safe);
 2. request_finished returns (True, None) -- block freeing is deferred
    to get_finished, which acks once every transfer reading the blocks
@@ -11,6 +11,8 @@ Rulings under test:
 4. committed boundaries are content-addressed: abort/finish NEVER
    deletes them; uncommitted pages never hit.
 """
+
+import pytest
 
 from conftest import (
     FakeBlocks, HybridRequestScheduler, make_spec,
@@ -61,23 +63,22 @@ def _setup_attn_req(sched, hashes, ids, tokens=0):
 
 
 # ------------------------------------------------------------------
-# 1-6: cursor rollback semantics
+# 1-6: save-frontier rollback semantics
 # ------------------------------------------------------------------
 
 def test_resume_to_zero_rolls_cursor_and_reemits():
-    """Attention: cursor at 2, resume to progress 0 -> cursor 0; the
-    blocks are re-emitted when the request re-crosses boundaries."""
+    """Attention: watermark at 2, resume to progress 0 -> watermark 0;
+    the blocks are re-emitted when the request re-crosses boundaries."""
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=32)  # cursor -> 2
-    assert sched._req_states["r1"].groups[0].next_block_to_save == 2
+    sched.build_save_meta("r1", scheduled_tokens=32)  # watermark -> 2
+    assert sched._req_states["r1"].save_watermark == 2
     sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=0)
     m = sched.build_save_meta("r1", scheduled_tokens=32)
-    g = sched._req_states["r1"].groups[0]
     # this pass re-crosses boundaries 0,1 -> re-emitted now
     assert m.group_block_ids == ((10, 11),), m.group_block_ids
-    assert g.next_block_to_save == 2, g
+    assert sched._req_states["r1"].save_watermark == 2
 
 
 def test_mamba_resume_reemits_boundary_snapshot():
@@ -88,27 +89,24 @@ def test_mamba_resume_reemits_boundary_snapshot():
         type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
     m1 = sched.build_save_meta("r1", scheduled_tokens=544)
     assert len(m1.block_hashes) == 1
-    assert sched._req_states["r1"].groups[0].next_block_to_save == 1
     sched.sync_running_request("r1", ([9],), resumed=True,
                             num_computed_tokens=0)
     m2 = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert sched._req_states["r1"].groups[0].next_block_to_save == 1
     assert len(m2.block_hashes) == 1  # re-emitted
     assert m2.group_block_ids == ((9,),)
 
 
 def test_resume_to_nonzero_progress_rolls_to_floor():
-    """Resume at N=32 (block 16): cursor rolls to floor(32/16)=2, so
+    """Resume at N=32 (block 16): watermark rolls to floor(32/16)=2, so
     only blocks >= 2 re-emit."""
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=64)  # cursor -> 4
+    sched.build_save_meta("r1", scheduled_tokens=64)  # watermark -> 4
     sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
                             num_computed_tokens=32)
     m = sched.build_save_meta("r1", scheduled_tokens=32)
-    g = sched._req_states["r1"].groups[0]
     assert m.group_block_ids == ((12, 13),), m.group_block_ids
-    assert g.next_block_to_save == 4, g
+    assert sched._req_states["r1"].save_watermark == 4
 
 
 def test_monotonic_progress_no_rollback():
@@ -117,33 +115,33 @@ def test_monotonic_progress_no_rollback():
     sched.build_save_meta("r1", scheduled_tokens=32)
     sched.sync_running_request("r1", None, resumed=False,
                             num_computed_tokens=32)
-    assert sched._req_states["r1"].groups[0].next_block_to_save == 2
+    assert sched._req_states["r1"].save_watermark == 2
 
 
-def test_resumed_empty_table_clears_and_rolls_back():
+def test_resumed_empty_table_clears_and_fails_closed():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1], [10, 11])
     sched.build_save_meta("r1", scheduled_tokens=32)
     sched.sync_running_request("r1", ([],), resumed=True,
                             num_computed_tokens=0)
-    sched.build_save_meta("r1", scheduled_tokens=32)
-    g = sched._req_states["r1"].groups[0]
-    assert g.block_ids == []
-    assert g.next_block_to_save == 0
+    assert sched._req_states["r1"].groups[0].block_ids == []
+    # A replaced table that cannot cover the credited frontier is an
+    # engine-contract break: fail closed, like the load path.
+    with pytest.raises(RuntimeError):
+        sched.build_save_meta("r1", scheduled_tokens=32)
 
 
 def test_progress_regression_without_resumed_flag_rolls_back():
-    """Fail-closed: authoritative progress regression rolls the cursor
-    even if the resumed flag is missing (defence in depth)."""
+    """Fail-closed: authoritative progress regression rolls the
+    watermark even if the resumed flag is missing (defence in depth)."""
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=64)  # cursor -> 4
+    sched.build_save_meta("r1", scheduled_tokens=64)  # watermark -> 4
     sched.sync_running_request("r1", None, resumed=False,
                             num_computed_tokens=16)
     m = sched.build_save_meta("r1", scheduled_tokens=16)
-    g = sched._req_states["r1"].groups[0]
     assert m.group_block_ids == ((11,),), m.group_block_ids  # floor(16/16)=1
-    assert g.next_block_to_save == 2, g
+    assert sched._req_states["r1"].save_watermark == 2
 
 
 # ------------------------------------------------------------------
@@ -279,9 +277,10 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     sched = _hybrid_resumed_setup(set(range(34)))
     sched.build_resumed_load_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
-    # 544 credited tokens = 34 blocks: every cursor starts past them
-    assert all(g.next_block_to_save == 34 for g in st.groups), [
-        g.next_block_to_save for g in st.groups]
+    # 544 credited tokens = 34 blocks: the watermark starts past the
+    # restored range; the mamba skip is structural (the tail rule
+    # only ever targets the newest boundary)
+    assert st.save_watermark == 34, st
     # Forward completes tokens up to 544+64=608: the ledger and the
     # attention table grow past the restored range by 4 blocks
     st.live_block_hashes.extend(range(34, 38))
@@ -313,21 +312,23 @@ def test_incremental_boundaries_after_restore_are_saved():
 
 
 def test_resume_rollback_still_overrides_the_skip():
-    """Preemption after the restore rolls the cursors back per the
-    resumed progress -- the skip must never keep a cursor ahead of
-    what vLLM says is computed."""
+    """Preemption after the restore rolls the watermark back per the
+    resumed progress -- the skip must never keep the save cursor ahead
+    of what vLLM says is computed."""
     sched = _hybrid_resumed_setup(set(range(34)))
     sched.build_resumed_load_meta("r1", scheduled_tokens=64)
-    # Preempted back to 32 tokens (2 blocks): every cursor rolls to 2
-    # the brake lives in build_save_meta now; the replaced tables are
-    # shorter than the frontier, so the paired emit waits (resume
-    # window) and the cursors stay at the floor
-    sched.sync_running_request("r1", (list(range(100, 102)), [200, 201]),
+    # Preempted back to 32 tokens (2 blocks); the replaced tables
+    # cover the resumed frontier (6 blocks after this pass's sched):
+    # the brake rolls the watermark to 2, so the re-crossed
+    # boundaries re-emit instead of staying hidden behind the skip
+    sched.sync_running_request("r1",
+                            (list(range(100, 106)),
+                             list(range(200, 206))),
                             resumed=True, num_computed_tokens=32)
-    sched.build_save_meta("r1", scheduled_tokens=64)
+    m = sched.build_save_meta("r1", scheduled_tokens=64)
     st = sched._req_states["r1"]
-    assert all(g.next_block_to_save == 2 for g in st.groups), [
-        g.next_block_to_save for g in st.groups]
+    assert st.save_watermark == 6, st
+    assert m.group_block_ids[0] == (102, 103, 104, 105), m
 
 
 def test_resumed_load_meta_without_credit_is_quiet():

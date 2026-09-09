@@ -122,37 +122,45 @@ def test_save_meta_decode_boundary_late_hash_still_saved():
     # real shape at progress 2641: cdiv(2641,528)=6 columns, the prev
     # column (idx 4) still holds the boundary-2640 state
     st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
-    st.groups[0].next_block_to_save = 4
     # the step AFTER the crossing: progress is off the boundary now
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
     assert meta.block_hashes == ("4",), meta
     assert meta.group_block_ids == ((70,),), meta
-    assert st.groups[0].next_block_to_save == 5
+    # the next pass offers nothing new: no duplicate put
+    meta = sched.build_save_meta("r1", scheduled_tokens=1)
+    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
-def test_save_meta_resumed_short_table_waits():
-    """Resume replaced the mamba table with a short one, but the
-    engine's hash list survives preemption at full length. The slot
-    for the newest hash does not physically exist yet: no save, no
-    crash, cursor stays -- the save fires once the table grows back."""
+def test_save_meta_prefill_waits_for_the_tail_slot():
+    """Prefill: hashes are pre-computed for the whole prompt at
+    construction while the table lags behind chunk by chunk. The tail
+    boundary's slot is not real until the chunk that completes it, so
+    every earlier pass offers but waits -- and the engine's aligned
+    splitting (scheduler :300-333) guarantees the slot is real exactly
+    when the boundary is fully computed, so the tail column always
+    holds a boundary state when it is read."""
     groups = [_group(0, "mamba", 544)]
-    sched = HybridRequestScheduler(groups, _Store({0}), 544)
+    sched = HybridRequestScheduler(groups, _Store(set()), 544)
     track_new_request(sched, "r1", block_hashes=list(range(34)),
                      num_computed_tokens=0)
-    st = sched._req_states["r1"]
-    # resumed: vLLM replaced the table with just the curr slot
-    st.groups[0].block_ids = [200, 201]
-    sched.sync_running_request("r1", ([202],), resumed=True,
-                            num_computed_tokens=0)
-    meta = sched.build_save_meta("r1", scheduled_tokens=64)
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
-    assert st.groups[0].next_block_to_save == 0
-    # the table grows back through forward; once the slot for hash 33
-    # is real, the snapshot is saved under that hash
-    st.groups[0].block_ids = list(range(200, 235))
-    meta = sched.build_save_meta("r1", scheduled_tokens=64)
+    for k in range(1, 34):
+        sched.sync_running_request("r1", ([100 + k],), resumed=False,
+                                num_computed_tokens=(k - 1) * 544)
+        meta = sched.build_save_meta("r1", scheduled_tokens=544)
+        assert meta.block_hashes == (), (k, meta)
+    # the chunk that completes boundary 33: the tail slot is real and
+    # holds the boundary state -- the save fires, once
+    sched.sync_running_request("r1", ([134],), resumed=False,
+                            num_computed_tokens=33 * 544)
+    meta = sched.build_save_meta("r1", scheduled_tokens=544)
     assert meta.block_hashes == ("33",), meta
-    assert meta.group_block_ids == ((233,),), meta
+    assert meta.group_block_ids == ((134,),), meta
+    # the next pass: credit catches up (nc = 34 blocks), the offer is
+    # empty -- no duplicate put
+    sched.sync_running_request("r1", ([],), resumed=False,
+                            num_computed_tokens=34 * 544)
+    meta = sched.build_save_meta("r1", scheduled_tokens=544)
+    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
 
 
 def test_save_meta_multi_block_boundary():
