@@ -583,8 +583,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         req_id = req.req_id if hasattr(req, "req_id") else req
         return self._take_load_plan(req_id)
 
-    build_resumed_load_meta = build_load_meta
-
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
