@@ -65,9 +65,12 @@ class ReqMeta:
 
 @dataclass
 class ReqGroupState:
-    """Per-group mutable state for one request (scheduler side)."""
+    """Per-group mutable state for one request (scheduler side):
+    just this group's block table. Save progress is NOT per group --
+    attention's save cursor IS save_watermark (it consumes every
+    offered boundary in the same pass), and mamba's dedup is the
+    same frontier-movement trigger. Both are derived from Layer 1."""
     block_ids: list[int] = field(default_factory=list)
-    next_block_to_save: int = 0
 
 
 @dataclass
@@ -84,10 +87,18 @@ class ReqState:
     num_computed_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     # ---- Layer 1: token/hash space, group-agnostic ----
-    # Number of boundaries OFFERED to the groups for saving so far.
+    # Number of boundaries OFFERED for saving so far -- and it IS the
+    # attention group's save cursor: attention consumes every offered
+    # boundary (one page each) in the same pass, so its frontier is
+    # the watermark read before the raise, not a separate variable.
     # build_save_meta advances it to the token frontier (min of credit
-    # and keyed-hash count); sync_running_request caps it when the engine
-    # rolls credit back. Group cursors never exceed this.
+    # and keyed-hash count) and caps it when credit rolls back (the
+    # only live trigger is pure-attention spec rejection -- GDN
+    # refuses spec at init, where the cap is a structural no-op).
+    # The mamba groups need no cursor of their own: their dedup is
+    # the same "frontier moved" trigger (end > start), and the
+    # restore skip is structural (the tail rule only ever targets
+    # the newest boundary).
     save_watermark: int = 0
     # Boundary range [start, end) to restore from the store, decided
     # once at the external lookup and consumed at allocation.
@@ -537,15 +548,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if group is owner:
                     hashes = [_hash_str(state.live_block_hashes[end - 1])]
                 group_ids[g_idx] = (dst.block_id,)
-        # Layer 1: the restored prefix is covered -- the watermark and
-        # every group cursor jump past it so the first post-restore
-        # save pass offers only newly computed boundaries. For
-        # attention, end is the number of restored blocks; for mamba,
-        # end is the slot past the restored snapshot.
+        # Layer 1: the restored prefix is covered -- the watermark
+        # (= attention's save cursor) jumps past it so the first
+        # post-restore save pass offers only newly computed
+        # boundaries. end is the number of restored blocks. The mamba
+        # groups need no jump: the tail rule only ever targets the
+        # newest boundary, and with the watermark at `end` the first
+        # pass offers nothing new (end == start).
         state.save_watermark = max(state.save_watermark, end)
-        for gstate in state.groups:
-            if gstate.next_block_to_save < end:
-                gstate.next_block_to_save = end
         state.load_plan = ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
@@ -623,45 +633,53 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         construction while the pages lag behind; `hashes` guards spec
         decode -- draft tokens inflate the credit but are appended
         only once accepted, so the min always lands on the accepted
-        side. The output is a range offer [watermark, end); groups
-        consume it at their own pace and never see token arithmetic.
+        side. The output is a range offer [start, end), where start
+        is the watermark read after the brake and before the raise.
 
         Layer 2 (per group): map the offered range onto this group's
         physical objects. attention consumes the whole range (one page
-        per boundary); mamba follows TAIL TRUTH instead -- its target
-        is the newest keyed boundary (len(live)-1), which is what the
-        kernel's tail column actually holds, so the credited frontier
-        does not bound it (see the branch comment).
+        per boundary; its cursor IS the watermark -- nothing sits
+        between the offer and the consumption); mamba follows TAIL
+        TRUTH instead -- its target is the newest keyed boundary
+        (len(live)-1), which is what the kernel's tail column actually
+        holds, so the credited frontier does not bound it (see the
+        branch comment). Both share one trigger: a non-empty offer
+        (end > start) -- the dedup is derived from the frontier
+        movement, not stored.
 
         The worker executes the plan after forward, when the GPU pages
         hold state up to computed+scheduled tokens. A partial boundary
         (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
         # Layer 1: the frontier, and the rollback brake, in one place.
-        # The brake clamps the group cursors to the frontier the engine
-        # last credits -- a no-op in normal flow (the previous pass's
+        # Sequence inside a pass: brake, read, raise. The brake
+        # rewinds the watermark to the frontier the engine last
+        # credits -- a no-op in normal flow (the previous pass's
         # progress IS this pass's credit snapshot) and the only brake
-        # when credit rolls back (failed-load recovery, pure-attention
-        # spec rejection): the rolled-back boundaries get re-emitted
-        # with the recomputed pages (store overwrite is idempotent).
-        # Same guarantee as the offloading connector's
-        # advance_stored_idx, which recomputes its cursor from the
-        # current arithmetic. The brake MUST land on the cursors
-        # before the watermark raise below -- a watermark-only rewind
-        # would be erased by the raise and the re-emit lost.
+        # when credit rolls back (pure-attention spec rejection: the
+        # rolled-back boundaries get re-emitted with the recomputed
+        # pages; store overwrite is idempotent). Reading it as `start`
+        # right after the brake makes the watermark serve as the
+        # attention cursor -- no separate per-group variable. Same
+        # recompute-from-arithmetic guarantee as the offloading
+        # connector's advance_stored_idx. The brake MUST land before
+        # the raise -- the raise would otherwise erase the rewind.
         # current_token_block: the index of the token block currently
-        # being computed (= the count of complete boundaries). The
-        # brake anchors here: cursors may never sit ahead of it.
+        # being computed (= the count of complete boundaries).
         current_token_block = (
             state.num_computed_tokens // self._block_size)
-        for gstate in state.groups:
-            if gstate.next_block_to_save > current_token_block:
-                gstate.next_block_to_save = current_token_block
+        state.save_watermark = min(
+            state.save_watermark, current_token_block)
+        start = state.save_watermark
         end = min((state.num_computed_tokens + scheduled_tokens)
                   // self._block_size,
                   len(state.live_block_hashes))
-        state.save_watermark = max(
-            min(state.save_watermark, current_token_block), end)
+        state.save_watermark = max(state.save_watermark, end)
+        # The mamba groups share this trigger: a non-empty offer
+        # (end > start) is exactly "a new boundary completed" in
+        # steady flow, and after a rollback the braked watermark
+        # makes it true again so the recomputed state re-emits and
+        # overwrites the bad store copy. No dedup marker is stored.
         owner = next((g for g in self._groups if g.kind == "attention"),
                      self._groups[0])
         hashes: list[str] = []
@@ -670,21 +688,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             gstate = state.groups[g_idx]
             ids = gstate.block_ids
             if group.kind == "attention":
-                # Layer 2: consume [cursor, end) -- one page per
-                # boundary, keyed in order. A table shorter than the
-                # frontier is the resume window (the engine may report
-                # a replaced table with the EMPTY list, :402) -- wait
-                # it out; the deficit closes within one pass.
-                start = gstate.next_block_to_save
+                # Layer 2: consume the offered range [start, end) --
+                # one page per boundary, keyed in order. A table
+                # shorter than the frontier would be an engine-contract
+                # break (alloc sizes the table for computed+scheduled
+                # tokens, so len(ids) >= end by construction) -- fail
+                # closed, like the load path.
                 if end > len(ids):
-                    continue
+                    raise RuntimeError(
+                        "kvshrink save: attention table shorter than "
+                        f"the save frontier (req={req_id} end={end} "
+                        f"blocks={len(ids)})")
                 if end > start:
                     if group is owner:
                         hashes = [_hash_str(h) for h in
                                   state.live_block_hashes[start:end]]
                     group_ids[g_idx] = tuple(ids[i] for i in
                                              range(start, end))
-                    gstate.next_block_to_save = end
             else:
                 # Layer 2: mamba's rule is TAIL TRUTH, not range
                 # consumption. align mode pins the kernel to the
@@ -695,36 +715,48 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # credit arithmetic. A multi-boundary pass physically
                 # materialises only the tail state -- the skipped
                 # middle boundaries get no entry (same semantics as
-                # vLLM's own offloading connector) and the cursor
-                # jumps to cover them. The prev column holds a
-                # boundary state until the following block completes,
-                # so a save that runs a step late still reads the
-                # right slot. This is why the target is NOT `end - 1`:
-                # after a resume the credited frontier and the column
-                # layout decouple (credit counts restored tokens, the
-                # table only has the CURR slot) -- end-bounding would
-                # aim at a null column.
-                idx = len(state.live_block_hashes) - 1
-                if idx >= gstate.next_block_to_save:
-                    if idx >= len(ids):
-                        # Resumed request: the freshly replaced table
-                        # is shorter than the hash list. The physical
-                        # slot does not exist yet -- the table grows
-                        # back as forward crosses boundaries, so just
-                        # wait (the cursor stays put and the save
-                        # happens once the slot is real).
+                # vLLM's own offloading connector). This is why the
+                # target is NOT `end - 1`: after a resume the credited
+                # frontier and the column layout decouple (credit
+                # counts restored tokens, the table only has the CURR
+                # slot) -- end-bounding would aim at a null column.
+                #
+                # Emit on the same trigger as attention: a non-empty
+                # offer. In steady flow end > start is exactly "a new
+                # boundary completed" (the hash append and the credit
+                # crossing move in the same pass), so the dedup is
+                # derived, not stored; after a rollback the braked
+                # watermark re-opens the offer and the recomputed
+                # state overwrites the bad store copy.
+                #
+                # The wait below is safe because the engine aligns
+                # prefill chunks to block boundaries exactly for
+                # mamba state caching (scheduler :300-333: "to enable
+                # block-aligned caching of the Mamba state,
+                # num_new_tokens must be a multiple of block_size"):
+                # len(ids) > idx therefore implies the boundary's
+                # tokens are fully computed, and the completing
+                # forward's ending state -- which the kernel writes
+                # into the tail column -- IS the boundary state.
+                if end > start:
+                    mamba_idx = len(state.live_block_hashes) - 1
+                    if mamba_idx >= len(ids):
+                        # Prefill: hashes are pre-computed for the
+                        # whole prompt while the table lags behind.
+                        # The tail boundary's slot is not real yet --
+                        # wait; the save fires once the slot exists.
                         continue
-                    if ids[idx] == 0:
+                    if ids[mamba_idx] == 0:
                         raise RuntimeError(
                             "kvshrink mamba save: boundary column "
                             f"is NULL (req={req_id} "
                             f"frontier={end} "
-                            f"table_idx={idx} table={ids})")
+                            f"table_idx={mamba_idx} table={ids})")
                     if group is owner:
                         hashes = [
-                            _hash_str(state.live_block_hashes[idx])]
-                    group_ids[g_idx] = (ids[idx],)
-                    gstate.next_block_to_save = idx + 1
+                            _hash_str(state.live_block_hashes[
+                                mamba_idx])]
+                    group_ids[g_idx] = (ids[mamba_idx],)
         return ReqMeta(
             block_hashes=tuple(hashes),
             group_block_ids=tuple(group_ids),
