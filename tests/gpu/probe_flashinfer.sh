@@ -38,7 +38,7 @@ gate_stop
 
 SECOND_LOG="$GATE_LOG_DIR/flashinfer_second.log"
 check "second run hit the external cache" \
-    grep -qE "start_load_kv: [1-9][0-9]* pages loaded" "$SECOND_LOG"
+    test "$(gate_cached_tokens)" -gt 0
 if [[ "$FIRST_OUT" == "$SECOND_OUT" ]]; then
     pass "output identical across FlashInfer runs"
 else

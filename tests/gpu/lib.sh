@@ -113,6 +113,7 @@ gate_serve() {
         --gpu-memory-utilization "$GATE_GPU_UTIL"
         --port "$GATE_PORT"
         --enforce-eager
+        --enable-prompt-tokens-details
     )
     if [[ "${GATE_HYBRID:-0}" == "1" ]]; then
         # GDN snapshots are only addressable on aligned boundaries, and
@@ -229,26 +230,47 @@ gate_wait_gpu_free() {
 gate_completion() {
     local prompt="$1"
     local max_tokens="${2:-64}"
-    curl -sf "http://127.0.0.1:$GATE_PORT/v1/completions" \
-        -H 'Content-Type: application/json' \
-        -d "$(python3 -c '
+    local out_json="$GATE_LOG_DIR/last_completion.json"
+    python3 - "$MODEL" "$prompt" "$max_tokens" "$GATE_PORT" "$out_json" <<'PYEOF'
+import json, sys, urllib.request
+model, prompt, max_tokens, port, out_file = sys.argv[1:6]
+payload = {
+    "model": model, "prompt": prompt,
+    "max_tokens": int(max_tokens),
+    "temperature": 0, "seed": 0,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=600) as r:
+    body = json.load(r)
+with open(out_file, "w") as f:
+    json.dump(body, f)
+print(body["choices"][0]["text"], end="")
+PYEOF
+}
+
+# gate_cached_tokens [json_file]
+# Return the number of cached tokens reported in the completion response.
+gate_cached_tokens() {
+    local json_file="${1:-$GATE_LOG_DIR/last_completion.json}"
+    python3 -c '
 import json, sys
-print(json.dumps({"model": sys.argv[1], "prompt": sys.argv[2],
-                  "max_tokens": int(sys.argv[3]), "temperature": 0,
-                  "seed": 0}))' "$MODEL" "$prompt" "$max_tokens")" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["text"])'
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    ptd = data.get("usage", {}).get("prompt_tokens_details", {}) or {}
+    print(ptd.get("cached_tokens", 0) or 0)
+except Exception:
+    print(0)
+' "$json_file"
 }
 
 # gate_completions_concurrent <outdir> <max_tokens> <prompt>...
 # Fire every prompt at once and wait for all of them, so the engine has
 # to batch them into shared steps. Writes reply N to <outdir>/N.txt and
 # returns non-zero if any request failed.
-#
-# This exists because gate_completion is strictly sequential: with one
-# request in flight a step commits at most one boundary, the partial
-# boundary path never triggers, and the zip/unzip queues are empty --
-# precisely the conditions under which the concurrency-sensitive parts
-# of the save path are NOT exercised.
 gate_completions_concurrent() {
     local outdir="$1"; shift
     local max_tokens="$1"; shift
@@ -256,15 +278,26 @@ gate_completions_concurrent() {
     local pids=() i=0
     for prompt in "$@"; do
         (
-            curl -sf "http://127.0.0.1:$GATE_PORT/v1/completions" \
-                -H 'Content-Type: application/json' \
-                -d "$(python3 -c '
-import json, sys
-print(json.dumps({"model": sys.argv[1], "prompt": sys.argv[2],
-                  "max_tokens": int(sys.argv[3]), "temperature": 0,
-                  "seed": 0}))' "$MODEL" "$prompt" "$max_tokens")" \
-                | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["text"])' \
-                > "$outdir/$i.txt"
+            python3 - "$MODEL" "$prompt" "$max_tokens" "$GATE_PORT" \
+                "$outdir/$i.json" "$outdir/$i.txt" <<'PYEOF'
+import json, sys, urllib.request
+model, prompt, max_tokens, port, json_file, text_file = sys.argv[1:7]
+payload = {
+    "model": model, "prompt": prompt,
+    "max_tokens": int(max_tokens),
+    "temperature": 0, "seed": 0,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=600) as r:
+    body = json.load(r)
+with open(json_file, "w") as f:
+    json.dump(body, f)
+with open(text_file, "w") as f:
+    f.write(body["choices"][0]["text"])
+PYEOF
         ) &
         pids+=($!)
         i=$((i + 1))
@@ -274,6 +307,24 @@ print(json.dumps({"model": sys.argv[1], "prompt": sys.argv[2],
         wait "$pid" || rc=1
     done
     return $rc
+}
+
+# gate_concurrent_cached_tokens <outdir>
+# Sum cached tokens across all concurrent completion JSON files in outdir.
+gate_concurrent_cached_tokens() {
+    local outdir="$1"
+    python3 -c '
+import glob, json, sys
+total = 0
+for f in glob.glob(f"{sys.argv[1]}/*.json"):
+    try:
+        with open(f) as fp:
+            d = json.load(fp)
+        total += (d.get("usage", {}).get("prompt_tokens_details", {}) or {}).get("cached_tokens", 0) or 0
+    except Exception:
+        pass
+print(total)
+' "$outdir"
 }
 
 # gate_branching_prompts <count> [shared_segments] [tail_segments]

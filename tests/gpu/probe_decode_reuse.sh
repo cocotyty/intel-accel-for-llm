@@ -73,15 +73,15 @@ with urllib.request.urlopen(req, timeout=600) as r:
     body = json.load(r)
 choice = body["choices"][0]
 gen_ids = choice.get("token_ids") or []
+cached_tokens = (body.get("usage", {}).get("prompt_tokens_details", {}) or {}).get("cached_tokens", 0) or 0
 open(ids_file, "w").write(json.dumps(
-    {"prompt_ids": prompt, "generated_ids": gen_ids}))
+    {"prompt_ids": prompt, "generated_ids": gen_ids, "cached_tokens": cached_tokens}))
 print(choice["text"], end="")
 PYEOF
 }
 
-pages_loaded_in() {
-    grep -oE "start_load_kv: [1-9][0-9]* pages loaded" "$1" \
-        | tail -1 | grep -oE "[1-9][0-9]*"
+cached_tokens_in() {
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("cached_tokens", 0))' "$1"
 }
 
 gate_reset_cache
@@ -136,47 +136,40 @@ if ! curl -sf -X POST "http://127.0.0.1:$GATE_PORT/reset_prefix_cache" \
         >/dev/null; then
     fail "internal prefix cache reset"
 fi
-R2_LOG="$GATE_LOG_DIR/decode_reuse.r2.log"
 R2_TEXT="$(gate_completion_ids "$PROMPT_IDS" 1 "$R1_IDS.r2")"
-tail -n "+$((MARK1 + 1))" "$LOG" >"$R2_LOG"
-N2="$(pages_loaded_in "$R2_LOG")"
-log "R2 (prompt only): ${N2:-0} pages restored"
-check "R2 restored from the external cache" test -n "$N2"
+N2="$(cached_tokens_in "$R1_IDS.r2")"
+log "R2 (prompt only): ${N2:-0} cached tokens restored"
+check "R2 restored from the external cache" test "${N2:-0}" -gt 0
 
 # The follow-up turn: prompt plus everything R1 generated.
-MARK2=$(wc -l < "$LOG")
 curl -sf -X POST "http://127.0.0.1:$GATE_PORT/reset_prefix_cache" >/dev/null
 TURN2_IDS="$(python3 -c '
 import json, sys
 print(json.dumps(json.loads(sys.argv[1]) + json.loads(sys.argv[2])))' \
     "$PROMPT_IDS" "$GEN_IDS")"
-R3_LOG="$GATE_LOG_DIR/decode_reuse.r3.log"
 R3_TEXT="$(gate_completion_ids "$TURN2_IDS" "$MAX_TOKENS" "$R1_IDS.r3")"
-tail -n "+$((MARK2 + 1))" "$LOG" >"$R3_LOG"
-N3="$(pages_loaded_in "$R3_LOG")"
-log "R3 (prompt + generated): ${N3:-0} pages restored"
-check "R3 restored from the external cache" test -n "$N3"
+N3="$(cached_tokens_in "$R1_IDS.r3")"
+log "R3 (prompt + generated): ${N3:-0} cached tokens restored"
+check "R3 restored from the external cache" test "${N3:-0}" -gt 0
 
-if [[ -n "${N2:-}" && -n "${N3:-}" && "${N3}" -gt "${N2}" ]]; then
-    pass "decode-produced blocks were restored (${N3} > ${N2} pages)"
+if [[ "${N3:-0}" -gt "${N2:-0}" ]]; then
+    pass "decode-produced blocks were restored (${N3} > ${N2} tokens)"
 else
     fail "decode-produced blocks were NOT restored " \
-         "(R3=${N3:-none} pages vs R2=${N2:-none} pages)"
+         "(R3=${N3:-0} tokens vs R2=${N2:-0} tokens)"
 fi
 
 # ------------------------------------------------ cold recompute control
 # The cache_salt mixes into block 0's hash only, which changes the
 # whole chain, so R4 cannot hit any cache. R4's OUTPUT is unaffected
 # by the salt, so R3 vs R4 still compares the same prompt.
-MARK3=$(wc -l < "$LOG")
 curl -sf -X POST "http://127.0.0.1:$GATE_PORT/reset_prefix_cache" >/dev/null
-R4_LOG="$GATE_LOG_DIR/decode_reuse.r4.log"
 R4_TEXT="$(gate_completion_ids "$TURN2_IDS" "$MAX_TOKENS" "$R1_IDS.r4" cold)"
-tail -n "+$((MARK3 + 1))" "$LOG" >"$R4_LOG"
-if ! grep -qE "start_load_kv:" "$R4_LOG"; then
+N4="$(cached_tokens_in "$R1_IDS.r4")"
+if [[ "${N4:-0}" -eq 0 ]]; then
     pass "R4 was a genuine cold recompute (no external load)"
 else
-    fail "R4 unexpectedly hit the external cache"
+    fail "R4 unexpectedly hit the external cache (${N4} cached tokens)"
 fi
 
 # R3' = R3 run again, SAME salt (cache_salt would rewrite the block-0
@@ -186,16 +179,13 @@ fi
 # restored-continuation path against ITSELF. If even this diverges,
 # the restore path carries nondeterminism. If it holds, the pipeline
 # is deterministic and any R3-vs-R4 gap is numeric.
-MARK35=$(wc -l < "$LOG")
 curl -sf -X POST "http://127.0.0.1:$GATE_PORT/reset_prefix_cache" >/dev/null
 R3B_TEXT="$(gate_completion_ids "$TURN2_IDS" "$MAX_TOKENS" "$R1_IDS.r3b" "")"
-R3B_LOG="$GATE_LOG_DIR/decode_reuse.r3b.log"
-tail -n "+$((MARK35 + 1))" "$LOG" >"$R3B_LOG"
-N3B="$(pages_loaded_in "$R3B_LOG")"
-if [[ -n "${N3B:-}" && "${N3B}" == "${N3:-0}" ]]; then
-    pass "R3' restored the same pages (${N3B})"
+N3B="$(cached_tokens_in "$R1_IDS.r3b")"
+if [[ "${N3B:-0}" -eq "${N3:-0}" ]]; then
+    pass "R3' restored the same tokens (${N3B})"
 else
-    fail "R3' restored different pages (R3'=${N3B:-none} vs R3=${N3:-none})"
+    fail "R3' restored different tokens (R3'=${N3B} vs R3=${N3})"
 fi
 if [[ "$R3_TEXT" == "$R3B_TEXT" ]]; then
     pass "restored continuation is self-consistent (R3 == R3')"

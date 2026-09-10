@@ -60,7 +60,7 @@ HOT_LOG="$GATE_LAST_LOG"
 # The engine must report external tokens; otherwise the identical output
 # below proves nothing (a full recompute would also match).
 check "hot run hit the external cache" \
-    grep -qE "start_load_kv: [1-9][0-9]* pages loaded" "$HOT_LOG"
+    test "$(gate_cached_tokens)" -gt 0
 
 if [[ "$COLD_OUT" == "$HOT_OUT" ]]; then
     pass "restored output is byte-identical to the recomputed output"

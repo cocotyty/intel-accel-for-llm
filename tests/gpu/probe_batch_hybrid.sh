@@ -124,7 +124,7 @@ if [[ "${GATE_BATCH_CONTROL:-0}" == "1" ]]; then
     log "control mode: skipping the external-cache-hit check (cache wiped)"
 else
     check "hot batched run hit the external cache" \
-        grep -qE "start_load_kv: [1-9][0-9]* pages loaded" "$HOT_LOG"
+        test "$(gate_concurrent_cached_tokens "$HOT_DIR")" -gt 0
 fi
 
 # Per-request comparison, reported but NOT asserted: see the header.

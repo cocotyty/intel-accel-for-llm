@@ -77,7 +77,7 @@ tail -n "+$((MARK + 1))" "$LOG" >"$TAIL_LOG"
 # Without this the identical output below would prove nothing: a full
 # recompute produces the same tokens too.
 check "second request hit the external cache" \
-    grep -qE "start_load_kv: [1-9][0-9]* pages loaded" "$TAIL_LOG"
+    test "$(gate_cached_tokens)" -gt 0
 
 if [[ "$FIRST_OUT" == "$SECOND_OUT" ]]; then
     pass "restored output is byte-identical to the computed output"
