@@ -523,7 +523,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         from vllm.model_executor.models.utils import extract_layer_index
 
-        execution_order = sorted(kv_caches, key=extract_layer_index)
+        execution_order = sorted(
+            [ln for ln in kv_caches if extract_layer_index(ln) < self.num_layers],
+            key=extract_layer_index,
+        )
         self._layer_names = list(execution_order)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
@@ -542,10 +545,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._mamba_save_segments = segments
         self._last_layer_name = self._attn_order[-1] if self._attn_order else None
 
-        # The store binds the RAW kv_caches directly.
+        # The store binds base model kv_caches directly.
+        base_kv_caches = {ln: kv_caches[ln] for ln in execution_order}
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            kv_caches=kv_caches,
+            kv_caches=base_kv_caches,
             rank=self.rank,
             tp_size=self.tp_size,
         )
@@ -666,6 +670,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
         if layer_name == self._last_layer_name:
+            if self._current_get_tasks:
+                self._store().get_wait(get_results=self._current_get_tasks, wait=True)
             self._current_get_tasks = None
             self._active_promoted_tasks = {}
 
