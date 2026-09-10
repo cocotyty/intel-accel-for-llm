@@ -581,7 +581,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # enters the decode phase, do not emit any save plans (neither attention
         # nor mamba). This avoids decode-time draft state pollution and eliminates
         # decode save overhead.
-        if state.num_prompt_tokens > 0 and state.num_computed_tokens >= state.num_prompt_tokens:
+        if (state.num_prompt_tokens > 0 and state.num_computed_tokens >= state.num_prompt_tokens) or scheduled_tokens <= 1:
             return ReqMeta(group_block_ids=tuple(() for _ in self._groups))
 
         # Layer 1: the frontier, and the rollback brake, in one place.
@@ -648,10 +648,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         new_bids = cr.new_block_ids
         ncts = cr.num_computed_tokens
         for i, req_id in enumerate(cr.req_ids):
+            sched_toks = num_sched[req_id]
+            if sched_toks <= 1:
+                # Prefill-only save policy: decode steps never produce saves.
+                continue
             self.sync_running_request(
                 req_id, new_bids[i], req_id in resumed, ncts[i])
             save_meta = self.build_save_meta(
-                req_id, num_sched[req_id])
+                req_id, sched_toks)
             if save_meta.block_hashes:
                 meta.reqs_to_save.add_request(
                     req_id, save_meta.block_hashes,
