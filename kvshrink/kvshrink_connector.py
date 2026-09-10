@@ -104,10 +104,6 @@ class ReqState:
     # restore skip is structural (the tail rule only ever targets
     # the newest boundary).
     save_watermark: int = 0
-    # This request's load plan, built in update_state_after_alloc from
-    # the block objects the engine hands over there, and handed out
-    # once by build_connector_meta. None = nothing to restore.
-    load_plan: Optional[ReqMeta] = None
     # Async load decision, made in get_num_new_matched_tokens and
     # consumed when the plan is built: while is_async, the request is
     # parked and its plan ships from build_connector_meta.
@@ -244,9 +240,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
 
         self._req_states: dict[ReqId, ReqState] = {}
-        # Async requests whose load plan has not been emitted yet (a
-        # parked request never appears in the scheduler output).
-        self._async_load_pending: set[str] = set()
+        self._reqs_to_load = RequestMetadata()
         self._current_get_tasks: Optional[dict[str, Any]] = None
         self._current_put_tasks: dict[ReqId, list[dict[str, Any]]] = {}
         self._deferred_finished_req_ids: set[ReqId] = set()
@@ -534,16 +528,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # pass offers nothing new (end == start), so the restored
         # snapshot is not re-put.
         state.save_watermark = max(state.save_watermark, end)
-        state.load_plan = ReqMeta(
+        self._reqs_to_load.add_request(
+            req_id,
             block_hashes=hashes,
             group_block_ids=tuple(group_ids),
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
         )
-        if state.is_async:
-            # The ONLY moment we hear about an async request: it is
-            # parked, so build_connector_meta never sees it scheduled.
-            self._async_load_pending.add(req_id)
 
     def request_finished(
         self,
@@ -556,7 +547,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # land. Committed boundaries are content-addressed and outlive
         # the request; they are never deleted here.
         self._req_states.pop(request.request_id, None)
-        self._async_load_pending.discard(request.request_id)
+        self._reqs_to_load.requests.pop(request.request_id, None)
         return True, None
 
     def request_finished_all_groups(
@@ -568,20 +559,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.request_finished(request, [])
 
     # ------------------------------------------------------------------
-    def _take_load_plan(self, req_id: str) -> ReqMeta:
-        """Pop the request's plan: a plan is emitted exactly once per
-        allocation, and a later allocation (resume) builds a fresh one."""
-        state = self._req_states[req_id]
-        plan = state.load_plan
-        state.load_plan = None
-        return plan
-
     def build_load_meta(
         self, req: "NewRequestData" | str, scheduled_tokens: int = 0
     ) -> ReqMeta:
         """Hand out the plan built at alloc time (test helper)."""
         req_id = req.req_id if hasattr(req, "req_id") else req
-        return self._take_load_plan(req_id)
+        return self._reqs_to_load.requests.pop(req_id, None)
 
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
@@ -655,16 +638,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Assemble this pass's load/save plans."""
-        meta = KVShrinkConnectorMetadata()
+        meta = KVShrinkConnectorMetadata(
+            reqs_to_load=self._reqs_to_load,
+            reqs_to_save=RequestMetadata(),
+        )
+        self._reqs_to_load = RequestMetadata()
         num_sched = scheduler_output.num_scheduled_tokens
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if self._req_states[new_req.req_id].load_plan is not None:
-                req_meta = self._take_load_plan(new_req.req_id)
-                meta.reqs_to_load.add_request(
-                    new_req.req_id, req_meta.block_hashes,
-                    req_meta.group_block_ids, req_meta.is_async,
-                    req_meta.async_load_layers)
             save_meta = self.build_save_meta(
                 new_req.req_id, num_sched[new_req.req_id])
             if save_meta.block_hashes:
@@ -672,40 +653,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     new_req.req_id, save_meta.block_hashes,
                     save_meta.group_block_ids)
 
-        # Load plans for requests vLLM parked (async loads never appear
-        # in the scheduler output), drained exactly once. Every parked
-        # request was queued with external tokens accepted, so its plan
-        # always carries pages.
-        pending = sorted(self._async_load_pending
-                         - set(meta.reqs_to_load.requests))
-        for req_id in pending:
-            req_meta = self._take_load_plan(req_id)
-            meta.reqs_to_load.add_request(
-                req_id, req_meta.block_hashes, req_meta.group_block_ids,
-                req_meta.is_async, req_meta.async_load_layers)
-        self._async_load_pending -= set(pending)
-
-        # PREEMPTION-RESUMED requests ride scheduled_cached_reqs.
-        # resumed_req_ids, NOT scheduled_new_reqs. Their external-hit
-        # tokens were accepted this same pass, so without a load plan
-        # here the worker would never restore the pages while the core
-        # already skips recompute -- silent garbage output.
         cr = scheduler_output.scheduled_cached_reqs
-        for req_id in cr.resumed_req_ids:
-            if self._req_states[req_id].load_plan is not None:
-                req_meta = self._take_load_plan(req_id)
-                meta.reqs_to_load.add_request(
-                    req_id, req_meta.block_hashes,
-                    req_meta.group_block_ids, req_meta.is_async,
-                    req_meta.async_load_layers)
-
-        # Running requests cross boundaries in later steps too (chunked
-        # prefill tails, decode-time crossings). The two calls are a
-        # LOAD-BEARING PAIR, in this order: the rollback brake inside
-        # build_save_meta must observe the credit sync_running_request
-        # just pulled in, and it must land on the group cursors before
-        # the watermark raise -- reordering or splitting them silently
-        # drops the re-emission of rolled-back boundaries.
         resumed = cr.resumed_req_ids
         new_bids = cr.new_block_ids
         ncts = cr.num_computed_tokens
