@@ -69,7 +69,7 @@ def HybridRequestScheduler(groups, store, block_size,
     builds one with just the fields they touch. Same signature the
     pre-merge HybridRequestScheduler class had.
     """
-    from kvshrink.kvshrink_connector import KVShrinkConnector
+    from kvshrink.kvshrink_connector import KVShrinkConnector, RequestMetadata
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
@@ -79,7 +79,7 @@ def HybridRequestScheduler(groups, store, block_size,
     conn._num_attn_layers = sum(
         len(g.layer_names) for g in groups if g.kind != "mamba")
     conn._req_states = {}
-    conn._async_load_pending = set()
+    conn._reqs_to_load = RequestMetadata()
     return conn
 
 
