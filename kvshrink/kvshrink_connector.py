@@ -87,6 +87,7 @@ class ReqState:
     # the reference instead of tracking our own copy.
     live_block_hashes: list = field(default_factory=list)
     num_computed_tokens: int = 0
+    num_prompt_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
     # ---- Layer 1: token/hash space, group-agnostic ----
     # Number of boundaries OFFERED for saving so far -- and it IS the
@@ -279,19 +280,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # block hashes at this granularity.
         self._block_size = block_size
 
-        # Fail-closed: spec decode moves the GDN running state into
-        # per-draft speculative blocks; the boundary block is committed
-        # only on acceptance, so a snapshot would persist a draft
-        # intermediate state (kvshrink-hybrid.md §5.4).
         for g in groups:
-            if g.kind == "mamba" and g.spec.num_speculative_blocks:
-                raise RuntimeError(
-                    "kvshrink hybrid: speculative decoding is not "
-                    f"supported (group has num_speculative_blocks="
-                    f"{g.spec.num_speculative_blocks}); the external GDN "
-                    "snapshot only restores the non-speculative state "
-                    "slot. Disable speculative decoding or the KV "
-                    "connector.")
+            if g.kind == "mamba" and getattr(g.spec, "num_speculative_blocks", 0) > 0:
+                logger.info(
+                    "kvshrink: mamba speculative decoding enabled with "
+                    "num_speculative_blocks=%d (running in prefill-only save mode)",
+                    g.spec.num_speculative_blocks,
+                )
 
         # Attention layer count, used to clamp the async early-start
         # prefix. Mamba layers are deliberately absent: they are never
@@ -400,9 +395,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # the engine's own hashes, so "key i names block i" follows
         # from the engine rather than being re-derived
         # (kvshrink-hybrid.md §8).
+        num_prompt = getattr(request, "num_prompt_tokens", 0) or getattr(request, "num_tokens", 0)
         state = ReqState(
             live_block_hashes=request.block_hashes,
             num_computed_tokens=num_computed_tokens,
+            num_prompt_tokens=num_prompt,
             groups=tuple(ReqGroupState() for _ in self._groups),
         )
         self._req_states[request.request_id] = state
@@ -499,14 +496,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # our external load, loading into prev_state_idx would be
                 # futile -- the copy has already finished.
                 # Therefore, the external snapshot MUST be loaded directly
-                # into the running state slot `group_blocks[-1]`
+                # into the running state slot `group_blocks[-1 - num_spec]`
                 # (curr_state_idx), where `_model_forward` will execute.
+                # In align mode with speculative decoding, the block table
+                # ends with `num_speculative_blocks` scratch slots for draft
+                # verification; the canonical running state slot is at `-1 - num_spec`.
                 # The plan spans the offer [start, end) with 0 sentinels
                 # in all preceding positions so the worker's positional
                 # zip lands `hashes[-1]` (the hit boundary key) squarely
-                # onto `group_blocks[-1].block_id`.
+                # onto `target_block.block_id`.
+                num_spec = getattr(group.spec, "num_speculative_blocks", 0)
+                target_block = group_blocks[-1 - num_spec]
                 group_ids[g_idx] = tuple(
-                    [0] * (end - start - 1) + [group_blocks[-1].block_id])
+                    [0] * (end - start - 1) + [target_block.block_id])
         # Layer 1: the restored prefix is covered -- the watermark
         # (= attention's save cursor) jumps past it so the first
         # post-restore save pass offers only newly computed
@@ -574,6 +576,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         hold state up to computed+scheduled tokens. A partial boundary
         (not all layers of the group) is never emitted."""
         state = self._req_states[req_id]
+
+        # Prefill-only save policy: once the prompt is computed and the request
+        # enters the decode phase, do not emit any save plans (neither attention
+        # nor mamba). This avoids decode-time draft state pollution and eliminates
+        # decode save overhead.
+        if state.num_prompt_tokens > 0 and state.num_computed_tokens >= state.num_prompt_tokens:
+            return ReqMeta(group_block_ids=tuple(() for _ in self._groups))
+
         # Layer 1: the frontier, and the rollback brake, in one place.
         # Sequence inside a pass: brake, read, raise. The brake
         # rewinds the watermark to the frontier the engine last

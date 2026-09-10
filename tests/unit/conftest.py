@@ -83,12 +83,15 @@ def HybridRequestScheduler(groups, store, block_size,
     return conn
 
 
-def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0):
+def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0, num_prompt_tokens=0):
     """Register a fresh ReqState (what get_num_new_matched_tokens does)."""
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
+    if num_prompt_tokens == 0 and block_hashes:
+        num_prompt_tokens = len(block_hashes) * sched._block_size
     sched._req_states[req_id] = ReqState(
         live_block_hashes=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
+        num_prompt_tokens=num_prompt_tokens,
         groups=tuple(ReqGroupState() for _ in sched._groups),
     )
 
@@ -128,7 +131,7 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     return conn
 
 
-def make_spec(kind: str, block_size: int):
+def make_spec(kind: str, block_size: int, num_speculative_blocks: int = 0):
     """A real vLLM KVCacheSpec for one group.
 
     The hit policy hands the spec back to vLLM's own matching code, so a
@@ -144,6 +147,7 @@ def make_spec(kind: str, block_size: int):
             shapes=((1, 1),),
             dtypes=(torch.float32,),
             mamba_cache_mode="align",
+            num_speculative_blocks=num_speculative_blocks,
         )
     return FullAttentionSpec(
         block_size=block_size,

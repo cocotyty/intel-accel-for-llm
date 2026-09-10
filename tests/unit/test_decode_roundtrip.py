@@ -59,28 +59,34 @@ def test_second_request_hits_decode_produced_blocks():
                         spec=make_spec("attention", 16))]
     sched = HybridRequestScheduler(groups, store, 16)
 
+    # First turn prefill: save prompt blocks 1 and 2
     live = _LiveRequest([1, 2])
     st = ReqState(
         live_block_hashes=live.block_hashes,
-        num_computed_tokens=32,
-        groups=(ReqGroupState(block_ids=[10, 11, 12, 13]),))
+        num_computed_tokens=0,
+        num_prompt_tokens=32,
+        groups=(ReqGroupState(block_ids=[10, 11]),))
     sched._req_states["r1"] = st
+    meta_prefill = sched.build_save_meta("r1", scheduled_tokens=32)
+    store.committed.update(int(h) for h in meta_prefill.block_hashes)
+    assert store.committed == {1, 2}
+
+    # Forward advances to 32 computed tokens (prefill complete)
+    st.num_computed_tokens = 32
+    st.groups[0].block_ids.extend([12, 13])
 
     # Decode completed two more blocks; the engine appended their
     # hashes to the live list in place.
     live.block_hashes.extend([3, 4])
     sched.sync_running_request("r1", None, False, 64)
 
-    # The save plan reaches the new boundaries and the store
-    # commits them.
-    meta = sched.build_save_meta("r1", scheduled_tokens=0)
-    store.committed.update(int(h) for h in meta.block_hashes)
-    assert store.committed == {1, 2, 3, 4}
+    # Under prefill-only policy, decode does NOT save blocks 3 and 4.
+    meta_decode = sched.build_save_meta("r1", scheduled_tokens=0)
+    assert meta_decode.block_hashes == ()
+    assert store.committed == {1, 2}
 
-    # Turn two: same first blocks plus the two decode produced ones.
-    # get_num_new_matched_tokens must see past the original prompt.
+    # Turn two: prompt arrives with blocks [1, 2, 3, 4].
+    # External cache matches only the prefill-saved blocks (32 tokens).
     turn_two = _LiveRequest([1, 2, 3, 4])
     hit, _ = sched.get_num_new_matched_tokens(turn_two, 0)
-    assert hit == 64, (
-        f"second turn restored only {hit} tokens; decode-produced "
-        f"blocks did not round-trip through the external cache")
+    assert hit == 32, f"expected prompt-only hit of 32 tokens, got {hit}"

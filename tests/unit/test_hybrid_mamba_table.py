@@ -105,32 +105,34 @@ def test_save_meta_partial_tail_still_saves_completed_blocks():
     assert meta.group_block_ids == ((0, 7),), meta
 
 
-def test_save_meta_decode_boundary_late_hash_still_saved():
-    """The decode-phase save loss bug, distilled. Block 4 completes at
-    token 2640; the engine appends its hash right after that forward,
-    so the NEXT scheduling step is the first that can see it. Old code
-    required progress % bs == 0 on the very step the hash appears --
-    by then progress is 2641 and the boundary window was missed
-    forever. New code reads the engine's live list: once the hash is
-    there, the save fires, and the prev column still holds the
-    boundary state for the whole next block cycle."""
+def test_save_meta_decode_phase_emits_no_saves():
+    """Under prefill-only save policy, requests in the decode phase emit
+    no save plans (neither attention nor mamba)."""
     groups = [_group(0, "mamba", 528)]
     sched = HybridRequestScheduler(groups, _Store({4}), 528)
     track_new_request(sched, "r1", block_hashes=[0, 1, 2, 3, 4],
-                     num_computed_tokens=2640)
+                     num_computed_tokens=2640, num_prompt_tokens=2640)
     st = sched._req_states["r1"]
-    # real shape at progress 2641: cdiv(2641,528)=6 columns, the prev
-    # column (idx 4) still holds the boundary-2640 state
     st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
-    # real flow: boundaries 0-3 were offered and put in earlier passes
     st.save_watermark = 4
-    # the step AFTER the crossing: progress is off the boundary now
-    meta = sched.build_save_meta("r1", scheduled_tokens=1)
-    assert meta.block_hashes == ("4",), meta
-    assert meta.group_block_ids == ((70,),), meta
-    # the next pass offers nothing new: no duplicate put
+    # During decode, build_save_meta returns empty plan
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+
+
+def test_mamba_restore_slot_with_speculative_decoding():
+    """With num_speculative_blocks=3, Mamba table ends with 3 scratchpad blocks.
+    The restore target must be `-(1 + 3) = -4`, skipping the scratchpads."""
+    groups = [GroupInfo(group_idx=0, kind="mamba", layer_names=("m.0",),
+                        spec=make_spec("mamba", 544, num_speculative_blocks=3))]
+    sched = HybridRequestScheduler(groups, _Store({0}), 544)
+    track_new_request(sched, "r1", block_hashes=[0], num_computed_tokens=0)
+    # 5 blocks allocated: 1 null (0), 1 running state (88), 3 spec draft blocks (91, 92, 93)
+    sched.update_state_after_alloc(
+        type("R", (), {"request_id": "r1"}),
+        FakeBlocks(([0, 88, 91, 92, 93],)), 544)
+    meta = sched._reqs_to_load.requests["r1"]
+    assert meta.group_block_ids[0] == (88,), meta.group_block_ids
 
 
 def test_save_meta_prefill_puts_every_boundary():
