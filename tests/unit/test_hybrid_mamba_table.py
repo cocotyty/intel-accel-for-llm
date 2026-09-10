@@ -189,8 +189,7 @@ def _load_plan(block_ids, committed, hashes, nc_before, ext):
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks((block_ids,)), ext)
-    return sched.build_load_meta(
-        type("R", (), {"req_id": "r1"}))
+    return sched._reqs_to_load.requests.get("r1")
 
 
 def test_load_meta_targets_the_tables_state_slot():
@@ -299,10 +298,7 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     sched.update_state_after_alloc(
         type("R", (), {"request_id": "r1"}),
         FakeBlocks(([3, 4], [5, 8])), 544)
-    meta = sched.build_load_meta(
-        type("R", (), {"req_id": "r1", "num_tokens": 1088,
-                       "block_ids": ([3, 4], [5, 8])}),
-        scheduled_tokens=544)
+    meta = sched._reqs_to_load.requests.get("r1")
     # attention: boundary 544 -> hash0's page, gpu block 3
     assert meta.block_hashes == ("0",), meta
     assert meta.group_block_ids[0] == (3,), meta

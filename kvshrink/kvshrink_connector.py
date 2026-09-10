@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.core.sched.output import NewRequestData
     from vllm.v1.request import Request
 
 from iaxl import KVStore, setup_root_logger
@@ -274,17 +272,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_cpu_affinity()
             self._bind_intel_accel()
 
-        pc = vllm_config.parallel_config
-        # Fail-closed: pipeline parallelism shards LAYERS across ranks,
-        # so one rank holds half the model's KV and its pages alone name
-        # only half a block. Every key would silently address a partial
-        # state. Nothing here can degrade safely, so refuse at startup.
-        if pc.pipeline_parallel_size != 1:
-            raise RuntimeError(
-                "kvshrink hybrid: pipeline parallelism is not supported "
-                f"(pipeline_parallel_size={pc.pipeline_parallel_size}); "
-                "each rank would persist only its own layers' pages. "
-                "Set pipeline_parallel_size=1 or the KV connector.")
         groups, block_size = parse_kv_cache_config(kv_cache_config)
         self._groups = groups
         # The block size every group shares (parse_kv_cache_config
@@ -559,13 +546,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.request_finished(request, [])
 
     # ------------------------------------------------------------------
-    def build_load_meta(
-        self, req: "NewRequestData" | str, scheduled_tokens: int = 0
-    ) -> ReqMeta:
-        """Hand out the plan built at alloc time (test helper)."""
-        req_id = req.req_id if hasattr(req, "req_id") else req
-        return self._reqs_to_load.requests.pop(req_id, None)
-
     def build_save_meta(
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
@@ -767,8 +747,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._current_get_tasks = None
         self._saved_layers = set()
         self._step_save_pages = 0
-        npages = 0
-        _t0 = time.monotonic()
         # One engine get per layer, in execution order: the engine
         # stream runs transfers FIFO, so submission order must be the
         # order forward consumes the layers. Synchronous (blocking)
@@ -793,7 +771,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 sync_block_ids.extend(gpu for gpu, _ in entries)
                 sync_block_hashes.extend(h for _, h in entries)
             if sync_block_ids:
-                npages += len(sync_block_ids)
                 sync_tasks.update(self._store().get(
                     block_indices=sync_block_ids,
                     block_hashs=sync_block_hashes,
@@ -815,7 +792,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 entries = tuple(
                     (gid, h) for gid, h in zip(gids, req_meta.block_hashes)
                     if gid != 0)
-                npages += len(entries)
                 async_tasks.setdefault(req_id, {}).update(
                     self._store().get(
                         block_indices=[gpu for gpu, _ in entries],
@@ -834,11 +810,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 raise RuntimeError(
                     "kvshrink load failed: recurrent pages did not land; "
                     "forward would read unrestored state")
-        if npages:
-            logger.info(
-                "start_load_kv: %d pages loaded "
-                "elapsed_ms=%.3f (rank %d/%d)", npages,
-                (time.monotonic() - _t0) * 1e3, self.rank, self.tp_size)
         return 
 
     def wait_for_layer_load(self, layer_name: str) -> None:
