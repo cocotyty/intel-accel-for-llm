@@ -334,6 +334,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """External lookup; returns (hit_tokens, has_async_load)."""
+        if self._req_states.pop(request.request_id, None) is not None:
+            logger.warning("Discarded stale state for request %s", request.request_id)
         # Initialize scheduler state for this new request.
         num_prompt = getattr(request, "num_prompt_tokens", 0) or getattr(request, "num_tokens", 0)
         state = ReqState(
