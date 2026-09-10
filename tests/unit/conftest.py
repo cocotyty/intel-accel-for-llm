@@ -80,6 +80,17 @@ def HybridRequestScheduler(groups, store, block_size,
         len(g.layer_names) for g in groups if g.kind != "mamba")
     conn._req_states = {}
     conn._reqs_to_load = RequestMetadata()
+
+    def _sync(req_id, new_block_ids, resumed=False, num_computed_tokens=0):
+        st = conn._req_states[req_id]
+        st.num_computed_tokens = num_computed_tokens
+        if new_block_ids:
+            for gstate, ids in zip(st.groups, new_block_ids):
+                if resumed:
+                    gstate.block_ids = list(ids)
+                else:
+                    gstate.block_ids.extend(ids)
+    conn.sync_running_request = _sync
     return conn
 
 

@@ -313,21 +313,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     # --- Scheduler Side Methods ---
 
-    def sync_running_request(
-        self, req_id: str, new_block_ids: tuple[list[int], ...],
-        resumed: bool, num_computed_tokens: int,
-    ) -> None:
-        """Pull the engine's block tables and computed token count
-        into our scheduler state for running prefill chunks."""
-        state = self._req_states[req_id]
-        state.num_computed_tokens = num_computed_tokens
-        if new_block_ids:
-            for gstate, ids in zip(state.groups, new_block_ids):
-                if resumed:
-                    gstate.block_ids = list(ids)
-                else:
-                    gstate.block_ids.extend(ids)
-
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -495,7 +480,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     save_meta.group_block_ids)
 
         cr = scheduler_output.scheduled_cached_reqs
-        resumed = cr.resumed_req_ids
         new_bids = cr.new_block_ids
         ncts = cr.num_computed_tokens
         for i, req_id in enumerate(cr.req_ids):
@@ -503,8 +487,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if sched_toks <= 1:
                 # Prefill-only save policy: decode steps never produce saves.
                 continue
-            self.sync_running_request(
-                req_id, new_bids[i], req_id in resumed, ncts[i])
+            state = self._req_states[req_id]
+            state.num_computed_tokens = ncts[i]
+            if new_bids[i] and req_id not in cr.resumed_req_ids:
+                for gstate, ids in zip(state.groups, new_bids[i]):
+                    gstate.block_ids.extend(ids)
             save_meta = self.build_save_meta(
                 req_id, sched_toks)
             if save_meta.block_hashes:
