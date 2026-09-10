@@ -114,7 +114,6 @@ def test_save_meta_decode_phase_emits_no_saves():
                      num_computed_tokens=2640, num_prompt_tokens=2640)
     st = sched._req_states["r1"]
     st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
-    st.save_watermark = 4
     # During decode, build_save_meta returns empty plan
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
     assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
