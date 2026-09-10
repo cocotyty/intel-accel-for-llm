@@ -70,8 +70,6 @@ class ReqState:
     num_computed_tokens: int = 0
     num_prompt_tokens: int = 0
     groups: tuple[ReqGroupState, ...] = ()
-    # Highest boundary index (in blocks) offered for saving so far.
-    save_watermark: int = 0
     # True if the request is parked waiting for background async KV transfer.
     is_async: bool = False
     async_load_layers: int = -1
@@ -398,8 +396,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 target_block = group_blocks[-1 - num_spec]
                 group_ids[g_idx] = tuple(
                     [0] * (end - start - 1) + [target_block.block_id])
-        # Advance watermark past restored prefix so loaded blocks are not re-saved.
-        state.save_watermark = max(state.save_watermark, end)
         self._reqs_to_load.add_request(
             req_id,
             block_hashes=hashes,
@@ -431,23 +427,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self, req_id: str, scheduled_tokens: int = 0
     ) -> ReqMeta:
         """Build incremental save plan for newly computed prefill blocks
-        in range [save_watermark, end)."""
+        in range [start, end)."""
         state = self._req_states[req_id]
 
         # Prefill-only save policy: decode steps never produce saves.
         if (state.num_prompt_tokens > 0 and state.num_computed_tokens >= state.num_prompt_tokens) or scheduled_tokens <= 1:
             return ReqMeta(group_block_ids=tuple(() for _ in self._groups))
 
-        # Roll back watermark if preemption occurred, then compute new boundary.
-        current_token_block = (
-            state.num_computed_tokens // self._block_size)
-        state.save_watermark = min(
-            state.save_watermark, current_token_block)
-        start = state.save_watermark
+        start = state.num_computed_tokens // self._block_size
         end = min((state.num_computed_tokens + scheduled_tokens)
                   // self._block_size,
                   len(state.live_block_hashes))
-        state.save_watermark = max(state.save_watermark, end)
         # Collect block hashes for the [start, end) range.
         hashes = tuple(
             _hash_str(h) for h in state.live_block_hashes[start:end])
