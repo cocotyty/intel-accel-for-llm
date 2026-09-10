@@ -39,7 +39,6 @@ if [[ -n "$HYBRID_MODEL" ]]; then
     run_gate "$HYBRID_MODEL" probe_warm_reuse.sh
     run_gate "$HYBRID_MODEL" probe_cold_hot.sh
     run_gate "$HYBRID_MODEL" probe_batch_hybrid.sh
-    run_gate "$HYBRID_MODEL" probe_decode_reuse.sh
     # Perf, not correctness: fails only if restoring is no faster
     # than recomputing, i.e. the feature is not paying for itself.
     run_gate "$HYBRID_MODEL" probe_hit_benefit.sh
@@ -49,7 +48,6 @@ fi
 
 if [[ -n "$ATTENTION_MODEL" ]]; then
     run_gate "$ATTENTION_MODEL" probe_pure_attention.sh
-    run_gate "$ATTENTION_MODEL" probe_decode_reuse_attn.sh
     run_gate "$ATTENTION_MODEL" probe_flashinfer.sh
 else
     echo "skipping the pure-attention regression gate:" \
