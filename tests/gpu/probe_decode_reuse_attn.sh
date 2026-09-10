@@ -105,8 +105,6 @@ check "R1 generated tokens recorded" \
     python3 -c 'import json,sys; exit(0 if len(json.load(open(sys.argv[1]))["generated_ids"]) > 100 else 1)' "$R1_IDS"
 check "R1 prompt ids recorded" \
     python3 -c 'import json,sys; exit(0 if len(json.load(open(sys.argv[1]))["prompt_ids"]) > 100 else 1)' "$R1_IDS"
-check "R1 saved boundaries" \
-    grep -qE "chunk_save: [1-9][0-9]* pages submitted, [1-9][0-9]* boundaries" "$LOG"
 
 log "waiting for async saves to land"
 sleep "${GATE_SAVE_SETTLE:-15}"

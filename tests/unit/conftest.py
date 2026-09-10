@@ -124,7 +124,6 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._last_layer_name = None
     conn._mamba_save_segments = {}
     conn._saved_layers = set()
-    conn._step_save_pages = 0
     conn._current_put_tasks = {}
     conn._deferred_finished_req_ids = set()
     conn._connector_metadata = None

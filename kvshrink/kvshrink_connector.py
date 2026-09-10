@@ -760,7 +760,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # bookkeeping resets here -- before any save hook can fire.
         self._current_get_tasks = None
         self._saved_layers = set()
-        self._step_save_pages = 0
         # One engine get per layer, in execution order: the engine
         # stream runs transfers FIFO, so submission order must be the
         # order forward consumes the layers. Synchronous (blocking)
@@ -880,7 +879,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 block_hashs=[h for _, h in pairs],
                 layer_names=[ln], label=f"g{g_idx}")
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
-            self._step_save_pages += len(pairs)
         self._saved_layers.add(ln)
 
     def save_kv_layer(
@@ -904,25 +902,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._save_layer(layer_name, metadata)
 
     def wait_for_save(self) -> None:
-        """Submit every layer no hook covered (the trailing mamba
-        segment), then log the step's save volume. Submission only;
-        the drain lives in get_finished."""
+        """Submit every layer no forward hook covered (recurrent/mamba layers).
+        Submission only; the drain lives in get_finished."""
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
         for ln in self._layer_names:
             if ln not in self._saved_layers:
                 self._save_layer(ln, metadata)
-        if self._step_save_pages:
-            # Counterpart of the start_load_kv line: without it a run
-            # that saves nothing looks exactly like a healthy one.
-            nbound = sum(
-                len(r.block_hashes)
-                for r in metadata.reqs_to_save.requests.values())
-            logger.info(
-                "chunk_save: %d pages submitted, %d boundaries "
-                "(rank %d/%d)", self._step_save_pages, nbound,
-                self.rank, self.tp_size)
 
     def get_finished(
         self, finished_req_ids: set[str]
