@@ -75,7 +75,6 @@ def _worker(store):
     w = HybridWorker(groups, {ln: None for ln in ORDER},
                      rank=0, tp_size=1)
     w.kvstore = store
-    w.register(ORDER)
     return w
 
 

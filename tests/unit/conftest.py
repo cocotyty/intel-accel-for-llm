@@ -97,12 +97,7 @@ def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0, num_pr
 
 
 def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
-    """Worker-side connector instance without the vLLM config stack.
-
-    ``layer_infos`` mirrors what the real register() receives as
-    kv_caches; tests pass {name: None} placeholders (only the key set
-    matters to the part mapping) plus the group descriptors.
-    """
+    """Worker-side connector instance without the vLLM config stack."""
     from kvshrink.kvshrink_connector import KVShrinkConnector
 
     conn = object.__new__(KVShrinkConnector)
@@ -111,7 +106,8 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn.tp_size = tp_size
     conn._labels = [f"g{g.group_idx}" for g in groups]
     conn.kvstore = None
-    conn._layer_names = []
+    order = list(layer_infos.keys() if isinstance(layer_infos, dict) else layer_infos)
+    conn._layer_names = order
     conn._current_get_tasks = None
     conn._pending_load_tasks = {}
     conn._pending_load_layers = {}
@@ -119,10 +115,20 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._active_promoted_tasks = {}
     conn._layer_group = {
         ln: g.group_idx for g in groups for ln in g.layer_names}
-    conn._mamba_layers = frozenset()
-    conn._attn_order = ()
-    conn._last_layer_name = None
-    conn._mamba_save_segments = {}
+    conn._mamba_layers = frozenset(
+        ln for g in groups if g.kind == "mamba" for ln in g.layer_names)
+    conn._attn_order = tuple(
+        ln for ln in order if ln not in conn._mamba_layers)
+    segments = {}
+    pending = []
+    for ln in order:
+        if ln in conn._mamba_layers:
+            pending.append(ln)
+        elif pending:
+            segments[ln] = tuple(pending)
+            pending = []
+    conn._mamba_save_segments = segments
+    conn._last_layer_name = conn._attn_order[-1] if conn._attn_order else None
     conn._saved_layers = set()
     conn._current_put_tasks = {}
     conn._deferred_finished_req_ids = set()
