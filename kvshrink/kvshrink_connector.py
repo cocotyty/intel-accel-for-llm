@@ -674,42 +674,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         from vllm.model_executor.models.utils import extract_layer_index
 
-        # Execution order feeds the async release gate.
-        self.register(sorted(kv_caches, key=extract_layer_index))
-
-        # The store binds the RAW kv_caches directly.
-        self.kvstore = KVStore(
-            model_name=os.path.basename(self.model_config.model),
-            kv_caches=kv_caches,
-            rank=self.rank,
-            tp_size=self.tp_size,
-        )
-        logger.info("Registered %d KV cache layers",
-                    len(self._store().layer_names))
-
-    def register(
-        self,
-        execution_order: list[str],
-    ) -> None:
-        """Record the model's execution order; only the attention
-        order is used, by the async release gate."""
-        # Ordered layer names for the block store layout and the two
-        # order-sensitive derived sets.
+        execution_order = sorted(kv_caches, key=extract_layer_index)
         self._layer_names = list(execution_order)
-        # All GDN layers: waited as one barrier in start_load before any
-        # attention layer runs.
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba"
             for ln in g.layer_names)
-        # Attention layers in model execution order, used by the async
-        # release gate ("the first N layers" means nothing otherwise).
         self._attn_order = tuple(
             ln for ln in execution_order
             if ln not in self._mamba_layers)
-        # Save pipelining segments: the mamba layers between attention
-        # layer i-1 and attention layer i are final when i's save hook
-        # fires, so they ride that hook (the trailing segment is
-        # submitted by wait_for_save).
         segments: dict[str, tuple[str, ...]] = {}
         pending: list[str] = []
         for ln in execution_order:
@@ -719,14 +691,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 segments[ln] = tuple(pending)
                 pending = []
         self._mamba_save_segments = segments
-        # Last attention hook: clears the per-step get tasks (main's
-        # cleanup point).
         self._last_layer_name = self._attn_order[-1] if self._attn_order else None
+
+        # The store binds the RAW kv_caches directly.
+        self.kvstore = KVStore(
+            model_name=os.path.basename(self.model_config.model),
+            kv_caches=kv_caches,
+            rank=self.rank,
+            tp_size=self.tp_size,
+        )
         logger.info(
-            "kvshrink hybrid worker registered: %d attention "
-            "hook points, %d recurrent layers (tp=%d rank=%d)",
-            len(self._attn_order),
-            len(self._mamba_layers), self.tp_size, self.rank)
+            "Registered %d KV cache layers (%d attention, %d recurrent)",
+            len(execution_order), len(self._attn_order), len(self._mamba_layers))
 
     # ----------------------------------------------------------
     # load path
