@@ -78,7 +78,7 @@ def test_save_meta_single_element_table():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[5]], hashes=(0,))  # ids=[5] only
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert meta.block_hashes == ("0",), meta
+    assert meta.block_hashes == ["0"], meta
     assert meta.group_block_ids == ((5,),), meta
 
 
@@ -88,7 +88,7 @@ def test_save_meta_null_prefixed_table():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0}, [[0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
-    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.block_hashes == ["0", "1"], meta
     assert meta.group_block_ids == ((0, 7),), meta
 
 
@@ -101,7 +101,7 @@ def test_save_meta_partial_tail_still_saves_completed_blocks():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {0, 1}, [[0, 7, 9]], hashes=(0, 1))
     meta = sched.build_save_meta("r1", scheduled_tokens=1560)
-    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.block_hashes == ["0", "1"], meta
     assert meta.group_block_ids == ((0, 7),), meta
 
 
@@ -116,7 +116,7 @@ def test_save_meta_decode_phase_emits_no_saves():
     st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
     # During decode, build_save_meta returns empty plan
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+    assert meta.block_hashes == [] and meta.group_block_ids == ((),), meta
 
 
 def test_mamba_restore_slot_with_speculative_decoding():
@@ -148,14 +148,14 @@ def test_save_meta_prefill_puts_every_boundary():
         sched.sync_running_request("r1", ([100 + k],), resumed=False,
                                 num_computed_tokens=(k - 1) * 544)
         meta = sched.build_save_meta("r1", scheduled_tokens=544)
-        assert meta.block_hashes == (f"{k - 1}",), (k, meta)
+        assert meta.block_hashes == [f"{k - 1}"], (k, meta)
         assert meta.group_block_ids == ((100 + k,),), (k, meta)
     # the next pass: credit catches up (nc = 34 blocks), the offer is
     # empty -- no duplicate put
     sched.sync_running_request("r1", ([],), resumed=False,
                             num_computed_tokens=34 * 544)
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+    assert meta.block_hashes == [] and meta.group_block_ids == ((),), meta
 
 
 def test_save_meta_multi_block_boundary():
@@ -164,7 +164,7 @@ def test_save_meta_multi_block_boundary():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1}, [[0, 7]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
-    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.block_hashes == ["0", "1"], meta
     assert meta.group_block_ids == ((0, 7),), meta
 
 
@@ -176,7 +176,7 @@ def test_save_meta_prev_and_curr_blocks_save_both():
     groups = [_group(0, "mamba", 544)]
     sched = _make(groups, {1, 2}, [[0, 31, 47]], hashes=(0, 1, 2))
     meta = sched.build_save_meta("r1", scheduled_tokens=1632)
-    assert meta.block_hashes == ("0", "1", "2"), meta
+    assert meta.block_hashes == ["0", "1", "2"], meta
     assert meta.group_block_ids == ((0, 31, 47),), meta
 
 
@@ -213,7 +213,7 @@ def test_load_meta_targets_the_tables_state_slot():
     for block_ids, nc, want_keys in cases:
         meta = _load_plan(block_ids, {int(want_keys[-1])}, (0, 1),
                           nc_before=0, ext=nc)
-        assert meta.block_hashes == want_keys, (block_ids, meta)
+        assert meta.block_hashes == list(want_keys), (block_ids, meta)
         assert meta.group_block_ids == (tuple([0] * (len(want_keys) - 1)
                                         + [block_ids[-1]]),), \
             (block_ids, meta)
@@ -245,7 +245,7 @@ def test_save_meta_all_null_table_puts_nothing():
     sched = _make(groups, {0}, [[0, 0]])
     meta = sched.build_save_meta("r1", scheduled_tokens=1088)
     # the shared key list spans the offer; both columns ride as 0
-    assert meta.block_hashes == ("0", "1"), meta
+    assert meta.block_hashes == ["0", "1"], meta
     assert meta.group_block_ids == ((0, 0),), meta
 
 
@@ -301,9 +301,8 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
         FakeBlocks(([3, 4], [5, 8])), 544)
     meta = sched._reqs_to_load.requests.get("r1")
     # attention: boundary 544 -> hash0's page, gpu block 3
-    assert meta.block_hashes == ("0",), meta
+    assert meta.block_hashes == ["0"], meta
     assert meta.group_block_ids[0] == (3,), meta
     # mamba: snapshot at hash0 -> curr table_idx 1 -> block 8
     assert meta.group_block_ids[1] == (8,), meta
-
 

@@ -62,7 +62,7 @@ def test_second_request_hits_decode_produced_blocks():
     # First turn prefill: save prompt blocks 1 and 2
     live = _LiveRequest([1, 2])
     st = ReqState(
-        live_block_hashes=live.block_hashes,
+        block_hashes=live.block_hashes,
         num_computed_tokens=0,
         num_prompt_tokens=32,
         groups=(ReqGroupState(block_ids=[10, 11]),))
@@ -82,7 +82,7 @@ def test_second_request_hits_decode_produced_blocks():
 
     # Under prefill-only policy, decode does NOT save blocks 3 and 4.
     meta_decode = sched.build_save_meta("r1", scheduled_tokens=0)
-    assert meta_decode.block_hashes == ()
+    assert meta_decode.block_hashes == []
     assert store.committed == {1, 2}
 
     # Turn two: prompt arrives with blocks [1, 2, 3, 4].

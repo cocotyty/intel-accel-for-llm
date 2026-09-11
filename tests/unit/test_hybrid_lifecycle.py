@@ -265,12 +265,12 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     # restored range
     # Forward completes tokens up to 544+64=608: the ledger and the
     # attention table grow past the restored range by 4 blocks
-    st.live_block_hashes.extend(range(34, 38))
-    st.num_prompt_tokens = len(st.live_block_hashes) * 16
+    st.block_hashes.extend(range(34, 38))
+    st.num_prompt_tokens = len(st.block_hashes) * 16
     st.groups[0].block_ids.extend(range(134, 138))
     m = sched.build_save_meta("r1", scheduled_tokens=64)
     # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
-    assert m.block_hashes == ("34", "35", "36", "37"), m
+    assert m.block_hashes == ["34", "35", "36", "37"], m
     assert m.group_block_ids[0] == (134, 135, 136, 137), m
     # the mamba tail column is the scan's output at boundary 37; the
     # restore slot (37) is keyed only because this pass overwrites it
@@ -283,8 +283,8 @@ def test_incremental_boundaries_after_restore_are_saved():
     sched = _hybrid_resumed_setup(set(range(34)))
     # Extend the ledger and both tables past the restored range
     st = sched._req_states["r1"]
-    st.live_block_hashes.extend(range(34, 74))
-    st.num_prompt_tokens = len(st.live_block_hashes) * 16
+    st.block_hashes.extend(range(34, 74))
+    st.num_prompt_tokens = len(st.block_hashes) * 16
     st.groups[0].block_ids.extend(range(134, 174))
     # one 640-token pass materializes only its tail column: the new
     # columns arrive null except the scan's output at idx 73

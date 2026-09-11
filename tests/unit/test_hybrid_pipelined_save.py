@@ -53,8 +53,8 @@ def _save_meta():
     hash 777 -- a boundary is one hash shared by every group."""
     saves = RequestMetadata()
     saves.requests["r1"] = ReqMeta(
-        block_hashes=("777",), group_block_ids=(("10",), ("20",)))
-    return KVShrinkConnectorMetadata(reqs_to_save=saves)
+        block_hashes=["777"], group_block_ids=(("10",), ("20",)))
+    return KVShrinkConnectorMetadata(reqs_to_load=RequestMetadata(), reqs_to_save=saves)
 
 
 def _worker():
@@ -136,9 +136,10 @@ def test_mamba_segment_splits_by_group():
     c._mamba_save_segments = {"a0": ("m0", "m1")}
     saves = RequestMetadata()
     saves.requests["r1"] = ReqMeta(
-        block_hashes=("777",),
+        block_hashes=["777"],
         group_block_ids=(("10",), ("20",), ("21",)))
-    c.bind_connector_metadata(KVShrinkConnectorMetadata(reqs_to_save=saves))
+    c.bind_connector_metadata(KVShrinkConnectorMetadata(
+        reqs_to_load=RequestMetadata(), reqs_to_save=saves))
     c.save_kv_layer("a0", None, None)
     by_label = {l: layers for l, layers, _h in c.kvstore.submits}
     assert by_label["g1"] == ["m0"]
