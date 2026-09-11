@@ -398,13 +398,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if state is None:
             raise RuntimeError(f"Missing state for request {req_id}")
 
-        # Prefill-only save policy: decode steps never produce saves.
-        if scheduled_tokens <= 1 or (
-            state.num_prompt_tokens > 0
-            and state.num_computed_tokens >= state.num_prompt_tokens
-        ):
-            return
-
         start = state.num_computed_tokens // self.block_size
         end = min(
             (state.num_computed_tokens + scheduled_tokens) // self.block_size,
@@ -440,18 +433,23 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         for request in scheduler_output.scheduled_new_reqs:
-            self._add_request_to_save(
-                request.req_id, scheduler_output.num_scheduled_tokens[request.req_id]
-            )
+            state = self._req_states[request.req_id]
+            if (scheduler_output.num_scheduled_tokens[request.req_id] > 1
+                    and state.num_computed_tokens < state.num_prompt_tokens):
+                self._add_request_to_save(
+                    request.req_id, scheduler_output.num_scheduled_tokens[request.req_id]
+                )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached_reqs.req_ids):
             block_ids = cached_reqs.new_block_ids[index]
-            is_prefill = scheduler_output.num_scheduled_tokens[req_id] > 1
-            if not is_prefill:
-                continue
             state = self._req_states[req_id]
             state.num_computed_tokens = cached_reqs.num_computed_tokens[index]
+            # MTP decode can schedule multiple tokens after the prompt is complete.
+            is_prefill = (scheduler_output.num_scheduled_tokens[req_id] > 1
+                          and state.num_computed_tokens < state.num_prompt_tokens)
+            if not is_prefill:
+                continue
             if block_ids and req_id not in cached_reqs.resumed_req_ids:
                 for group, ids in zip(state.groups, block_ids):
                     group.block_ids.extend(ids)
@@ -490,26 +488,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._attn_order = tuple(
             ln for ln in execution_order
             if ln not in self._mamba_layers)
-        first_attention = (execution_order.index(self._attn_order[0])
-                           if self._attn_order else len(execution_order))
-        self._leading_mamba_layers = execution_order[:first_attention]
         self._async_load_order = [ln for ln in execution_order if ln in self._mamba_layers]
         self._async_load_order.extend(self._attn_order)
-        segments: dict[str, tuple[str, ...]] = {}
+        self._mamba_save_segments = {}
+        self._mamba_load_segments = {}
+        previous_attention = None
         pending: list[str] = []
         for ln in execution_order:
             if ln in self._mamba_layers:
                 pending.append(ln)
-            elif pending:
-                segments[ln] = tuple(pending)
+            else:
+                self._mamba_save_segments[ln] = tuple(pending)
+                self._mamba_load_segments[previous_attention] = pending
+                previous_attention = ln
                 pending = []
-        self._mamba_save_segments = segments
-        self._mamba_load_segments = {}
-        for index, layer_name in enumerate(self._attn_order):
-            start = execution_order.index(layer_name) + 1
-            end = (execution_order.index(self._attn_order[index + 1])
-                   if index + 1 < len(self._attn_order) else len(execution_order))
-            self._mamba_load_segments[layer_name] = execution_order[start:end]
+        self._mamba_load_segments[previous_attention] = pending
+        self._leading_mamba_layers = self._mamba_load_segments.pop(None)
         self._last_layer_name = self._attn_order[-1] if self._attn_order else None
 
         # The store binds base model kv_caches directly.
