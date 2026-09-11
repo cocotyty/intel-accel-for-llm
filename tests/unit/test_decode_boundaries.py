@@ -38,7 +38,7 @@ class _LiveRequest:
 
 def _state(sched, live, hashes, num_prompt_tokens=32):
     st = ReqState(
-        live_block_hashes=(live.block_hashes
+        block_hashes=(live.block_hashes
                            if live is not None else list(hashes)),
         num_prompt_tokens=num_prompt_tokens,
         groups=tuple(ReqGroupState() for _ in sched._groups))
@@ -54,7 +54,7 @@ def test_missing_request_object_is_not_fatal():
     st = _state(sched, None, [1, 2])
 
     sched.sync_running_request("r1", None, False, 32)
-    assert st.live_block_hashes == [1, 2]
+    assert st.block_hashes == [1, 2]
 
 
 def test_save_plan_ignores_decode_boundaries():
@@ -69,4 +69,4 @@ def test_save_plan_ignores_decode_boundaries():
     sched.sync_running_request("r1", None, False, 64)
 
     meta = sched.build_save_meta("r1", scheduled_tokens=0)
-    assert meta.block_hashes == () and meta.group_block_ids == ((),), meta
+    assert meta.block_hashes == [] and meta.group_block_ids == ((),), meta

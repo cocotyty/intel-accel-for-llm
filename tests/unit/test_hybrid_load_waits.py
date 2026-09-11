@@ -8,8 +8,8 @@ GDN/mamba ones. So the two are waited differently:
 
 - attention pages stay pipelined -- each layer's hook waits its own
   pages, right before that layer reads them;
-- every GDN page is waited in ``start_load``, in one barrier before
-  forward begins, because no hook will ever come for it.
+- leading GDN pages are waited in ``start_load``; later GDN runs are
+  waited at the preceding attention post-hook, before they execute.
 
 Anything left un-waited at the end of a step is a fail-stop: it would
 mean forward read unrestored state.
@@ -41,15 +41,19 @@ class _FakeStore:
         self.submitted = []          # layer names, in submit order
         self.waited = []             # layer names, in wait order
         self.committed = committed
+        self.pending = set()
 
     def get(self, block_indices, block_hashs, layer_names,
-            label=None):
+            label=None, description=""):
         self.submitted.extend(layer_names)
+        self.pending.update(layer_names)
         return {k: f"task:{k}" for k in layer_names}
 
     def get_wait(self, get_results, layer_names=None, wait=True):
-        for k in (layer_names or get_results.keys()):
-            self.waited.append(k)
+        for k in (layer_names if layer_names is not None else get_results.keys()):
+            if k in self.pending:
+                self.waited.append(k)
+                self.pending.remove(k)
         return True
 
     def has(self, chunk_labels, label=None):
@@ -83,8 +87,8 @@ def _load_meta(group_idx, req_id="r1"):
     group_ids[group_idx] = ("5",)
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(
-        block_hashes=("7",), group_block_ids=tuple(group_ids))
-    return KVShrinkConnectorMetadata(reqs_to_load=md)
+        block_hashes=["7"], group_block_ids=tuple(group_ids))
+    return KVShrinkConnectorMetadata(reqs_to_load=md, reqs_to_save=RequestMetadata())
 
 
 # ------------------------------------------------------------------
@@ -107,15 +111,12 @@ def test_attention_execution_order_is_recorded():
 # load scheduling
 # ------------------------------------------------------------------
 
-def test_every_recurrent_layer_is_waited_before_forward():
-    """GDN gets no per-layer hook from vLLM, so the whole recurrent set
-    is waited in start_load. Nothing may be left pending: a GDN layer
-    that reaches forward unrestored is silent output corruption."""
+def test_only_leading_recurrent_layers_are_waited_before_forward():
     be = _FakeStore()
     w = _worker(be)
     drive_start_load(w, _load_meta(1))
     assert sorted(be.submitted) == sorted(GDN)
-    assert sorted(be.waited) == sorted(GDN), be.waited
+    assert be.waited == ["m0"], be.waited
     # the batch stays open until the last attention hook (main's rule)
     assert set(w._current_get_tasks) == set(GDN)
 
@@ -129,13 +130,57 @@ def test_attention_pages_stay_pipelined():
     meta.reqs_to_load.requests.update(
         _load_meta(1, req_id="r2").reqs_to_load.requests)
     drive_start_load(w, meta)
-    # GDN waited already; no attention layer has been waited yet
-    assert sorted(be.waited) == sorted(GDN), be.waited
+    assert be.submitted == ORDER
+    assert be.waited == ["m0"], be.waited
 
     w.wait_for_layer_load("a1")
-    assert be.waited[-1] == "a1"
+    assert be.waited == ["m0", "a1"]
+    assert be.pending == {"m2", "m3", "a4"}
+    w.save_kv_layer("a1", None, None)
+    assert be.waited == ["m0", "a1", "m2", "m3"]
+    assert be.pending == {"a4"}
     w.wait_for_layer_load("a4")
     assert be.waited[-1] == "a4"
+    w.save_kv_layer("a4", None, None)
+    assert not be.pending
+    assert w._current_get_tasks is None
+
+
+@pytest.mark.parametrize("order,gdn,leading", [
+    (["m0", "m2", "a1", "m3"], ["m0", "m2", "m3"], ["m0", "m2"]),
+    (["a1", "m2", "m3"], ["m2", "m3"], []),
+    (["m0", "m2", "m3"], ["m0", "m2", "m3"], ["m0", "m2", "m3"]),
+])
+def test_sync_leading_and_trailing_mamba_without_save_requests(order, gdn, leading):
+    store = _FakeStore()
+    worker = _worker(store, order=order, gdn=gdn)
+    drive_start_load(worker, _load_meta(1))
+    assert store.waited == leading
+    if "a1" in order:
+        worker.wait_for_layer_load("a1")
+        assert store.waited == leading
+        worker.save_kv_layer("a1", None, None)
+    assert not store.pending
+    assert worker._current_get_tasks is None
+
+
+def test_later_recurrent_failure_raises_before_next_mamba_run():
+    store = _FakeStore()
+    worker = _worker(store)
+    drive_start_load(worker, _load_meta(1))
+    store.get_wait = lambda **kwargs: False
+    with pytest.raises(RuntimeError, match="recurrent KV cache"):
+        worker.save_kv_layer("a1", None, None)
+
+
+def test_mismatched_load_metadata_is_rejected_before_submission():
+    store = _FakeStore()
+    worker = _worker(store)
+    metadata = _load_meta(1)
+    metadata.reqs_to_load.requests["r1"].block_hashes.append("8")
+    with pytest.raises(ValueError, match="Mismatched block metadata"):
+        drive_start_load(worker, metadata)
+    assert store.submitted == []
 
 
 def test_failed_blocking_wait_raises():

@@ -50,9 +50,11 @@ class _FakeStore:
         self.landed: set[str] = set()
         self.waited: list[str] = []      # layers finalized, in order
         self.fail_on: set[str] = set()
+        self.submitted = []
 
     def get(self, block_indices, block_hashs, layer_names,
-            label=None):
+            label=None, description=""):
+        self.submitted.extend((ln, description) for ln in layer_names)
         return {ln: f"task:{ln}" for ln in layer_names}
 
     def get_wait(self, get_results, layer_names=None, wait=True):
@@ -82,9 +84,9 @@ def _meta(async_layers, req_id="r1"):
     """A load plan covering every layer, split per group."""
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(
-        block_hashes=("7",), group_block_ids=(("5",), ("5",)),
+        block_hashes=["7"], group_block_ids=(("5",), ("5",)),
         is_async=True, async_load_layers=async_layers)
-    return KVShrinkConnectorMetadata(reqs_to_load=md)
+    return KVShrinkConnectorMetadata(reqs_to_load=md, reqs_to_save=RequestMetadata())
 
 
 # ------------------------------------------------------------------
@@ -118,6 +120,20 @@ def test_not_released_until_recurrent_state_has_landed():
     b.landed |= set(GDN)                   # now the state is there
     _, recving = w.get_finished(set())
     assert recving == {"r1"}, recving
+
+
+def test_async_queues_all_mamba_before_attention_across_requests():
+    store = _FakeStore()
+    worker = _worker(store)
+    metadata = _meta(async_layers=1)
+    metadata.reqs_to_load.requests.update(_meta(1, "r2").reqs_to_load.requests)
+    drive_start_load(worker, metadata)
+    assert store.submitted == [
+        (layer, req_id) for layer in GDN + ATTN for req_id in ("r1", "r2")
+    ]
+    assert store.waited == []
+    store.landed = {"m0", *ATTN}
+    assert worker.get_finished(set())[1] is None
 
 
 def test_negative_layer_count_gates_on_every_layer():
@@ -155,22 +171,23 @@ def test_sync_loads_queue_ahead_of_async_loads():
 
     class _Recorder(_FakeStore):
         def get(self, block_indices, block_hashs, layer_names,
-                label=None):
+                label=None, description=""):
             calls.append((layer_names[0], block_indices[0]))
             return super().get(block_indices, block_hashs,
-                               layer_names, label)
+                               layer_names, label, description)
 
     w = _worker(_Recorder())
     md = RequestMetadata()
     md.requests["sync1"] = ReqMeta(
-        block_hashes=("7",), group_block_ids=(("5",), ("5",)))
+        block_hashes=["7"], group_block_ids=(("5",), ("5",)))
     md.requests["async1"] = ReqMeta(
-        block_hashes=("7",), group_block_ids=(("9",), ("9",)),
+        block_hashes=["7"], group_block_ids=(("9",), ("9",)),
         is_async=True, async_load_layers=1)
-    drive_start_load(w, KVShrinkConnectorMetadata(reqs_to_load=md))
+    drive_start_load(w, KVShrinkConnectorMetadata(
+        reqs_to_load=md, reqs_to_save=RequestMetadata()))
 
     assert calls == ([(ln, "5") for ln in ORDER]
-                     + [(ln, "9") for ln in ORDER])
+                     + [(ln, "9") for ln in GDN + ATTN])
 
 
 def test_remaining_layers_are_drained_by_the_layer_hooks():
@@ -227,7 +244,7 @@ def _alloc(sched, block_ids, hashes, ext, is_async, layers=-1,
     from conftest import FakeBlocks
 
     st = ReqState(
-        live_block_hashes=list(hashes),
+        block_hashes=list(hashes),
         groups=tuple(ReqGroupState() for _ in sched._groups))
     st.is_async = is_async
     st.async_load_layers = layers
@@ -360,5 +377,4 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     assert sched.build_connector_meta(
         _empty_out()).reqs_to_load.requests == {}, (
         "a second transfer was queued for a request already running")
-
 

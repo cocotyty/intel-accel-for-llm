@@ -69,17 +69,26 @@ def HybridRequestScheduler(groups, store, block_size,
     builds one with just the fields they touch. Same signature the
     pre-merge HybridRequestScheduler class had.
     """
-    from kvshrink.kvshrink_connector import KVShrinkConnector, RequestMetadata
+    from kvshrink.async_load_config import AsyncLoadLayerConfig
+    from kvshrink.kvshrink_connector import KVShrinkConnector, RequestMetadata, ReqMeta
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
     conn.kvstore = store
-    conn._block_size = block_size
-    conn._async_load_layer_config = async_load_config
+    conn.block_size = block_size
+    conn._async_load_layer_config = async_load_config or AsyncLoadLayerConfig(enabled=False)
     conn._num_attn_layers = sum(
         len(g.layer_names) for g in groups if g.kind != "mamba")
     conn._req_states = {}
     conn._reqs_to_load = RequestMetadata()
+    conn._reqs_to_save = RequestMetadata()
+
+    def _save(req_id, scheduled_tokens=0):
+        conn._add_request_to_save(req_id, scheduled_tokens)
+        return conn._reqs_to_save.requests.pop(
+            req_id, ReqMeta(group_block_ids=tuple(() for _ in groups)))
+
+    conn.build_save_meta = _save
 
     def _sync(req_id, new_block_ids, resumed=False, num_computed_tokens=0):
         st = conn._req_states[req_id]
@@ -98,9 +107,9 @@ def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0, num_pr
     """Register a fresh ReqState (what get_num_new_matched_tokens does)."""
     from kvshrink.kvshrink_connector import ReqGroupState, ReqState
     if num_prompt_tokens == 0 and block_hashes:
-        num_prompt_tokens = len(block_hashes) * sched._block_size
+        num_prompt_tokens = len(block_hashes) * sched.block_size
     sched._req_states[req_id] = ReqState(
-        live_block_hashes=list(block_hashes),
+        block_hashes=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
         num_prompt_tokens=num_prompt_tokens,
         groups=tuple(ReqGroupState() for _ in sched._groups),
@@ -130,6 +139,11 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
         ln for g in groups if g.kind == "mamba" for ln in g.layer_names)
     conn._attn_order = tuple(
         ln for ln in order if ln not in conn._mamba_layers)
+    first_attention = (order.index(conn._attn_order[0])
+                       if conn._attn_order else len(order))
+    conn._leading_mamba_layers = order[:first_attention]
+    conn._async_load_order = [ln for ln in order if ln in conn._mamba_layers]
+    conn._async_load_order.extend(conn._attn_order)
     segments = {}
     pending = []
     for ln in order:
@@ -139,6 +153,12 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
             segments[ln] = tuple(pending)
             pending = []
     conn._mamba_save_segments = segments
+    conn._mamba_load_segments = {}
+    for index, layer_name in enumerate(conn._attn_order):
+        start = order.index(layer_name) + 1
+        end = (order.index(conn._attn_order[index + 1])
+               if index + 1 < len(conn._attn_order) else len(order))
+        conn._mamba_load_segments[layer_name] = order[start:end]
     conn._last_layer_name = conn._attn_order[-1] if conn._attn_order else None
     conn._saved_layers = set()
     conn._current_put_tasks = {}
