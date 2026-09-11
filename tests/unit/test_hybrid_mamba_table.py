@@ -113,7 +113,7 @@ def test_save_meta_decode_phase_emits_no_saves():
     track_new_request(sched, "r1", block_hashes=[0, 1, 2, 3, 4],
                      num_computed_tokens=2640, num_prompt_tokens=2640)
     st = sched._req_states["r1"]
-    st.groups[0].block_ids = [60, 61, 62, 63, 70, 71]
+    st.group_block_ids[0] = [60, 61, 62, 63, 70, 71]
     # During decode, build_save_meta returns empty plan
     meta = sched.build_save_meta("r1", scheduled_tokens=1)
     assert meta.block_hashes == [] and meta.group_block_ids == ((),), meta
@@ -305,4 +305,3 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     assert meta.group_block_ids[0] == (3,), meta
     # mamba: snapshot at hash0 -> curr table_idx 1 -> block 8
     assert meta.group_block_ids[1] == (8,), meta
-

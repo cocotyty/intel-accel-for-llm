@@ -17,7 +17,7 @@ Pure logic: no GPU, no disk, no model.
 from __future__ import annotations
 
 from conftest import make_spec
-from kvshrink.kvshrink_connector import GroupInfo, ReqGroupState, ReqState
+from kvshrink.kvshrink_connector import GroupInfo, ReqState
 from conftest import HybridRequestScheduler
 
 
@@ -65,7 +65,7 @@ def test_second_request_hits_decode_produced_blocks():
         block_hashes=live.block_hashes,
         num_computed_tokens=0,
         num_prompt_tokens=32,
-        groups=(ReqGroupState(block_ids=[10, 11]),))
+        group_block_ids=[[10, 11]])
     sched._req_states["r1"] = st
     meta_prefill = sched.build_save_meta("r1", scheduled_tokens=32)
     store.committed.update(int(h) for h in meta_prefill.block_hashes)
@@ -73,7 +73,7 @@ def test_second_request_hits_decode_produced_blocks():
 
     # Forward advances to 32 computed tokens (prefill complete)
     st.num_computed_tokens = 32
-    st.groups[0].block_ids.extend([12, 13])
+    st.group_block_ids[0].extend([12, 13])
 
     # Decode completed two more blocks; the engine appended their
     # hashes to the live list in place.

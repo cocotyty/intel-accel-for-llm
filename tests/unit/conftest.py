@@ -100,25 +100,25 @@ def HybridRequestScheduler(groups, store, block_size,
         st = conn._req_states[req_id]
         st.num_computed_tokens = num_computed_tokens
         if new_block_ids:
-            for gstate, ids in zip(st.groups, new_block_ids):
-                if resumed:
-                    gstate.block_ids = list(ids)
-                else:
-                    gstate.block_ids.extend(ids)
+            if resumed:
+                st.group_block_ids = [list(ids) for ids in new_block_ids]
+            else:
+                for group_ids, ids in zip(st.group_block_ids, new_block_ids):
+                    group_ids.extend(ids)
     conn.sync_running_request = _sync
     return conn
 
 
 def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0, num_prompt_tokens=0):
     """Register a fresh ReqState (what get_num_new_matched_tokens does)."""
-    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqState
     if num_prompt_tokens == 0 and block_hashes:
         num_prompt_tokens = len(block_hashes) * sched.block_size
     sched._req_states[req_id] = ReqState(
         block_hashes=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
         num_prompt_tokens=num_prompt_tokens,
-        groups=tuple(ReqGroupState() for _ in sched._groups),
+        group_block_ids=[[] for _ in sched._groups],
     )
 
 

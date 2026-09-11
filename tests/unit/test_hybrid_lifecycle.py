@@ -143,7 +143,7 @@ def test_resumed_empty_table_clears():
     sched.build_save_meta("r1", scheduled_tokens=32)
     sched.sync_running_request("r1", ([],), resumed=True,
                             num_computed_tokens=0)
-    assert sched._req_states["r1"].groups[0].block_ids == []
+    assert sched._req_states["r1"].group_block_ids[0] == []
 
 
 def test_progress_regression_without_resumed_flag_rolls_back():
@@ -294,7 +294,7 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     # attention table grow past the restored range by 4 blocks
     st.block_hashes.extend(range(34, 38))
     st.num_prompt_tokens = len(st.block_hashes) * 16
-    st.groups[0].block_ids.extend(range(134, 138))
+    st.group_block_ids[0].extend(range(134, 138))
     m = sched.build_save_meta("r1", scheduled_tokens=64)
     # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
     assert m.block_hashes == ["34", "35", "36", "37"], m
@@ -312,10 +312,10 @@ def test_incremental_boundaries_after_restore_are_saved():
     st = sched._req_states["r1"]
     st.block_hashes.extend(range(34, 74))
     st.num_prompt_tokens = len(st.block_hashes) * 16
-    st.groups[0].block_ids.extend(range(134, 174))
+    st.group_block_ids[0].extend(range(134, 174))
     # one 640-token pass materializes only its tail column: the new
     # columns arrive null except the scan's output at idx 73
-    st.groups[1].block_ids.extend([0] * 35 + [273])
+    st.group_block_ids[1].extend([0] * 35 + [273])
     # 544 + 640 = 1184 tokens = 74 blocks: 40 blocks past the skip
     m = sched.build_save_meta("r1", scheduled_tokens=640)
     assert len(m.block_hashes) == 40, m
