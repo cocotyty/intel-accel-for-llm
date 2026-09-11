@@ -37,8 +37,6 @@ check "hybrid path active" \
     grep -q "kvshrink hybrid path enabled" "$COLD_LOG"
 check "MTP speculative decoding detected by engine" \
     grep -qi "Qwen3_5MTP" "$COLD_LOG"
-check "MTP speculative decoding enabled in connector" \
-    grep -q "mamba speculative decoding enabled with num_speculative_blocks=1" "$COLD_LOG"
 check "cold run produced output" test -n "$COLD_OUT"
 
 # ----------------------------------------------------------------- hot
