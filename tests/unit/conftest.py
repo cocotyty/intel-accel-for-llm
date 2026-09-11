@@ -84,8 +84,14 @@ def HybridRequestScheduler(groups, store, block_size,
     conn._reqs_to_save = RequestMetadata()
 
     def _save(req_id, scheduled_tokens=0):
-        conn._add_request_to_save(req_id, scheduled_tokens)
-        return conn._reqs_to_save.requests.pop(
+        from types import SimpleNamespace
+
+        metadata = conn.build_connector_meta(SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=req_id)],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+            num_scheduled_tokens={req_id: scheduled_tokens},
+        ))
+        return metadata.reqs_to_save.requests.get(
             req_id, ReqMeta(group_block_ids=tuple(() for _ in groups)))
 
     conn.build_save_meta = _save

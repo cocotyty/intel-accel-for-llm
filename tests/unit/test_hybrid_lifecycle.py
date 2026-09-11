@@ -16,8 +16,35 @@ from conftest import (
     FakeBlocks, HybridRequestScheduler, make_spec,
     track_new_request)
 from kvshrink.kvshrink_connector import GroupInfo
+import pytest
+from types import SimpleNamespace
 
 PAGE = 64 * 1024
+
+
+@pytest.mark.parametrize("new_request", [True, False])
+@pytest.mark.parametrize("computed,scheduled,expect_save", [
+    (0, 16, True),
+    (16, 16, True),
+    (32, 1, False),
+    (32, 2, False),
+    (48, 4, False),
+])
+def test_scheduler_filters_decode_before_save(new_request, computed, scheduled, expect_save):
+    sched = _sched([_attn()])
+    track_new_request(sched, "r1", [0, 1, 2, 3],
+                      num_computed_tokens=computed if new_request else 0,
+                      num_prompt_tokens=32)
+    sched.update_state_after_alloc(
+        SimpleNamespace(request_id="r1"), FakeBlocks(([10, 11, 12, 13],)), 0)
+    metadata = sched.build_connector_meta(SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r1")] if new_request else [],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[] if new_request else ["r1"],
+            new_block_ids=[None], num_computed_tokens=[computed], resumed_req_ids=set()),
+        num_scheduled_tokens={"r1": scheduled},
+    ))
+    assert ("r1" in metadata.reqs_to_save.requests) == expect_save
 
 
 def _attn(bs=16):
