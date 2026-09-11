@@ -6,6 +6,7 @@
 *.lo
 *.o
 *.obj
+*.so
 
 # Precompiled Headers
 *.gch
@@ -53,3 +54,5 @@
 *.swp
 _build
 _lib
+_data
+.wheels/

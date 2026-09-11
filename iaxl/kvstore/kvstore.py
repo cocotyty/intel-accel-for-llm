@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
+
 import torch
 import numpy as np
 from typing import Dict, List, Optional
@@ -25,26 +27,41 @@ def _get_default_cache_size_gb() -> float:
     return available_bytes / (10 * 1024**3)
 
 
+def _bind_pools(
+    kv_caches: Optional[Dict[str, torch.Tensor | list]],
+) -> Optional[Dict[str, torch.Tensor]]:
+    if kv_caches is None:
+        return None
+    pools: Dict[str, torch.Tensor] = {}
+    for layer_name, entry in kv_caches.items():
+        if not isinstance(entry, (list, tuple)):
+            pools[layer_name] = entry
+            continue
+        first = entry[0]
+        page_bytes = first.stride(0) * first.element_size()
+        num_blocks = first.shape[0]
+        base = torch.empty(0, dtype=torch.uint8, device=first.device).set_(first.untyped_storage())
+        pools[layer_name] = torch.as_strided(
+            base, size=(num_blocks, page_bytes), stride=(page_bytes, 1), storage_offset=0
+        )
+    return pools
+
+
 class KVStore:
     LABEL = "kv"
 
     def __init__(
         self,
         model_name: str,
-        block_dim: Optional[int] = None,
         kv_caches: Optional[Dict[str, torch.Tensor]] = None,
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
     ):
-
         if kv_caches is None and layer_names is None:
             raise ValueError(
                 "At least one of kv_caches or layer_names must be provided"
             )
-
-        if kv_caches is not None and block_dim is None:
-            raise ValueError("block_dim is required when kv_caches is provided")
 
         if kv_caches is not None and layer_names is not None:
             kv_keys = set(kv_caches.keys())
@@ -54,13 +71,12 @@ class KVStore:
                     f"kv_caches keys {kv_keys} must match layer_names {layer_set}"
                 )
 
-        self.kv_caches = kv_caches
-        self.block_dim = block_dim
+        self.kv_caches = _bind_pools(kv_caches)
         self.rank = rank
         self.tp_size = tp_size
 
         if kv_caches is not None:
-            self.layer_names = list(kv_caches.keys())
+            self.layer_names = list(self.kv_caches.keys())
         else:
             self.layer_names = layer_names
 
@@ -69,21 +85,6 @@ class KVStore:
         )
 
         self.has_only_mode = kv_caches is None
-
-        if kv_caches:
-            first_tensor = next(iter(kv_caches.values()))
-            self.kvcache_shape = list(first_tensor.shape)
-
-            self.block_shape = list(first_tensor.shape)
-            self.block_shape[block_dim] = 1
-            self.block_shape = tuple(
-                self.block_shape[i]
-                for i in range(len(self.block_shape))
-                if i != block_dim
-            )
-        else:
-            self.kvcache_shape = None
-            self.block_shape = None
 
         if self.has_only_mode:
             final_persist_dir = f"{model_name}_rank0"
@@ -109,14 +110,12 @@ class KVStore:
         logger.info(
             "KVStore initialized successfully: "
             "model_name=%s, rank=%d, has_only_mode=%s, "
-            "num_layers=%d, block_dim=%s, block_shape=%s, "
+            "num_layers=%d, "
             "pool_size_gb=%.2f, persist_dir=%s",
             model_name,
             self.rank,
             self.has_only_mode,
             len(self.layer_names),
-            self.block_dim,
-            self.block_shape,
             pool_size_gb,
             final_persist_dir,
         )
@@ -158,8 +157,8 @@ class KVStore:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
-
         if self.has_only_mode:
             raise RuntimeError(
                 "put() not available in has-only mode (kv_caches not provided)"
@@ -171,17 +170,17 @@ class KVStore:
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
         result = self.tensorzip.put(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim,
+            chunk_dim=0,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
             skip_compression_count=self.skip_compression_count,
         )
 
-        if self.layer_names[-1] in layer_names:
-            self.tensorzip.put_finish(self.LABEL, block_hashs)
+        if label is not None or self.layer_names[-1] in layer_names:
+            self.tensorzip.put_finish(label or self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
         return result
@@ -210,8 +209,12 @@ class KVStore:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
-
+        """Read blocks back into the bound pools; see ``put`` for the
+        naming and namespace contract. Results are keyed by layer name
+        so a caller can wait one layer at a time and overlap the rest
+        with compute."""
         if self.has_only_mode:
             raise RuntimeError(
                 "get() not available in has-only mode (kv_caches not provided)"
@@ -223,9 +226,9 @@ class KVStore:
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
         return self.tensorzip.get(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=self.block_dim,
+            chunk_dim=0,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
@@ -249,13 +252,20 @@ class KVStore:
             wait=wait,
         )
 
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None) -> List[bool]:
+        """Presence, truncated at the first miss.
+
+        The truncation is prefix semantics: a cached prefix is only
+        usable up to its first hole, so nothing past one is worth
+        reporting. ``label`` selects the namespace, as in ``put``.
+        """
         if not block_hashs:
             self.tensorzip.record_flush()
             return []
 
         results = self.tensorzip.has(
-            label=self.LABEL,
+            label=label or self.LABEL,
             chunk_labels=block_hashs,
         )
 
@@ -275,7 +285,6 @@ class KVStore:
         status = self.tensorzip.status()
         status["rank"] = self.rank
         status["num_layers"] = len(self.layer_names)
-        status["kvcache_shape"] = self.kvcache_shape
         return status
 
     def metrics(self, params: Optional[dict] = None) -> dict:

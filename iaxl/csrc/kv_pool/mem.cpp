@@ -271,14 +271,24 @@ class Mem::Impl {
 
             std::vector<bool> is_persisted = record_->is_persisted(check_keys);
 
+            // One storage load per unique key. A batch may name the same key
+            // twice (identical content restored into two different device
+            // blocks); loading it twice would make the second put_one_unlocked
+            // free the first copy's buffer while results[] still points at it,
+            // handing the caller a dangling payload.
+            std::unordered_set<std::string> queued;
+            queued.reserve(miss_indices.size());
+            size_t unresolvable = 0;
             for (size_t i = 0; i < miss_indices.size(); ++i) {
-                if (is_persisted[i]) {
+                if (!is_persisted[i]) {
+                    unresolvable++;
+                    continue;
+                }
+                if (queued.insert(keys[miss_indices[i]]).second) {
                     storage_indices.push_back(miss_indices[i]);
-                } else {
                 }
             }
-            misses_.fetch_add(miss_indices.size() - storage_indices.size(),
-                              std::memory_order_relaxed);
+            misses_.fetch_add(unresolvable, std::memory_order_relaxed);
         } else {
 
             misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
@@ -327,6 +337,14 @@ class Mem::Impl {
             } else {
 
                 misses_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // The duplicates skipped above resolve from the pool the loaded copy
+        // now owns.
+        for (size_t idx : miss_indices) {
+            if (!results[idx].first) {
+                results[idx] = get_one_unlocked(keys[idx], now);
             }
         }
 
