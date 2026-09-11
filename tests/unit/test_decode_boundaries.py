@@ -16,7 +16,7 @@ Pure logic: no GPU, no disk, no model.
 from __future__ import annotations
 
 from conftest import make_spec
-from kvshrink.kvshrink_connector import GroupInfo, ReqGroupState, ReqState
+from kvshrink.kvshrink_connector import GroupInfo, ReqState
 from conftest import HybridRequestScheduler
 
 
@@ -41,7 +41,7 @@ def _state(sched, live, hashes, num_prompt_tokens=32):
         block_hashes=(live.block_hashes
                            if live is not None else list(hashes)),
         num_prompt_tokens=num_prompt_tokens,
-        groups=tuple(ReqGroupState() for _ in sched._groups))
+        group_block_ids=[[] for _ in sched._groups])
     sched._req_states["r1"] = st
     return st
 
@@ -63,7 +63,7 @@ def test_save_plan_ignores_decode_boundaries():
     sched = _sched()
     live = _LiveRequest([1, 2])
     st = _state(sched, live, [1, 2], num_prompt_tokens=32)
-    st.groups[0].block_ids = [10, 11, 12, 13]
+    st.group_block_ids[0] = [10, 11, 12, 13]
 
     live.block_hashes.extend([3, 4])       # two blocks produced by decode
     sched.sync_running_request("r1", None, False, 64)

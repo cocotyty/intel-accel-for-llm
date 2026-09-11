@@ -240,12 +240,12 @@ def _alloc(sched, block_ids, hashes, ext, is_async, layers=-1,
            req_id="r1"):
     """Register a request and hand vLLM's allocation to the connector,
     which is where the load plan is built."""
-    from kvshrink.kvshrink_connector import ReqGroupState, ReqState
+    from kvshrink.kvshrink_connector import ReqState
     from conftest import FakeBlocks
 
     st = ReqState(
         block_hashes=list(hashes),
-        groups=tuple(ReqGroupState() for _ in sched._groups))
+        group_block_ids=[[] for _ in sched._groups])
     st.is_async = is_async
     st.async_load_layers = layers
     sched._req_states[req_id] = st
@@ -377,4 +377,3 @@ def test_second_alloc_callback_does_not_queue_another_transfer():
     assert sched.build_connector_meta(
         _empty_out()).reqs_to_load.requests == {}, (
         "a second transfer was queued for a request already running")
-
