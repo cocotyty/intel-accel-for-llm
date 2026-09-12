@@ -138,6 +138,7 @@ class KVFlow:
         lambda self,
         label,
         tensors,
+        chunk_dim,
         chunk_indices,
         chunk_labels,
         description="",
@@ -149,21 +150,13 @@ class KVFlow:
         self,
         label: str,
         tensors: Dict[str, torch.Tensor],
+        chunk_dim: int,
         chunk_indices: List[int],
         chunk_labels: List[str],
         description: str = "",
-        entry_flags: Optional[List[int]] = None,
+        skip_compression_count: int = 0,
     ) -> Dict[str, Task]:
-        """Write blocks from row-addressable GPU pools, one batch.
 
-        ``tensors`` maps pool keys to dim-0-indexed block pools; pools
-        may differ in shape/dtype (an attention page vs an opaque mamba
-        page) because staging is allocated PER ENTRY from each tensor's
-        own metadata. ``entry_flags``, when given, aligns positionally:
-        bit0 = compress this entry through the codec, bit1 = apply the
-        lossy-trunc transform BEFORE compression. Absent or None means
-        every entry runs compressed with no numeric loss.
-        """
         self._ensure_streams()
         assert chunk_indices is not None and chunk_labels is not None
         assert tensors, "tensors must not be empty"
@@ -172,6 +165,7 @@ class KVFlow:
             "chunk_indices and chunk_labels must have the same length"
         )
         first_t = next(iter(tensors.values()))
+        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
             assert tensor.is_cuda or tensor.is_xpu, (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
@@ -180,23 +174,24 @@ class KVFlow:
                 "all tensors must be on the same device"
             )
             assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
+            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
         results = {}
         first_tensor = True
         num_chunks = len(chunk_indices)
+        chunk_shape = list(first_t.shape)
+        del chunk_shape[chunk_dim]
+        chunk_shape = tuple(chunk_shape)
 
         for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
-            flags = (entry_flags[tensor_index]
-                     if entry_flags is not None else 0b01)
-            compress = bool(flags & 0b01)
-            lossy = bool(flags & 0b10)
             cpu_tensors = self.chunk_pool.allocate(
-                num_chunks, tuple(tensor.shape[1:]), tensor.dtype
+                num_chunks, chunk_shape, tensor.dtype
             )
 
             ctx = Context.create(
                 tensor,
-                0,
+                chunk_dim,
                 GpuTransferDirection.D2H,
                 description,
                 work_stream=self.put_stream,
@@ -207,9 +202,9 @@ class KVFlow:
             ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
             ctx.xfer_finish()
 
+            compress = tensor_index >= skip_compression_count
             ctx.zip_to_mem(
-                self.mem, label, tensor_key, chunk_labels, cpu_tensors,
-                compress, lossy,
+                self.mem, label, tensor_key, chunk_labels, cpu_tensors, compress
             )
 
             results[tensor_key] = Task(
@@ -257,7 +252,7 @@ class KVFlow:
         return True
 
     @profile_func(
-        lambda self, label, tensors, chunk_indices, chunk_labels, description: (
+        lambda self, label, tensors, chunk_dim, chunk_indices, chunk_labels, description: (
             f"({description},count={len(chunk_indices)})"
         )
     )
@@ -265,13 +260,11 @@ class KVFlow:
         self,
         label: str,
         tensors: Dict[str, torch.Tensor],
+        chunk_dim: int,
         chunk_indices: List[int],
         chunk_labels: List[str],
         description: str = "",
     ) -> Dict[str, Task]:
-        """Read blocks back into row-addressable GPU pools, one batch;
-        per-entry staging follows each pool's own metadata (see
-        ``put``). No codec transforms apply on the read path."""
 
         self._ensure_streams()
         assert chunk_indices is not None and chunk_labels is not None
@@ -281,6 +274,7 @@ class KVFlow:
             "chunk_indices and chunk_labels must have the same length"
         )
         first_t = next(iter(tensors.values()))
+        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
             assert tensor.is_cuda or tensor.is_xpu, (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
@@ -289,19 +283,24 @@ class KVFlow:
                 "all tensors must be on the same device"
             )
             assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
+            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
         results = {}
         num_chunks = len(chunk_indices)
+        chunk_shape = list(first_t.shape)
+        del chunk_shape[chunk_dim]
+        chunk_shape = tuple(chunk_shape)
 
         first_tensor = True
         for tensor_key, tensor in tensors.items():
             cpu_tensors = self.chunk_pool.allocate(
-                num_chunks, tuple(tensor.shape[1:]), tensor.dtype
+                num_chunks, chunk_shape, tensor.dtype
             )
 
             ctx = Context.create(
                 tensor,
-                0,
+                chunk_dim,
                 GpuTransferDirection.H2D,
                 description,
                 work_stream=self.get_stream,

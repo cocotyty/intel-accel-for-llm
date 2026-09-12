@@ -21,12 +21,12 @@ docker run --rm --name iaxl-regress \
   -e GATE_MODEL_HYBRID="$HYB" -e GATE_MODEL_ATTENTION="$ATT" \
   -e TP_SIZE=2 \
   --entrypoint bash "$IMG" -c '
-set -e
+set -eo pipefail
 pip install -q --no-index --find-links=/w/.wheels xxhash 2>/dev/null || pip install --retries 5 --timeout 60 -q xxhash
 export PYTHONPATH=/w
 
 echo "################ UNIT TESTS ################"
-python3 -m pytest tests/unit -q 2>&1 | tail -3
+python3 -m pytest tests/unit -q
 
 echo
 echo "################ GPU GATES ################"

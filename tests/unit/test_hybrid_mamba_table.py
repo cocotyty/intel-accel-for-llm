@@ -40,7 +40,7 @@ class _Store:
         against another, which is what committed_pairs expresses."""
         h = int(chunk_labels[0])
         if self.committed_pairs is not None:
-            g = int(label[len("g"):])
+            g = 1 if label == "mamba" else 0
             return [(g, h) in self.committed_pairs]
         return [h in self.committed]
 

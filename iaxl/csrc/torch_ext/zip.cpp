@@ -109,8 +109,7 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
 
 void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                          const std::vector<std::string> &chunk_labels,
-                         const std::vector<torch::Tensor> &cpu_tensors, bool compress,
-                         bool lossy_trunc_enabled) {
+                         const std::vector<torch::Tensor> &cpu_tensors, bool compress) {
     PROFILE_SCOPE_FMT("zip_to_mem(%s,l=<%zu,l0=%s>)", name().c_str(), chunk_labels.size(),
                       chunk_labels[0].c_str());
 
@@ -141,7 +140,7 @@ void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std:
                     PROFILE_SCOPE("compress");
                     METRICS_TIMER_START(metrics_compress);
                     kv_zip_compress_batch(cpu_tensors_copy, compressed_bufs, compressed_sizes,
-                                          unzip_sizes, compress, lossy_trunc_enabled);
+                                          unzip_sizes, compress);
                     METRICS_ADD_COMPRESS(metrics_compress, metrics_sum_sizes(unzip_sizes));
                 }
 

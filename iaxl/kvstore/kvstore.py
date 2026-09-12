@@ -29,71 +29,22 @@ def _get_default_cache_size_gb() -> float:
 
 def _bind_pools(
     kv_caches: Optional[Dict[str, torch.Tensor | list]],
-) -> tuple[Optional[Dict[str, torch.Tensor]], set[str]]:
-    """Normalize bound caches to one dim-0 block pool per layer.
-
-    - A bare Tensor passes through unchanged (attention family: vLLM
-      already lays them out block-leading and page-contiguous).
-    - A list/tuple of views sharing one storage (mamba family: conv +
-      ssm over the same raw buffer, both as_strided with dim 0 = block
-      index and stride(0) covering a whole padded page) collapses into
-      ONE byte plane: an int8 (num_blocks, page_bytes) view over the
-      shared storage. The first view's row stride is authoritative for
-      the page width -- downstream parts must agree, or binding fails
-      closed.
-
-    Returns (normalized_pools, opaque_layer_names). Opaque layers came
-    from multi-dtype fusion: their bytes carry no single numeric
-    meaning, so per-call policies must never apply lossy transforms.
-    """
+) -> Optional[Dict[str, torch.Tensor]]:
     if kv_caches is None:
-        return None, set()
-
+        return None
     pools: Dict[str, torch.Tensor] = {}
-    opaque: set[str] = set()
     for layer_name, entry in kv_caches.items():
         if not isinstance(entry, (list, tuple)):
             pools[layer_name] = entry
             continue
-
-        if len(entry) == 0:
-            raise ValueError(f"Layer {layer_name}: empty state list")
         first = entry[0]
         page_bytes = first.stride(0) * first.element_size()
         num_blocks = first.shape[0]
-        device = first.device
-
-        total_needed = page_bytes * num_blocks
-        storage_size = first.untyped_storage().size()
-        if total_needed > storage_size:
-            raise ValueError(
-                f"Layer {layer_name}: unified pages need {total_needed} "
-                f"bytes but the shared storage has {storage_size}")
-
-        base = torch.empty(
-            0, dtype=torch.uint8, device=device
-        ).set_(first.untyped_storage())
-        pool = torch.as_strided(
-            base,
-            size=(num_blocks, page_bytes),
-            stride=(page_bytes, 1),
-            storage_offset=0,
+        base = torch.empty(0, dtype=torch.uint8, device=first.device).set_(first.untyped_storage())
+        pools[layer_name] = torch.as_strided(
+            base, size=(num_blocks, page_bytes), stride=(page_bytes, 1), storage_offset=0
         )
-        # Fail closed if sibling parts disagree on the page geometry:
-        # each view's dim-0 stride, in bytes, must equal the first's.
-        for part in entry[1:]:
-            part_row_bytes = part.stride(0) * part.element_size()
-            if part.stride(0) and part_row_bytes != page_bytes:
-                raise ValueError(
-                    f"Layer {layer_name}: part strides disagree "
-                    f"({part_row_bytes} != {page_bytes} bytes); refusing "
-                    "to bind a misaligned multi-dtype pool")
-        pools[layer_name] = pool
-        opaque.add(layer_name)
-        logger.info(
-            "Bound layer %s as %d opaque int8 pages of %d bytes",
-            layer_name, num_blocks, page_bytes)
-    return pools, opaque
+    return pools
 
 
 class KVStore:
@@ -107,20 +58,6 @@ class KVStore:
         rank: int = 0,
         tp_size: int = 1,
     ):
-        """Bind row-addressable KV pools.
-
-        ``kv_caches`` maps a LAYER name to either a single GPU pool or
-        a LIST of pools sharing one storage (a mamba-style recurrent
-        layer: one conv view + one ssm view, both as_strided with
-        dim 0 = block index and a common padded page stride).
-
-        Binding normalizes everything to ONE dim-0 block pool per
-        layer: list entries collapse into a single uint8/int8 page
-        view spanning the shared storage. Thereafter every bound pool
-        is homogeneous within its group call; entry flags mark which
-        layers must never see numeric-loss transforms.
-        """
-
         if kv_caches is None and layer_names is None:
             raise ValueError(
                 "At least one of kv_caches or layer_names must be provided"
@@ -134,7 +71,7 @@ class KVStore:
                     f"kv_caches keys {kv_keys} must match layer_names {layer_set}"
                 )
 
-        self.kv_caches, self._opaque_layers = _bind_pools(kv_caches)
+        self.kv_caches = _bind_pools(kv_caches)
         self.rank = rank
         self.tp_size = tp_size
 
@@ -145,13 +82,6 @@ class KVStore:
 
         self.skip_compression_count = min(
             envs.IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS, len(self.layer_names)
-        )
-        self._skip_order = {ln: i for i, ln in
-                            enumerate(self.layer_names)}
-        # Operator-level lossy request; opaque layers veto it per entry
-        # inside _entry_flags.
-        self.lossy_trunc = (
-            os.getenv("IAXL_KV_LOSSY_TRUNC", "0").strip() not in ("", "0")
         )
 
         self.has_only_mode = kv_caches is None
@@ -221,25 +151,6 @@ class KVStore:
             role=role, rank=self.rank, num_workers=self.tp_size
         )
 
-    def _entry_flags(self, layer_names: List[int]) -> List[int]:
-        """Per-entry codec bits aligned to the tensors dict order.
-
-        bit0 = compress; bit1 = lossy-trunc. Both are structurally
-        refused for opaque (multi-dtype fused) layers: their pages are
-        raw bytes with no codec semantics, and a fused page exceeds the
-        zip source capacity anyway. For the rest, compression follows
-        the operator's skip-prefix and lossy follows the env request.
-        """
-        flags: List[int] = []
-        for ln in layer_names:
-            if ln in self._opaque_layers:
-                flags.append(0)
-                continue
-            compress = int(self._skip_order.get(ln, len(layer_names))
-                           >= self.skip_compression_count)
-            flags.append(compress | (int(self.lossy_trunc) << 1))
-        return flags
-
     def put(
         self,
         block_indices: List[int],
@@ -248,19 +159,6 @@ class KVStore:
         description: str = "",
         label: Optional[str] = None,
     ) -> Dict[str, Task]:
-        """Write blocks to the store, one entry per bound pool.
-
-        ``layer_names`` selects among the pools bound at construction
-        (bare layer names; multi-part layers are already unified).
-        ``label`` is the store-side namespace: callers that keep several
-        independent block spaces (one per KV cache group) pass their
-        own; the default keeps every existing key byte for byte.
-
-        A call carrying an explicit ``label`` is treated as complete on
-        its own -- the caller passes that namespace's whole layer set in
-        one call -- so the block is finalized here rather than waiting
-        for a "last layer" that this namespace defines differently.
-        """
         if self.has_only_mode:
             raise RuntimeError(
                 "put() not available in has-only mode (kv_caches not provided)"
@@ -271,17 +169,14 @@ class KVStore:
 
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
-        # Per-entry codec flags: bit0 compress, bit1 lossy-trunc.
-        # Opaque (multi-dtype fused) layers hard-refuse lossy; the
-        # operator's skip-compression prefix still applies by
-        # registration order.
         result = self.tensorzip.put(
             label=label or self.LABEL,
             tensors=tensors,
+            chunk_dim=0,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
-            entry_flags=self._entry_flags(layer_names),
+            skip_compression_count=self.skip_compression_count,
         )
 
         if label is not None or self.layer_names[-1] in layer_names:
@@ -333,6 +228,7 @@ class KVStore:
         return self.tensorzip.get(
             label=label or self.LABEL,
             tensors=tensors,
+            chunk_dim=0,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,

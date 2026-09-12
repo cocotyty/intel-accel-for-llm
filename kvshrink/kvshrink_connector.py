@@ -50,7 +50,6 @@ class ReqMeta:
     is_async: bool = False
     async_load_layers: int = -1
 
-
     def for_group(self, group_idx: int) -> tuple[list[int], list[str]]:
         """Pair group blocks with shared hashes, omitting null state slots."""
         pairs = [(block_id, block_hash) for block_id, block_hash in zip(
@@ -86,7 +85,7 @@ class RequestMetadata:
     ) -> None:
         self.requests[req_id] = ReqMeta(
             group_block_ids,
-            block_hashes,
+            [_hash_str(h) for h in block_hashes],
             is_async,
             async_load_layers,
         )
@@ -195,14 +194,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._bind_intel_accel()
 
         self._groups, self.block_size = parse_kv_cache_config(kv_cache_config)
-
-        # Attention layer count used to clamp the async early-start prefix.
-        self._num_attn_layers = sum(
-            len(g.layer_names) for g in self._groups if g.kind != "mamba")
-        if role != KVConnectorRole.SCHEDULER:
-            # layer_name -> group idx, every cached layer.
-            self._layer_group = {
-                ln: g.group_idx for g in self._groups for ln in g.layer_names}
+        self._has_mamba = any(g.kind == "mamba" for g in self._groups)
+        self._mamba_layers = frozenset(
+            ln for g in self._groups if g.kind == "mamba" for ln in g.layer_names)
+        self._layer_group = {
+            ln: g.group_idx for g in self._groups for ln in g.layer_names}
 
         logger.info(
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
@@ -291,7 +287,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         policy = HybridHitPolicy(
             self._groups,
             lambda g, h: self._store().has(
-                [_hash_str(h)], label=f"g{g}")[0],
+                [_hash_str(h)],
+                label="mamba" if self._groups[g].kind == "mamba" else "kv",
+            )[0],
             self.block_size, num_computed_tokens)
         matched_tokens = policy.find_longest_cache_hit(
             state.block_hashes, request.num_tokens
@@ -304,15 +302,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
+        # Mamba has no layer-load hook: finish every layer before resuming.
+        if self._has_mamba:
+            selected_layers = -1
         # A dynamic-map layer value of 0 selects synchronous loading. It is not
         # an async request that resumes before layer 0.
         use_async = num_new_tokens > 0 and selected_layers != 0
         state.is_async = use_async
         if use_async:
             state.async_load_layers = selected_layers
-            # Clamp layer count to available attention layers.
-            if selected_layers > self._num_attn_layers:
-                state.async_load_layers = -1
 
         logger.info(
             f"get_num_new_matched_tokens, req-{request.request_id}, "
@@ -349,24 +347,20 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if load_end <= load_start:
             return
-        group_ids: list[tuple[int, ...]] = [() for _ in self._groups]
+        group_ids = [tuple(ids[load_start:load_end]) for ids in block_ids]
         for g_idx, group in enumerate(self._groups):
-            group_blocks = block_ids[g_idx]
-            if group.kind == "attention":
-                group_ids[g_idx] = tuple(
-                    group_blocks[load_start:load_end])
-            else:
+            if group.kind == "mamba":
                 # Restore Mamba state directly into the execution slot (-1 - num_spec),
                 # prepending 0 sentinels so hashes[-1] aligns with the target block ID.
                 num_spec = getattr(group.spec, "num_speculative_blocks", 0)
                 group_ids[g_idx] = tuple(
                     [0] * (load_end - load_start - 1)
-                    + [group_blocks[-1 - num_spec]])
+                    + [block_ids[g_idx][-1 - num_spec]])
         state.num_computed_tokens += num_external_tokens
         self._reqs_to_load.add_request(
             request.request_id,
             tuple(group_ids),
-            [_hash_str(h) for h in state.block_hashes[load_start:load_end]],
+            state.block_hashes[load_start:load_end],
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
         )
@@ -383,7 +377,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             (state.num_computed_tokens + scheduled_tokens) // self.block_size,
             len(state.block_hashes),
         )
-        block_hashes = [_hash_str(h) for h in state.block_hashes[start:end]]
+        block_hashes = state.block_hashes[start:end]
         if block_hashes:
             block_ids = tuple(
                 tuple(ids[start:end]) for ids in state.group_block_ids
@@ -457,46 +451,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         from vllm.model_executor.models.utils import extract_layer_index
 
-        execution_order = sorted(
-            [ln for ln in kv_caches if extract_layer_index(ln) < self.num_layers],
-            key=extract_layer_index,
-        )
-        self._layer_names = list(execution_order)
-        self._mamba_layers = frozenset(
-            ln for g in self._groups if g.kind == "mamba"
-            for ln in g.layer_names)
-        self._attn_order = tuple(
-            ln for ln in execution_order
-            if ln not in self._mamba_layers)
-        self._async_load_order = [ln for ln in execution_order if ln in self._mamba_layers]
-        self._async_load_order.extend(self._attn_order)
-        self._mamba_save_segments = {}
-        self._mamba_load_segments = {}
-        previous_attention = None
-        pending: list[str] = []
-        for ln in execution_order:
-            if ln in self._mamba_layers:
-                pending.append(ln)
-            else:
-                self._mamba_save_segments[ln] = tuple(pending)
-                self._mamba_load_segments[previous_attention] = pending
-                previous_attention = ln
-                pending = []
-        self._mamba_load_segments[previous_attention] = pending
-        self._leading_mamba_layers = self._mamba_load_segments.pop(None)
-        self._last_layer_name = self._attn_order[-1] if self._attn_order else None
-
-        # The store binds base model kv_caches directly.
-        base_kv_caches = {ln: kv_caches[ln] for ln in execution_order}
+        # Exclude speculative draft layers while preserving registration order.
+        kv_caches = {ln: cache for ln, cache in kv_caches.items()
+                     if extract_layer_index(ln) < self.num_layers}
+        self._mamba_layers = self._mamba_layers.intersection(kv_caches)
+        self._last_layer_name = next(reversed(kv_caches))
+        self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            kv_caches=base_kv_caches,
+            kv_caches=kv_caches,
             rank=self.rank,
             tp_size=self.tp_size,
         )
-        logger.info(
-            "Registered %d KV cache layers (%d attention, %d recurrent)",
-            len(execution_order), len(self._attn_order), len(self._mamba_layers))
+        logger.info("Registered %d KV cache layers", len(kv_caches))
 
     def start_load_kv(
         self,
@@ -520,12 +487,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._active_promoted_tasks.update(self._early_promoted_tasks)
             self._early_promoted_tasks = {}
 
-        self._saved_layers = set()
-        self._current_get_tasks = None
-        if not metadata.reqs_to_load.requests:
-            return
-
-        sync_reqs: list[tuple[ReqId, ReqMeta]] = []
+        sync_block_ids: list[int] = []
+        sync_block_hashes: list[str] = []
         async_reqs: list[tuple[ReqId, ReqMeta]] = []
         for req_id, request in metadata.reqs_to_load.requests.items():
             if len(request.group_block_ids) != len(self._groups) or any(
@@ -538,68 +501,44 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if request.is_async:
                 async_reqs.append((req_id, request))
             else:
-                sync_reqs.append((req_id, request))
+                block_ids, block_hashes = request.for_group(0)
+                sync_block_ids.extend(block_ids)
+                sync_block_hashes.extend(block_hashes)
 
         # Submit synchronous (blocking) loads first as a single merged batch so
         # they are enqueued ahead of the asynchronous loads for this pass.
-        sync_tasks: dict[str, Any] = {}
-        for layer_name in self._layer_names:
-            group_idx = self._layer_group[layer_name]
-            sync_block_ids: list[int] = []
-            sync_block_hashes: list[str] = []
-            for req_id, request in sync_reqs:
-                block_ids, block_hashes = request.for_group(group_idx)
-                sync_block_ids.extend(block_ids)
-                sync_block_hashes.extend(block_hashes)
-            if sync_block_ids:
-                sync_tasks.update(self._store().get(
-                    block_indices=sync_block_ids,
-                    block_hashs=sync_block_hashes,
-                    layer_names=[layer_name],
-                    label=f"g{group_idx}",
-                ))
-        if sync_tasks:
-            self._current_get_tasks = sync_tasks
+        self._current_get_tasks = None
+        if sync_block_ids:
+            self._current_get_tasks = self._store().get(
+                block_indices=sync_block_ids,
+                block_hashs=sync_block_hashes,
+            )
 
         # Submit asynchronous loads per request; they are polled across
         # scheduler steps in get_finished().
-        async_tasks: dict[ReqId, dict[str, Any]] = {}
-        # All Mamba prev blocks must land before next-step preprocessing.
-        for layer_name in self._async_load_order:
-            group_idx = self._layer_group[layer_name]
-            for req_id, request in async_reqs:
-                block_ids, block_hashes = request.for_group(group_idx)
-                if not block_ids:
+        for req_id, request in async_reqs:
+            tasks: dict[str, Any] = {}
+            for group in self._groups:
+                block_ids, block_hashes = request.for_group(group.group_idx)
+                layer_names = [ln for ln in self._layer_names if ln in group.layer_names]
+                if not block_ids or not layer_names:
                     continue
-                async_tasks.setdefault(req_id, {}).update(self._store().get(
+                tasks.update(self._store().get(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=[layer_name],
+                    layer_names=layer_names,
                     description=req_id,
-                    label=f"g{group_idx}",
+                    label="mamba" if group.kind == "mamba" else "kv",
                 ))
-        for req_id, request in async_reqs:
-            if req_id in async_tasks:
-                self._pending_load_tasks[req_id] = async_tasks[req_id]
-                self._pending_load_layers[req_id] = request.async_load_layers
-
-        # Sync targets are consumed in layer order; wait only the leading Mamba run.
-        if not sync_tasks:
-            return
-        if self._leading_mamba_layers:
-            if not self._store().get_wait(
-                get_results=sync_tasks, layer_names=self._leading_mamba_layers, wait=True
-            ):
-                raise RuntimeError("Failed to load leading recurrent KV cache")
-        if not self._attn_order:
-            self._current_get_tasks = None
+            self._pending_load_tasks[req_id] = tasks
+            self._pending_load_layers[req_id] = request.async_load_layers
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
             return
 
         # Wait for the synchronous (batched) loads for this layer.
-        if self._current_get_tasks and layer_name in self._current_get_tasks:
+        if self._current_get_tasks:
             success = self._store().get_wait(
                 get_results=self._current_get_tasks,
                 layer_names=[layer_name],
@@ -613,8 +552,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # first N layers were already finalized in get_finished(); waiting on an
         # already-finalized layer is a no-op.
         for tasks in self._active_promoted_tasks.values():
-            if layer_name not in tasks:
-                continue
             success = self._store().get_wait(
                 get_results=tasks,
                 layer_names=[layer_name],
@@ -625,6 +562,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
         if layer_name == self._last_layer_name:
+            self._current_get_tasks = None
             self._active_promoted_tasks = {}
 
     def save_kv_layer(
@@ -634,53 +572,31 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        # The attention post-hook is the last hook before the next Mamba run.
-        if self._current_get_tasks:
-            recurrent = [
-                ln for ln in self._mamba_load_segments.get(layer_name, ())
-                if ln in self._current_get_tasks
-            ]
-            if recurrent and not self._store().get_wait(
-                get_results=self._current_get_tasks, layer_names=recurrent, wait=True
-            ):
-                raise RuntimeError("Failed to load recurrent KV cache")
-            if layer_name == self._last_layer_name:
-                self._store().get_wait(get_results=self._current_get_tasks, wait=True)
-                self._current_get_tasks = None
-
         if self._connector_metadata is None:
             return
 
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
-        if not metadata.reqs_to_save.requests:
-            return
-        for ln in self._mamba_save_segments.get(layer_name, ()):
-            if ln not in self._saved_layers:
-                self.save_kv_layer(ln, None, attn_metadata)
 
-        group_idx = self._layer_group[layer_name]
         for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(group_idx)
+            block_ids, block_hashes = request.for_group(self._layer_group[layer_name])
             if not block_ids:
                 continue
             tasks = self._store().put(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
                 layer_names=[layer_name],
-                label=f"g{group_idx}",
+                label="mamba" if layer_name in self._mamba_layers else "kv",
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
-        self._saved_layers.add(layer_name)
 
     def wait_for_save(self) -> None:
-        """Submit every layer no forward hook covered (recurrent/mamba layers)."""
-        if self._connector_metadata is None:
+        """Submit Mamba states after forward; these layers have no save hook."""
+        if self._connector_metadata is None or not self._mamba_layers:
             return
-        for ln in self._layer_names:
-            if ln not in self._saved_layers:
-                self.save_kv_layer(ln, None, None)
+        for ln in self._mamba_layers:
+            self.save_kv_layer(ln, None, None)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -698,17 +614,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     del self._pending_load_layers[req_id]
                     finished_recving.add(req_id)
             else:
-                # Recurrent layers and first N attention layers must complete
-                # before releasing the request to forward.
-                gate_layers = (
-                    [ln for ln in tasks if ln in self._mamba_layers]
-                    + [ln for ln in self._attn_order
-                       if ln in tasks][:async_load_layers])
+                # Early promote once the first N layers are loaded; the remaining
+                # layers are waited on-demand in wait_for_layer_load().
+                first_n_layers = self._layer_names[:async_load_layers]
                 if self._store().get_wait(
-                    get_results=tasks, layer_names=gate_layers, wait=False
+                    get_results=tasks, layer_names=first_n_layers, wait=False
                 ):
                     self._store().get_wait(
-                        get_results=tasks, layer_names=gate_layers, wait=True
+                        get_results=tasks, layer_names=first_n_layers, wait=True
                     )
                     del self._pending_load_tasks[req_id]
                     del self._pending_load_layers[req_id]
