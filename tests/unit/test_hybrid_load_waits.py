@@ -1,207 +1,154 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""When each kind of layer is waited for.
-
-vLLM calls ``wait_for_layer_load`` only at ATTENTION layers, never at
-GDN/mamba ones. So the two are waited differently:
-
-- attention pages stay pipelined -- each layer's hook waits its own
-  pages, right before that layer reads them;
-- leading GDN pages are waited in ``start_load``; later GDN runs are
-  waited at the preceding attention post-hook, before they execute.
-
-Anything left un-waited at the end of a step is a fail-stop: it would
-mean forward read unrestored state.
-
-Pure logic: fake store and canonicalizer, no GPU, no disk, no model.
-"""
-
-from __future__ import annotations
+"""Mamba loads finish across steps; only pure attention uses layer waits."""
 
 import pytest
+from types import SimpleNamespace
 
 from conftest import HybridWorker, drive_start_load, make_spec
 from kvshrink.kvshrink_connector import (
-    RequestMetadata, GroupInfo, KVShrinkConnectorMetadata, ReqMeta)
-
-PAGE = 4096
+    GroupInfo, KVShrinkConnectorMetadata, ReqMeta, RequestMetadata)
 
 
-def _group(g_idx, kind, layers):
-    return GroupInfo(
-        group_idx=g_idx, kind=kind, layer_names=tuple(layers),
-        spec=make_spec(kind, 16))
+def _group(index, kind, layers):
+    return GroupInfo(index, kind, tuple(layers), make_spec(kind, 16))
 
 
 class _FakeStore:
-    """Records submits and the ORDER in which tasks are waited."""
+    def __init__(self, layers):
+        self.layers = layers
+        self.submitted = []
+        self.waited = []
+        self.landed = set()
 
-    def __init__(self, committed=True):
-        self.submitted = []          # layer names, in submit order
-        self.waited = []             # layer names, in wait order
-        self.committed = committed
-        self.pending = set()
-
-    def get(self, block_indices, block_hashs, layer_names,
+    def get(self, block_indices, block_hashs, layer_names=None,
             label=None, description=""):
-        self.submitted.extend(layer_names)
-        self.pending.update(layer_names)
-        return {k: f"task:{k}" for k in layer_names}
+        layers = self.layers if layer_names is None else layer_names
+        self.submitted.append((label, list(layers), list(block_indices)))
+        return {ln: ln for ln in layers}
 
     def get_wait(self, get_results, layer_names=None, wait=True):
-        for k in (layer_names if layer_names is not None else get_results.keys()):
-            if k in self.pending:
-                self.waited.append(k)
-                self.pending.remove(k)
+        layers = list(get_results) if layer_names is None else layer_names
+        assert set(layers) <= get_results.keys()
+        if not wait:
+            return set(layers) <= self.landed
+        self.waited.extend(layers)
         return True
 
-    def has(self, chunk_labels, label=None):
-        return [self.committed]
+
+def _worker(groups, order):
+    worker = HybridWorker(groups, order)
+    worker.kvstore = _FakeStore(order)
+    return worker
 
 
-# Execution order: a leading GDN layer, then attention, more GDN, and a
-# final attention layer with nothing after it.
-ORDER = ["m0", "a1", "m2", "m3", "a4"]
-ATTN = ["a1", "a4"]
-GDN = ["m0", "m2", "m3"]
+def _meta(group_ids, is_async=True):
+    requests = RequestMetadata()
+    requests.requests["r1"] = ReqMeta(
+        group_block_ids=group_ids, block_hashes=["7"],
+        is_async=is_async, async_load_layers=-1)
+    return KVShrinkConnectorMetadata(requests, RequestMetadata())
 
 
-def _worker(store=None, order=ORDER, gdn=None):
-    """Worker whose groups match ``order`` unless ``gdn`` overrides the
-    mamba membership (used to test an unplaceable GDN layer)."""
-    attn = [ln for ln in order if ln in ATTN]
-    groups = [_group(0, "attention", attn),
-              _group(1, "mamba", gdn if gdn is not None
-                     else [ln for ln in order if ln in GDN])]
-    w = HybridWorker(groups, {ln: None for ln in order},
-                     rank=0, tp_size=1)
-    w.kvstore = store or _FakeStore()
-    return w
+def test_metadata_snapshots_hashes_without_mutating_request():
+    hashes = [b"\x01\xff", 42]
+    requests = RequestMetadata()
+    requests.add_request("r1", ((5, 6),), hashes, is_async=True)
+    hashes.append(43)
+    assert requests.requests["r1"].block_hashes == ["01ff", "42"]
+    assert hashes == [b"\x01\xff", 42, 43]
 
 
-def _load_meta(group_idx, req_id="r1"):
-    """One load plan: a single block for group ``group_idx`` (the
-    group's own config decides which layers it reaches)."""
-    group_ids = [(), ()]
-    group_ids[group_idx] = ("5",)
-    md = RequestMetadata()
-    md.requests[req_id] = ReqMeta(
-        block_hashes=["7"], group_block_ids=tuple(group_ids))
-    return KVShrinkConnectorMetadata(reqs_to_load=md, reqs_to_save=RequestMetadata())
-
-
-# ------------------------------------------------------------------
-# registration
-# ------------------------------------------------------------------
-
-def test_recurrent_layers_are_recorded():
-    w = _worker()
-    assert w._mamba_layers == frozenset(GDN)
-
-
-def test_attention_execution_order_is_recorded():
-    """The async release gate holds a request until its first N layers
-    have landed, which is a statement about position."""
-    w = _worker(order=["m0", "a1", "m2", "m3", "a4"])
-    assert w._attn_order == ("a1", "a4")
-
-
-# ------------------------------------------------------------------
-# load scheduling
-# ------------------------------------------------------------------
-
-def test_only_leading_recurrent_layers_are_waited_before_forward():
-    be = _FakeStore()
-    w = _worker(be)
-    drive_start_load(w, _load_meta(1))
-    assert sorted(be.submitted) == sorted(GDN)
-    assert be.waited == ["m0"], be.waited
-    # the batch stays open until the last attention hook (main's rule)
-    assert set(w._current_get_tasks) == set(GDN)
-
-
-def test_attention_pages_stay_pipelined():
-    """Attention keeps its per-layer hook: its pages are waited when
-    the layer is about to read them, not up front."""
-    be = _FakeStore()
-    w = _worker(be)
-    meta = _load_meta(0)
-    meta.reqs_to_load.requests.update(
-        _load_meta(1, req_id="r2").reqs_to_load.requests)
-    drive_start_load(w, meta)
-    assert be.submitted == ORDER
-    assert be.waited == ["m0"], be.waited
-
-    w.wait_for_layer_load("a1")
-    assert be.waited == ["m0", "a1"]
-    assert be.pending == {"m2", "m3", "a4"}
-    w.save_kv_layer("a1", None, None)
-    assert be.waited == ["m0", "a1", "m2", "m3"]
-    assert be.pending == {"a4"}
-    w.wait_for_layer_load("a4")
-    assert be.waited[-1] == "a4"
-    w.save_kv_layer("a4", None, None)
-    assert not be.pending
-    assert w._current_get_tasks is None
-
-
-@pytest.mark.parametrize("order,gdn,leading", [
-    (["m0", "m2", "a1", "m3"], ["m0", "m2", "m3"], ["m0", "m2"]),
-    (["a1", "m2", "m3"], ["m2", "m3"], []),
-    (["m0", "m2", "m3"], ["m0", "m2", "m3"], ["m0", "m2", "m3"]),
+@pytest.mark.parametrize("order", [
+    ["m0", "a1", "m2"], ["a1", "m0", "m2"], ["m0", "m2"],
 ])
-def test_sync_leading_and_trailing_mamba_without_save_requests(order, gdn, leading):
-    store = _FakeStore()
-    worker = _worker(store, order=order, gdn=gdn)
-    drive_start_load(worker, _load_meta(1))
-    assert store.waited == leading
+def test_mamba_layers_finish_before_forward_regardless_of_order(order):
+    groups = [_group(0, "mamba", ["m0", "m2"])]
+    ids = ((5,),)
     if "a1" in order:
-        worker.wait_for_layer_load("a1")
-        assert store.waited == leading
-        worker.save_kv_layer("a1", None, None)
-    assert not store.pending
+        groups.append(_group(1, "attention", ["a1"]))
+        ids += ((6,),)
+    worker = _worker(groups, order)
+    store = worker.kvstore
+    drive_start_load(worker, _meta(ids))
+    assert store.waited == []
+    assert worker._current_get_tasks is None
+    store.landed = set(order) - {"m2"}
+    assert worker.get_finished(set())[1] is None
+    store.landed.add("m2")
+    assert worker.get_finished(set())[1] == {"r1"}
+    assert set(store.waited) == set(order)
+    assert not worker._early_promoted_tasks
+    assert not worker._pending_load_tasks
+
+
+def test_attention_sync_pages_stay_pipelined():
+    worker = _worker([_group(0, "attention", ["a0", "a1"])], ["a0", "a1"])
+    drive_start_load(worker, _meta(((5,),), is_async=False))
+    assert worker.kvstore.submitted == [(None, ["a0", "a1"], [5])]
+    assert worker.kvstore.waited == []
+    worker.wait_for_layer_load("a0")
+    assert worker.kvstore.waited == ["a0"]
+    worker.wait_for_layer_load("a1")
+    assert worker.kvstore.waited == ["a0", "a1"]
     assert worker._current_get_tasks is None
 
 
-def test_later_recurrent_failure_raises_before_next_mamba_run():
-    store = _FakeStore()
-    worker = _worker(store)
-    drive_start_load(worker, _load_meta(1))
-    store.get_wait = lambda **kwargs: False
-    with pytest.raises(RuntimeError, match="recurrent KV cache"):
-        worker.save_kv_layer("a1", None, None)
-
-
 def test_mismatched_load_metadata_is_rejected_before_submission():
-    store = _FakeStore()
-    worker = _worker(store)
-    metadata = _load_meta(1)
+    worker = _worker([_group(0, "mamba", ["m0"])], ["m0"])
+    metadata = _meta(((5,),))
     metadata.reqs_to_load.requests["r1"].block_hashes.append("8")
     with pytest.raises(ValueError, match="Mismatched block metadata"):
         drive_start_load(worker, metadata)
-    assert store.submitted == []
+    assert worker.kvstore.submitted == []
 
 
-def test_failed_blocking_wait_raises():
-    """An incomplete transfer at a blocking wait is fatal (EngineCore
-    dies), same contract as the original path."""
-    be = _FakeStore()
+def test_failed_async_wait_raises():
+    worker = _worker([_group(0, "mamba", ["m0"])], ["m0"])
+    drive_start_load(worker, _meta(((5,),)))
 
-    def _boom(get_results, layer_names=None, wait=True):
+    def fail(**kwargs):
         raise RuntimeError("h2d failed")
 
-    be.get_wait = _boom
-    w = _worker(be)
+    worker.kvstore.get_wait = fail
     with pytest.raises(RuntimeError, match="h2d failed"):
-        drive_start_load(w, _load_meta(1))
+        worker.get_finished(set())
 
 
-def test_attention_layers_of_an_idle_group_get_no_call():
-    """A group with nothing to load (empty block ids) contributes no
-    engine call for its layers -- regression: an empty op once produced
-    a get with no tensors, tripping the engine's not-empty assert."""
-    be = _FakeStore()
-    w = _worker(be)
-    drive_start_load(w, _load_meta(1))
-    assert not (set(ATTN) & set(be.submitted)), be.submitted
+def test_idle_group_gets_no_call():
+    worker = _worker([
+        _group(0, "attention", ["a0"]), _group(1, "mamba", ["m0"]),
+    ], ["a0", "m0"])
+    drive_start_load(worker, _meta(((), (5,))))
+    assert worker.kvstore.submitted == [("mamba", ["m0"], [5])]
+
+
+def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
+    import torch
+    import kvshrink.kvshrink_connector as module
+
+    attn, mamba, draft = "model.layers.1", "model.layers.0", "model.layers.2"
+    worker = _worker([
+        _group(0, "attention", [attn]), _group(1, "mamba", [mamba, draft]),
+    ], [attn, mamba, draft])
+    worker.num_layers = 2
+    worker.model_config = SimpleNamespace(model="test-model")
+    worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(
+        static_forward_context={}))
+    caches = {attn: torch.empty(2, 1), mamba: [torch.empty(2, 1)],
+              draft: [torch.empty(2, 1)]}
+    captured = {}
+
+    def store(**kwargs):
+        captured.update(kwargs)
+        return _FakeStore(list(kwargs["kv_caches"]))
+
+    monkeypatch.setattr(module, "KVStore", store)
+    worker.register_kv_caches(caches)
+    assert worker._layer_names == [attn, mamba]
+    assert worker._mamba_layers == {mamba}
+    assert list(captured["kv_caches"]) == [attn, mamba]
+    drive_start_load(worker, _meta(((5,), (6,))))
+    assert worker.kvstore.submitted == [
+        ("kv", [attn], [5]), ("mamba", [mamba], [6])]

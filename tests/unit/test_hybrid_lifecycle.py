@@ -204,7 +204,7 @@ def test_abort_keeps_committed_boundary_hittable():
     sched.request_finished(
         type("R", (), {"request_id": "r1"})(), [])  # abort
     # a fresh lookup for the same hashes still hits
-    assert store.has(["0"], label="g0") == [True]
+    assert store.has(["0"], label="kv") == [True]
 
 
 def test_abort_resume_stress_1000_iterations_zero_residue():

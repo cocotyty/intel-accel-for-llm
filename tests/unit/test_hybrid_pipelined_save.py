@@ -2,9 +2,8 @@
 
 vLLM calls save_kv_layer on exit of every attention layer during
 forward. The connector submits that layer's async put immediately
-(overlapping the remaining layers' compute); the mamba segment
-preceding an attention layer rides the same hook, and the trailing
-segment submits in wait_for_save (post-forward). Nothing is waited
+(overlapping the remaining layers' compute); all mamba layers
+submit in wait_for_save (post-forward). Nothing is waited
 inside the step: writes drain in get_finished, which also releases
 finished requests' blocks (finished_sending). These tests use a fake
 store and fake canonicalizer -- no GPU, no disk, no model.
@@ -85,7 +84,7 @@ def test_pipelined_attention_submits_during_forward():
     assert ["a0", "a1"] not in submit_layers  # no bulk re-submit
     assert ["m0"] in submit_layers
     # every group was submitted; nothing waited inside the step
-    assert {l for l, _ls, _b in c.kvstore.submits} == {"g0", "g1"}
+    assert {l for l, _ls, _b in c.kvstore.submits} == {"kv", "mamba"}
     assert c.kvstore.waits == 0
     # the drain is what waits, and it releases the finished request
     sending, _ = c.get_finished({"r1"})
@@ -93,47 +92,37 @@ def test_pipelined_attention_submits_during_forward():
     assert c.kvstore.waits > 0
 
 
-def test_fallback_when_hook_never_fired():
-    """Older vLLM / decorator missing: attention submits post-forward,
-    commits still correct (idempotent full coverage)."""
+def test_post_forward_submits_only_mamba():
+    """Attention saves require their forward hooks, as on main."""
     c = _worker()
     c.bind_connector_metadata(_save_meta())  # no save_kv_layer first
     c.wait_for_save()
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
-    # every layer goes out in its own post-forward call
-    assert ["a0"] in submit_layers
-    assert ["a1"] in submit_layers
-    assert ["m0"] in submit_layers
-    assert len(c.kvstore.submits) == 3
+    assert submit_layers == [["m0"]]
 
 
-def test_mamba_segment_rides_the_next_attention_hook():
-    """Mamba layers before an attention layer are final when its save
-    hook fires, so they submit there instead of post-forward."""
+def test_mamba_waits_until_post_forward():
+    """Attention hooks do not submit Mamba states."""
     c = _worker()
-    c._mamba_save_segments = {"a0": ("m0",)}
     meta = _save_meta()
     c.bind_connector_metadata(meta)
     c.save_kv_layer("a0", None, None)
     submit_layers = [sorted(v) for _g, v, _l in c.kvstore.submits]
-    assert ["m0"] in submit_layers  # mamba segment piggybacked on the hook
-    assert ["a0"] in submit_layers
+    assert submit_layers == [["a0"]]
     c.save_kv_layer("a1", None, None)
     c.wait_for_save()
-    # everything submitted during forward; nothing left post-forward
+    assert c.kvstore.submits[-1][1] == ["m0"]
     assert len(c.kvstore.submits) == 3
 
 
-def test_mamba_segment_splits_by_group():
-    """A segment between two attention layers interleaves the mamba
-    groups; each group's layers must go under their own store label."""
+def test_post_forward_saves_all_mamba_groups():
+    """All Mamba groups use the mamba namespace after forward."""
     groups = [_group(0, "attention", ["a0", "a1"]),
               _group(1, "mamba", ["m0"]),
               _group(2, "mamba", ["m1"])]
     c = HybridWorker(groups, {ln: None for ln in ("a0", "a1", "m0", "m1")},
                      rank=0, tp_size=1)
     c.kvstore = _FakeStore()
-    c._mamba_save_segments = {"a0": ("m0", "m1")}
     saves = RequestMetadata()
     saves.requests["r1"] = ReqMeta(
         block_hashes=["777"],
@@ -141,10 +130,10 @@ def test_mamba_segment_splits_by_group():
     c.bind_connector_metadata(KVShrinkConnectorMetadata(
         reqs_to_load=RequestMetadata(), reqs_to_save=saves))
     c.save_kv_layer("a0", None, None)
-    by_label = {l: layers for l, layers, _h in c.kvstore.submits}
-    assert by_label["g1"] == ["m0"]
-    assert by_label["g2"] == ["m1"]
-    assert by_label["g0"] == ["a0"]
+    assert c.kvstore.submits == [("kv", ["a0"], ["777"])]
+    c.wait_for_save()
+    assert sorted(c.kvstore.submits[1:]) == [
+        ("mamba", ["m0"], ["777"]), ("mamba", ["m1"], ["777"])]
 
 
 def test_write_is_the_commit():

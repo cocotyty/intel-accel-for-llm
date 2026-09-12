@@ -72,19 +72,21 @@ class _FakeStore:
         return [True]
 
 
-def _worker(store):
-    groups = [_group(0, "attention", ATTN), _group(1, "mamba", GDN)]
-    w = HybridWorker(groups, {ln: None for ln in ORDER},
+def _worker(store, hybrid=True):
+    groups = [_group(0, "attention", ATTN)]
+    if hybrid:
+        groups.append(_group(1, "mamba", GDN))
+    w = HybridWorker(groups, {ln: None for ln in (ORDER if hybrid else ATTN)},
                      rank=0, tp_size=1)
     w.kvstore = store
     return w
 
 
-def _meta(async_layers, req_id="r1"):
+def _meta(async_layers=-1, req_id="r1", hybrid=True):
     """A load plan covering every layer, split per group."""
     md = RequestMetadata()
     md.requests[req_id] = ReqMeta(
-        block_hashes=["7"], group_block_ids=(("5",), ("5",)),
+        block_hashes=["7"], group_block_ids=(("5",), ("5",)) if hybrid else (("5",),),
         is_async=True, async_load_layers=async_layers)
     return KVShrinkConnectorMetadata(reqs_to_load=md, reqs_to_save=RequestMetadata())
 
@@ -92,28 +94,32 @@ def _meta(async_layers, req_id="r1"):
 # ------------------------------------------------------------------
 # the recurrent-state constraint
 # ------------------------------------------------------------------
-def test_gate_covers_every_recurrent_layer_despite_short_prefix():
-    """Asking to release after ONE attention layer must still wait for
-    all GDN state: it is consumed whole at the start of forward."""
+def test_hybrid_waits_for_attention_tail_too():
+    """Mamba requests require all layers, including trailing attention."""
     b = _FakeStore()
     w = _worker(b)
-    drive_start_load(w, _meta(async_layers=1))
-    assert w._pending_load_layers["r1"] == 1
+    drive_start_load(w, _meta())
+    assert w._pending_load_layers["r1"] == -1
 
     # the gate lands: every recurrent layer plus exactly the first
     # attention layer in execution order
     b.landed = {"a1", *GDN}
     _, recving = w.get_finished(set())
+    assert recving is None
+    assert b.waited == []
+    b.landed.add("a3")
+    _, recving = w.get_finished(set())
     assert recving == {"r1"}
-    assert set(b.waited) == {"a1", "m0", "m2"}, b.waited
+    assert set(b.waited) == set(ORDER)
+    assert not w._early_promoted_tasks
 
 
 def test_not_released_until_recurrent_state_has_landed():
     b = _FakeStore()
     w = _worker(b)
-    drive_start_load(w, _meta(async_layers=1))
+    drive_start_load(w, _meta())
 
-    b.landed = {"a1"}                      # attention prefix only
+    b.landed = set(ATTN)                   # attention only
     _, recving = w.get_finished(set())
     assert not recving
 
@@ -122,14 +128,14 @@ def test_not_released_until_recurrent_state_has_landed():
     assert recving == {"r1"}, recving
 
 
-def test_async_queues_all_mamba_before_attention_across_requests():
+def test_async_queues_groups_per_request():
     store = _FakeStore()
     worker = _worker(store)
-    metadata = _meta(async_layers=1)
-    metadata.reqs_to_load.requests.update(_meta(1, "r2").reqs_to_load.requests)
+    metadata = _meta()
+    metadata.reqs_to_load.requests.update(_meta(-1, "r2").reqs_to_load.requests)
     drive_start_load(worker, metadata)
     assert store.submitted == [
-        (layer, req_id) for layer in GDN + ATTN for req_id in ("r1", "r2")
+        (layer, req_id) for req_id in ("r1", "r2") for layer in ATTN + GDN
     ]
     assert store.waited == []
     store.landed = {"m0", *ATTN}
@@ -157,7 +163,7 @@ def test_async_tasks_live_outside_the_step_tasks():
     per-step _current_get_tasks drained by the layer hooks."""
     b = _FakeStore()
     w = _worker(b)
-    drive_start_load(w, _meta(async_layers=1))
+    drive_start_load(w, _meta())
     assert w._current_get_tasks is None
     assert "r1" in w._pending_load_tasks
 
@@ -165,36 +171,37 @@ def test_async_tasks_live_outside_the_step_tasks():
 def test_sync_loads_queue_ahead_of_async_loads():
     """The engine stream runs transfers FIFO, so submission order is
     the service order: this pass's blocking loads must all be enqueued
-    before a parked request's, one call per layer, in execution order
-    (the order forward consumes the layers)."""
+    before a parked request's, with sync requests merged in one call."""
     calls = []
 
     class _Recorder(_FakeStore):
-        def get(self, block_indices, block_hashs, layer_names,
-                label=None, description=""):
-            calls.append((layer_names[0], block_indices[0]))
+        def get(self, block_indices, block_hashs, layer_names=None,
+                 label=None, description=""):
+            layer_names = layer_names or ATTN
+            calls.append((list(layer_names), list(block_indices)))
             return super().get(block_indices, block_hashs,
                                layer_names, label, description)
 
-    w = _worker(_Recorder())
+    w = _worker(_Recorder(), hybrid=False)
     md = RequestMetadata()
     md.requests["sync1"] = ReqMeta(
-        block_hashes=["7"], group_block_ids=(("5",), ("5",)))
+        block_hashes=["7"], group_block_ids=(("5",),))
+    md.requests["sync2"] = ReqMeta(
+        block_hashes=["8"], group_block_ids=(("6",),))
     md.requests["async1"] = ReqMeta(
-        block_hashes=["7"], group_block_ids=(("9",), ("9",)),
+        block_hashes=["7"], group_block_ids=(("9",),),
         is_async=True, async_load_layers=1)
     drive_start_load(w, KVShrinkConnectorMetadata(
         reqs_to_load=md, reqs_to_save=RequestMetadata()))
 
-    assert calls == ([(ln, "5") for ln in ORDER]
-                     + [(ln, "9") for ln in GDN + ATTN])
+    assert calls == [(ATTN, ["5", "6"]), (ATTN, ["9"])]
 
 
 def test_remaining_layers_are_drained_by_the_layer_hooks():
     b = _FakeStore()
-    w = _worker(b)
-    drive_start_load(w, _meta(async_layers=1))
-    b.landed = set(ORDER)
+    w = _worker(b, hybrid=False)
+    drive_start_load(w, _meta(async_layers=1, hybrid=False))
+    b.landed = {"a1"}
     _, recving = w.get_finished(set())
     assert recving == {"r1"}
 
@@ -202,8 +209,8 @@ def test_remaining_layers_are_drained_by_the_layer_hooks():
     assert "a3" not in b.waited
     assert "r1" in w._early_promoted_tasks
     # main: the next start_load_kv promotes early -> active
-    w._active_promoted_tasks.update(w._early_promoted_tasks)
-    w._early_promoted_tasks = {}
+    drive_start_load(w, KVShrinkConnectorMetadata(RequestMetadata(), RequestMetadata()))
+    b.landed.add("a3")
     w.wait_for_layer_load("a3")
     assert "a3" in b.waited
     # a3 is the last attention layer: the promoted book is cleared
@@ -217,7 +224,7 @@ def test_failed_transfer_raises_at_poll():
     b = _FakeStore()
     b.fail_on = {"m0"}
     w = _worker(b)
-    drive_start_load(w, _meta(async_layers=1))
+    drive_start_load(w, _meta())
     b.landed = set(ORDER)
 
     with pytest.raises(RuntimeError, match="transfer failed"):
@@ -293,18 +300,14 @@ def test_async_plan_is_emitted_only_once():
         _empty_out()).reqs_to_load.requests == {}
 
 
-def test_recurrent_models_can_go_async():
-    """Recurrent groups do NOT force synchronous loading.
-
-    The transfer is a DMA; it needs no forward step. What it needs is to
-    land in the slot vLLM will read, which it does -- see
-    test_async_mamba_targets_the_slot_vllm_reads_as_prev.
-    """
+@pytest.mark.parametrize("selected_layers", [0, 1, 4, -1])
+def test_recurrent_models_force_full_async(selected_layers):
+    """Both disabled async and early-start configs become full async."""
     from conftest import HybridRequestScheduler
 
     class _Cfg:
         def select(self, concurrency):
-            return 4
+            return selected_layers
 
     class _Req:
         request_id = "r1"
@@ -316,6 +319,7 @@ def test_recurrent_models_can_go_async():
         _FakeStore(), 16, async_load_config=_Cfg())
     external, use_async = hybrid.get_num_new_matched_tokens(_Req(), 0)
     assert external == 32 and use_async is True
+    assert hybrid._req_states["r1"].async_load_layers == -1
 
 
 def test_async_mamba_targets_the_slot_vllm_reads_as_prev():

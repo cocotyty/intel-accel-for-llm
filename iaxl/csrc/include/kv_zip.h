@@ -10,8 +10,7 @@ namespace kv_zip {
 
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
                                                      std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
-                                                     bool compress = true,
-                                                     bool lossy_trunc_enabled = false);
+                                                     bool compress = true);
 
 void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
                                                          const std::vector<torch::Tensor> &tensors);

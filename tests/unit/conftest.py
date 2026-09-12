@@ -74,11 +74,10 @@ def HybridRequestScheduler(groups, store, block_size,
 
     conn = object.__new__(KVShrinkConnector)
     conn._groups = list(groups)
+    conn._has_mamba = any(g.kind == "mamba" for g in groups)
     conn.kvstore = store
     conn.block_size = block_size
     conn._async_load_layer_config = async_load_config or AsyncLoadLayerConfig(enabled=False)
-    conn._num_attn_layers = sum(
-        len(g.layer_names) for g in groups if g.kind != "mamba")
     conn._req_states = {}
     conn._reqs_to_load = RequestMetadata()
     conn._reqs_to_save = RequestMetadata()
@@ -130,7 +129,6 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._groups = list(groups)
     conn.rank = rank
     conn.tp_size = tp_size
-    conn._labels = [f"g{g.group_idx}" for g in groups]
     conn.kvstore = None
     order = list(layer_infos.keys() if isinstance(layer_infos, dict) else layer_infos)
     conn._layer_names = order
@@ -143,30 +141,7 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
         ln: g.group_idx for g in groups for ln in g.layer_names}
     conn._mamba_layers = frozenset(
         ln for g in groups if g.kind == "mamba" for ln in g.layer_names)
-    conn._attn_order = tuple(
-        ln for ln in order if ln not in conn._mamba_layers)
-    first_attention = (order.index(conn._attn_order[0])
-                       if conn._attn_order else len(order))
-    conn._leading_mamba_layers = order[:first_attention]
-    conn._async_load_order = [ln for ln in order if ln in conn._mamba_layers]
-    conn._async_load_order.extend(conn._attn_order)
-    segments = {}
-    pending = []
-    for ln in order:
-        if ln in conn._mamba_layers:
-            pending.append(ln)
-        elif pending:
-            segments[ln] = tuple(pending)
-            pending = []
-    conn._mamba_save_segments = segments
-    conn._mamba_load_segments = {}
-    for index, layer_name in enumerate(conn._attn_order):
-        start = order.index(layer_name) + 1
-        end = (order.index(conn._attn_order[index + 1])
-               if index + 1 < len(conn._attn_order) else len(order))
-        conn._mamba_load_segments[layer_name] = order[start:end]
-    conn._last_layer_name = conn._attn_order[-1] if conn._attn_order else None
-    conn._saved_layers = set()
+    conn._last_layer_name = order[-1] if order else None
     conn._current_put_tasks = {}
     conn._deferred_finished_req_ids = set()
     conn._connector_metadata = None
