@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-import os
-
 import torch
 import numpy as np
 from typing import Dict, List, Optional
@@ -58,6 +56,7 @@ class KVStore:
         rank: int = 0,
         tp_size: int = 1,
     ):
+
         if kv_caches is None and layer_names is None:
             raise ValueError(
                 "At least one of kv_caches or layer_names must be provided"
@@ -76,7 +75,7 @@ class KVStore:
         self.tp_size = tp_size
 
         if kv_caches is not None:
-            self.layer_names = list(self.kv_caches.keys())
+            self.layer_names = list(kv_caches.keys())
         else:
             self.layer_names = layer_names
 
@@ -159,6 +158,7 @@ class KVStore:
         description: str = "",
         label: Optional[str] = None,
     ) -> Dict[str, Task]:
+
         if self.has_only_mode:
             raise RuntimeError(
                 "put() not available in has-only mode (kv_caches not provided)"

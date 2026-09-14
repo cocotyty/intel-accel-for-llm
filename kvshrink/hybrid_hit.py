@@ -31,12 +31,9 @@ class _StoreAsBlockPool:
     def get_cached_block(
         self, block_hash: object, kv_cache_group_ids: list[int],
     ) -> Optional[list[object]]:
-        blocks = []
-        for group_id in kv_cache_group_ids:
-            if not self._present(group_id, block_hash):
-                return None
-            blocks.append(_StoreAsBlockPool.null_block)
-        return blocks
+        if all(self._present(group_id, block_hash) for group_id in kv_cache_group_ids):
+            return [self.null_block] * len(kv_cache_group_ids)
+        return None
 
 
 class HybridHitPolicy:
@@ -50,8 +47,7 @@ class HybridHitPolicy:
         num_computed_tokens: int,
     ):
         """Configure the policy for one request."""
-        self._groups: list[GroupInfo] = groups
-        self._present: Callable[[int, object], bool] = present
+        self._block_pool = _StoreAsBlockPool(present)
         self._block_size: int = block_size
         self._num_computed: int = num_computed_tokens
         # full attention first (tighter initial bound)
@@ -77,7 +73,7 @@ class HybridHitPolicy:
             block_hashes=block_hashes,
             max_length=max_length,
             kv_cache_group_ids=[group.group_idx],
-            block_pool=_StoreAsBlockPool(self._present),
+            block_pool=self._block_pool,
             kv_cache_spec=group.spec,
             drop_eagle_block=False,
             alignment_tokens=self._block_size,
@@ -96,14 +92,10 @@ class HybridHitPolicy:
             candidate = (candidate - 1) // self._block_size * self._block_size
 
         while True:
-            changed = False
+            previous = candidate
             for group in self._ordered:
-                hit = self._lookup(group, block_hashes, candidate)
-                if hit < candidate:
-                    candidate = hit
-                    changed = True
+                candidate = min(candidate, self._lookup(group, block_hashes, candidate))
                 if candidate <= self._num_computed:
                     return 0
-            if not changed:
-                break
-        return candidate if candidate > self._num_computed else 0
+            if candidate == previous:
+                return candidate if candidate > self._num_computed else 0

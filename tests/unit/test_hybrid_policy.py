@@ -184,3 +184,25 @@ def test_multiple_attention_groups_converge_to_zero():
     b, hashes = _group_aware({(0, 0), (0, 1)}, 4)
     policy = HybridHitPolicy(groups, b, 32, 0)
     assert policy.find_longest_cache_hit(hashes, 128) == 0
+
+
+def test_multiple_mamba_groups_match_exhaustive_boundary_search():
+    """Independent oracle: every restored boundary needs both state snapshots."""
+    groups = [_group(0, "attention", 16), _group(1, "mamba", 16),
+              _group(2, "mamba", 16)]
+    hashes = list(range(3))
+    for mask in range(1 << 9):
+        present = {(g, h) for g in range(3) for h in hashes
+                   if mask & (1 << (g * 3 + h))}
+        for max_length in (48, 49):
+            for computed in (0, 16):
+                expected = max((
+                    boundary for boundary in (16, 32, 48)
+                    if computed < boundary < max_length
+                    and all((0, h) in present for h in range(boundary // 16))
+                    and all((g, boundary // 16 - 1) in present for g in (1, 2))
+                ), default=0)
+                policy = HybridHitPolicy(
+                    groups, lambda g, h: (g, h) in present, 16, computed)
+                assert policy.find_longest_cache_hit(hashes, max_length) == expected, (
+                    mask, max_length, computed)
