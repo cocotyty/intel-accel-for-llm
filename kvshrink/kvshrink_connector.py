@@ -65,7 +65,6 @@ class ReqState:
     num_computed_tokens: int = 0
     # Reference to the vLLM request's block_hashes list.
     block_hashes: list = field(default_factory=list)
-    num_prompt_tokens: int = 0
     group_block_ids: list[list[int]] = field(default_factory=list)
     is_async: bool = False
     async_load_layers: int = -1
@@ -278,7 +277,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
             block_hashes=request.block_hashes,
-            num_prompt_tokens=request.num_prompt_tokens,
         )
         self._req_states[request.request_id] = state
         policy = HybridHitPolicy(
@@ -401,10 +399,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
+        # A request's first schedule is always prefill. The > 1 also skips
+        # the full-hit case (all but one token restored): its one computed
+        # block can never serve a hit under the last-token exclusion.
         for request in scheduler_output.scheduled_new_reqs:
-            state = self._req_states[request.req_id]
-            if (scheduler_output.num_scheduled_tokens[request.req_id] > 1
-                    and state.num_computed_tokens < state.num_prompt_tokens):
+            if scheduler_output.num_scheduled_tokens[request.req_id] > 1:
                 self._add_request_to_save(
                     request.req_id, scheduler_output.num_scheduled_tokens[request.req_id]
                 )
@@ -417,9 +416,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             block_ids = cached_reqs.new_block_ids[index]
             state = self._req_states[req_id]
             state.num_computed_tokens = cached_reqs.num_computed_tokens[index]
-            # MTP decode can schedule multiple tokens after the prompt is complete.
+            # num_output_tokens counts async-scheduling placeholders, which
+            # are only added for decode steps -- 0 means still in prefill.
+            # This filters MTP decode, which schedules 1 + num_spec > 1.
             is_prefill = (scheduler_output.num_scheduled_tokens[req_id] > 1
-                          and state.num_computed_tokens < state.num_prompt_tokens)
+                          and cached_reqs.num_output_tokens[index] == 0)
             if not is_prefill:
                 continue
             if block_ids:

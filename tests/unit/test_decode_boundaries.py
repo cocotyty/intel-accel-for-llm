@@ -36,11 +36,10 @@ class _LiveRequest:
         self.block_hashes = list(hashes)
 
 
-def _state(sched, live, hashes, num_prompt_tokens=32):
+def _state(sched, live, hashes):
     st = ReqState(
         block_hashes=(live.block_hashes
                            if live is not None else list(hashes)),
-        num_prompt_tokens=num_prompt_tokens,
         group_block_ids=[[] for _ in sched._groups])
     sched._req_states["r1"] = st
     return st
@@ -62,7 +61,7 @@ def test_save_plan_ignores_decode_boundaries():
     build_save_meta emits empty plan."""
     sched = _sched()
     live = _LiveRequest([1, 2])
-    st = _state(sched, live, [1, 2], num_prompt_tokens=32)
+    st = _state(sched, live, [1, 2])
     st.group_block_ids[0] = [10, 11, 12, 13]
 
     live.block_hashes.extend([3, 4])       # two blocks produced by decode

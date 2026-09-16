@@ -28,25 +28,23 @@ PAGE = 64 * 1024
 
 
 @pytest.mark.parametrize("new_request", [True, False])
-@pytest.mark.parametrize("computed,scheduled,expect_save", [
-    (0, 16, True),
-    (16, 16, True),
-    (32, 1, False),
-    (32, 2, False),
-    (48, 4, False),
+@pytest.mark.parametrize("scheduled,num_output,expect_save", [
+    (16, 0, True),   # prefill chunk
+    (1, 0, False),   # full-hit minus one token: nothing new worth saving
+    (2, 1, False),   # MTP decode: 1 + 1 spec
+    (4, 2, False),   # MTP decode: 1 + 3 spec
 ])
-def test_scheduler_filters_decode_before_save(new_request, computed, scheduled, expect_save):
+def test_scheduler_filters_decode_before_save(new_request, scheduled, num_output, expect_save):
     sched = _sched([_attn()])
-    track_new_request(sched, "r1", [0, 1, 2, 3],
-                      num_computed_tokens=computed if new_request else 0,
-                      num_prompt_tokens=32)
+    track_new_request(sched, "r1", [0, 1, 2, 3])
     sched.update_state_after_alloc(
         SimpleNamespace(request_id="r1"), FakeBlocks(([10, 11, 12, 13],)), 0)
     metadata = sched.build_connector_meta(SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(req_id="r1")] if new_request else [],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[] if new_request else ["r1"],
-            new_block_ids=[None], num_computed_tokens=[computed], resumed_req_ids=set()),
+            new_block_ids=[None], num_computed_tokens=[0],
+            num_output_tokens=[num_output], resumed_req_ids=set()),
         num_scheduled_tokens={"r1": scheduled},
     ))
     assert ("r1" in metadata.reqs_to_save.requests) == expect_save
@@ -245,7 +243,6 @@ def test_restored_blocks_are_not_rewritten_on_first_save():
     # Forward completes tokens up to 544+64=608: the ledger and the
     # attention table grow past the restored range by 4 blocks
     st.block_hashes.extend(range(34, 38))
-    st.num_prompt_tokens = len(st.block_hashes) * 16
     st.group_block_ids[0].extend(range(134, 138))
     m = sched.build_save_meta("r1", scheduled_tokens=64)
     # 608 % 16 == 0 -> 38 blocks done, 4 past the skip of 34
@@ -263,7 +260,6 @@ def test_incremental_boundaries_after_restore_are_saved():
     # Extend the ledger and both tables past the restored range
     st = sched._req_states["r1"]
     st.block_hashes.extend(range(34, 74))
-    st.num_prompt_tokens = len(st.block_hashes) * 16
     st.group_block_ids[0].extend(range(134, 174))
     # one 640-token pass materializes only its tail column: the new
     # columns arrive null except the scan's output at idx 73
