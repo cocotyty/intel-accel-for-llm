@@ -235,15 +235,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if self._req_states.pop(request.request_id, None) is not None:
             logger.warning("Discarded stale state for request %s", request.request_id)
 
-        num_prompt = getattr(request, "num_prompt_tokens", 0) or getattr(request, "num_tokens", 0)
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
             block_hashes=request.block_hashes,
-            num_prompt_tokens=num_prompt,
+            num_prompt_tokens=request.num_prompt_tokens,
         )
         self._req_states[request.request_id] = state
-        if num_computed_tokens >= request.num_tokens:
-            return 0, False
         policy = HybridHitPolicy(
             self._groups,
             lambda g, h: self._store().has(
@@ -299,12 +296,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("External token count must be block aligned")
 
         load_start = state.num_computed_tokens // self.block_size
-        load_end = min(
-            load_start + num_external_tokens // self.block_size,
-            len(state.block_hashes),
-            *(len(block_ids[g_idx]) for g_idx, group in enumerate(self._groups)
-              if group.kind == "attention"),
-        )
+        # The scheduler guarantees the endpoint: local+external <= num_tokens
+        # (its own assert) and the allocation covers local+external, so both
+        # block_hashes and every attention group table are long enough.
+        load_end = load_start + num_external_tokens // self.block_size
         if load_end <= load_start:
             return
         group_ids = [tuple(ids[load_start:load_end]) for ids in block_ids]
@@ -333,10 +328,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError(f"Missing state for request {req_id}")
 
         start = state.num_computed_tokens // self.block_size
-        end = min(
-            (state.num_computed_tokens + scheduled_tokens) // self.block_size,
-            len(state.block_hashes),
-        )
+        # Prefill steps stay within the prompt, whose hashes cover every
+        # full block; the decode overshoot case never reaches here (the
+        # is_prefill gate filters it).
+        end = (state.num_computed_tokens + scheduled_tokens) // self.block_size
         block_hashes = state.block_hashes[start:end]
         if block_hashes:
             block_ids = tuple(
@@ -376,6 +371,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached_reqs.req_ids):
+            if req_id in cached_reqs.resumed_req_ids:
+                raise RuntimeError("Resuming from preemption is not supported")
+
             block_ids = cached_reqs.new_block_ids[index]
             state = self._req_states[req_id]
             state.num_computed_tokens = cached_reqs.num_computed_tokens[index]
@@ -384,7 +382,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                           and state.num_computed_tokens < state.num_prompt_tokens)
             if not is_prefill:
                 continue
-            if block_ids and req_id not in cached_reqs.resumed_req_ids:
+            if block_ids:
                 for group_ids, ids in zip(state.group_block_ids, block_ids):
                     group_ids.extend(ids)
             self._add_request_to_save(

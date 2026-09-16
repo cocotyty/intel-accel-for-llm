@@ -71,9 +71,20 @@ def test_align_down_and_minus_one():
 def test_local_computed_tokens_reduce_external():
     """num_computed reduces the reported external hit."""
     groups = [_group(0, "attention", 32)]
-    b, hashes = _hashes({0, 1}, 2)
+    b, hashes = _hashes({0, 1, 2}, 3)
     policy = HybridHitPolicy(groups, b, 32, 32)
-    assert policy.find_longest_cache_hit(hashes, 64) == 64  # external = 64 - 32
+    # candidate caps at (96 - 1) aligned = 64; external = 64 - 32
+    assert policy.find_longest_cache_hit(hashes, 96) == 64
+
+
+def test_full_prompt_hit_recap_last_token():
+    """Main's semantic (all_token_ids[:-1]): a prompt that is an exact
+    block multiple never fully hits -- the last block is recomputed so
+    the scheduler always has a token to run."""
+    groups = [_group(0, "attention", 32)]
+    b, hashes = _hashes({0, 1, 2, 3}, 4)
+    policy = HybridHitPolicy(groups, b, 32, 0)
+    assert policy.find_longest_cache_hit(hashes, 128) == 96
 
 
 def test_local_computed_at_boundary_is_miss():

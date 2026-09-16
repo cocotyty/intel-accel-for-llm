@@ -41,12 +41,13 @@ request_finished_all_groups（HMA 分配器下 v0.23 实际调用的那个）
 SupportsHMA 接口            （声明我们懂 hybrid 内存分配器）
 get_num_new_matched_tokens 返回值在无命中时的退化处理等
 on_cached_request          （新请求之外的 running 请求通道）
-build_resumed_load_meta    （预占恢复）
 ```
 
-为什么 main 能白嫖不接？因为纯 attention 模型上这些回调里没有数据
-时 vLLM 也走得通——而 resume 是杂交模型的日常事件（GDN 请求更重、
-更容易被抢占），不接它的代价就是恢复后输出乱码，没有降级可言。
+resume 曾经接过，后来撤了：恢复路径依赖 vLLM 一个没写在明面上的语
+义（resumed 请求的 new_block_ids 是全量表而非增量），而端到端 gate
+构造不出可靠的抢占场景。没测过的路径不该静默服务——现在和 main 逐
+字节一致，build_connector_meta 遇到 resumed_req_ids 直接 raise。
+抢占发生时 engine 崩溃，这是 main 本来就接受的行为。
 
 ====================================================================
 # 第一部分：寻址与命中 —— "什么算缓存过"

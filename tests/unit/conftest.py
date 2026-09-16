@@ -95,15 +95,12 @@ def HybridRequestScheduler(groups, store, block_size,
 
     conn.build_save_meta = _save
 
-    def _sync(req_id, new_block_ids, resumed=False, num_computed_tokens=0):
+    def _sync(req_id, new_block_ids, num_computed_tokens=0):
         st = conn._req_states[req_id]
         st.num_computed_tokens = num_computed_tokens
         if new_block_ids:
-            if resumed:
-                st.group_block_ids = [list(ids) for ids in new_block_ids]
-            else:
-                for group_ids, ids in zip(st.group_block_ids, new_block_ids):
-                    group_ids.extend(ids)
+            for group_ids, ids in zip(st.group_block_ids, new_block_ids):
+                group_ids.extend(ids)
     conn.sync_running_request = _sync
     return conn
 

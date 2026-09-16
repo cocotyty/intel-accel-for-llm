@@ -36,9 +36,10 @@ class _LiveRequest:
     def __init__(self, hashes):
         self.block_hashes = list(hashes)
 
-    # get_num_new_matched_tokens reads these two fields.
+    # get_num_new_matched_tokens reads these fields.
     request_id = "r1"
     num_tokens = 10 ** 9
+    num_prompt_tokens = 10 ** 9
 
 
 class _Store:
@@ -78,7 +79,7 @@ def test_second_request_hits_decode_produced_blocks():
     # Decode completed two more blocks; the engine appended their
     # hashes to the live list in place.
     live.block_hashes.extend([3, 4])
-    sched.sync_running_request("r1", None, False, 64)
+    sched.sync_running_request("r1", None, 64)
 
     # Under prefill-only policy, decode does NOT save blocks 3 and 4.
     meta_decode = sched.build_save_meta("r1", scheduled_tokens=0)
