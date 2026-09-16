@@ -153,8 +153,10 @@ export IAXL_RDMA_CLIENT_IP=${IAXL_RDMA_CLIENT_IP:-}           # Client RDMA NIC 
 export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
 export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
 
-HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
-export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
+# Only widens no_proxy. Containers often ship without iproute2, and that
+# must not stop the engine from starting.
+HOST_IP=$(ip route get 1 2>/dev/null | awk '{print $7}' | tr -d '\n') || HOST_IP=""
+export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12${HOST_IP:+,$HOST_IP}
 if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_IP" ]]; then
     export no_proxy="$no_proxy,$IAXL_RDMA_DAEMON_IP"
 fi
