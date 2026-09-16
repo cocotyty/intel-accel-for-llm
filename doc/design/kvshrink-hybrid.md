@@ -64,7 +64,7 @@ fix it. Serving must use:
 | **block table** | Per request: logical block *i* to physical block id. Allocation is not contiguous. For a mamba group the table is **full length with null (0) placeholders**, and only the current boundary's column is read. |
 | **group** | vLLM buckets layers with identical storage specs. A hybrid model has at least one mamba group and one or more attention groups. |
 | **pass / step** | One scheduler decision plus its worker execution. |
-| **preemption** | vLLM evicts a request under memory pressure and resumes it later. Resumed requests arrive in `resumed_req_ids`, *not* in the new-request list. |
+| **preemption** | vLLM evicts a request under memory pressure and resumes it later. Resumed requests arrive in `resumed_req_ids`, *not* in the new-request list. Like main, this connector **refuses** resume: `build_connector_meta` raises on any resumed request. |
 | **HMA** | Hybrid Memory Allocator. In v0.23 it is on by default and a connector must implement `SupportsHMA` or the factory rejects it. |
 
 ### 2.2 This package
@@ -77,7 +77,7 @@ fix it. Serving must use:
 | **chunk** | The storage layer's transfer unit. Each page is split into chunks that are compressed, named and persisted independently. |
 | **label** | A group's namespace inside the store, `{namespace}_g{group}_r{rank}`. A group's whole layer set is written in one call under its label, so the block is finalized by that write: there is no second step that could publish a boundary before its data. |
 | **snapshot boundary** | The token count a request restored to. Locked at lookup time and never recomputed afterwards, because by then the progress counters have already moved. |
-| **save cursor** (`next_block_to_save`) | Per group: what has already been emitted. Rolls **back** on resume, because saves issued before preemption may never have been persisted; re-emitting is an idempotent overwrite. |
+| **save frontier** | Derived per pass from the scheduler's authoritative `num_computed_tokens`: blocks below `floor(num_computed / block_size)` are already covered. An authoritative progress regression (MTP draft rejection) rolls it back; re-emitting is an idempotent overwrite. |
 | **fail-closed** | The first principle. A false hit corrupts output silently; a false miss costs one recompute. Every uncertain case resolves to MISS, refuse, or raise. |
 
 ### 2.3 Processes
@@ -112,7 +112,7 @@ workers, so the work order must be self-contained.
 
 ```mermaid
 flowchart TD
-    A[waiting queue: new or resumed] --> B["get_num_new_matched_tokens<br/>how many tokens can you cover?"]
+    A[waiting queue: new request] --> B["get_num_new_matched_tokens<br/>how many tokens can you cover?"]
     B --> C[allocate_slots: reserve GPU blocks<br/>may preempt others]
     C --> D["update_state_after_alloc<br/>full block table + accepted external tokens"]
     D --> E[running queue: growing requests<br/>get new blocks WITHOUT a callback]
@@ -319,13 +319,16 @@ the GPU contents match.
 
 ### 5.6 Preemption and resume
 
-- Resumed requests get their load plan built separately; if the core
-  accepted external tokens and no load pages can be produced, the
-  connector **raises** rather than enter forward with unrestored state.
-- The save cursor **rolls back**, because saves issued before preemption
-  may never have been persisted. Re-emitting is an idempotent overwrite.
-- Progress moving backwards also triggers the rollback, so the guard
-  holds even if the resumed flag is missing.
+- Resume is **refused**, byte-identical to main: `build_connector_meta`
+  raises `RuntimeError("Resuming from preemption is not supported")` for
+  any request in `resumed_req_ids`. Rationale: the resume path depends
+  on subtle core semantics (a resumed request's `new_block_ids` is the
+  full table, not an increment) that no end-to-end gate exercises, and
+  an untested path must fail loudly rather than maybe-corrupt.
+- The save frontier still follows the scheduler's authoritative
+  `num_computed_tokens`, so a progress regression *without* preemption
+  (MTP draft rejection) re-emits the affected blocks -- an idempotent
+  overwrite.
 
 ### 5.7 Request end
 

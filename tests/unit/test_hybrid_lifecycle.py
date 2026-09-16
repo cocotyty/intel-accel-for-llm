@@ -1,14 +1,19 @@
-"""Abort / preemption / resume lifecycle tests.
+"""Abort / preemption / finish lifecycle tests.
 
 Rulings under test:
-1. resume (or any authoritative progress regression) rolls the save
-   watermark and the mamba dedup back to floor(N / block_size) --
-   emitted-but-unproven boundaries are re-emitted (idempotent, safe);
-2. request_finished returns (True, None) -- block freeing is deferred
+1. resuming from preemption fail-stops, byte-identical to main:
+   build_connector_meta raises RuntimeError for any req_id in
+   scheduled_cached_reqs.resumed_req_ids (an untested code path must
+   fail loudly, not maybe-corrupt);
+2. an authoritative progress regression WITHOUT the resumed flag (MTP
+   draft rejection) rolls the save cursor back to
+   floor(N / block_size) -- emitted-but-unproven boundaries are
+   re-emitted (idempotent, safe);
+3. request_finished returns (True, None) -- block freeing is deferred
    to get_finished, which acks once every transfer reading the blocks
    has landed (the async save lifecycle, same as main);
-3. request_finished fail-stops if async store jobs exist;
-4. committed boundaries are content-addressed: abort/finish NEVER
+4. request_finished fail-stops if async store jobs exist;
+5. committed boundaries are content-addressed: abort/finish NEVER
    deletes them; uncommitted pages never hit.
 """
 
@@ -88,70 +93,24 @@ def _setup_attn_req(sched, hashes, ids, tokens=0):
 
 
 # ------------------------------------------------------------------
-# 1-6: save-frontier rollback semantics
+# 1: resume fail-stops like main; regression without the flag rolls back
 # ------------------------------------------------------------------
-
-def test_resume_to_zero_rolls_cursor_and_reemits():
-    """Attention: resume to progress 0 re-emits blocks when re-crossing boundaries."""
-    sched = _sched([_attn()])
-    _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=32)
-    sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
-                            num_computed_tokens=0)
-    m = sched.build_save_meta("r1", scheduled_tokens=32)
-    # this pass re-crosses boundaries 0,1 -> re-emitted now
-    assert m.group_block_ids == ((10, 11),), m.group_block_ids
-
-
-def test_mamba_resume_reemits_boundary_snapshot():
-    sched = _sched([_mamba()])
-    track_new_request(sched, "r1", block_hashes=[0],
-                         num_computed_tokens=0)
-    sched.update_state_after_alloc(
-        type("R", (), {"request_id": "r1"}), FakeBlocks(([5],)), 0)
-    m1 = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert len(m1.block_hashes) == 1
-    sched.sync_running_request("r1", ([9],), resumed=True,
-                            num_computed_tokens=0)
-    m2 = sched.build_save_meta("r1", scheduled_tokens=544)
-    assert len(m2.block_hashes) == 1  # re-emitted
-    assert m2.group_block_ids == ((9,),)
-
-
-def test_resume_to_nonzero_progress_rolls_to_floor():
-    """Resume at N=32 (block 16): only blocks >= 2 re-emit."""
-    sched = _sched([_attn()])
-    _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
-    sched.build_save_meta("r1", scheduled_tokens=64)
-    sched.sync_running_request("r1", ([10, 11, 12, 13],), resumed=True,
-                            num_computed_tokens=32)
-    m = sched.build_save_meta("r1", scheduled_tokens=32)
-    assert m.group_block_ids == ((12, 13),), m.group_block_ids
-
 
 def test_monotonic_progress_no_rollback():
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=32)
-    sched.sync_running_request("r1", None, resumed=False,
+    sched.sync_running_request("r1", None,
                             num_computed_tokens=32)
 
 
-def test_resumed_empty_table_clears():
-    sched = _sched([_attn()])
-    _setup_attn_req(sched, [0, 1], [10, 11])
-    sched.build_save_meta("r1", scheduled_tokens=32)
-    sched.sync_running_request("r1", ([],), resumed=True,
-                            num_computed_tokens=0)
-    assert sched._req_states["r1"].group_block_ids[0] == []
-
-
 def test_progress_regression_without_resumed_flag_rolls_back():
-    """Fail-closed: authoritative progress regression re-emits recomputed blocks."""
+    """Fail-closed: authoritative progress regression (MTP draft
+    rejection) re-emits recomputed blocks."""
     sched = _sched([_attn()])
     _setup_attn_req(sched, [0, 1, 2, 3], [10, 11, 12, 13])
     sched.build_save_meta("r1", scheduled_tokens=64)
-    sched.sync_running_request("r1", None, resumed=False,
+    sched.sync_running_request("r1", None,
                             num_computed_tokens=16)
     m = sched.build_save_meta("r1", scheduled_tokens=16)
     assert m.group_block_ids == ((11,),), m.group_block_ids  # floor(16/16)=1
@@ -207,10 +166,9 @@ def test_abort_keeps_committed_boundary_hittable():
     assert store.has(["0"], label="kv") == [True]
 
 
-def test_abort_resume_stress_1000_iterations_zero_residue():
-    """1000 rounds of new/save/resume/finish. Every round the cursor
-    rolls back and re-emits; at the end no request state is left behind,
-    the rollback counter is exact and nothing raised."""
+def test_abort_finish_stress_1000_iterations_zero_residue():
+    """1000 rounds of new/save/finish. At the end no request state is
+    left behind and nothing raised."""
     sched = _sched([_attn()], _MissStore())
     conn = _sched_side_connector(sched)
     for i in range(1000):
@@ -219,12 +177,7 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
         sched.update_state_after_alloc(
             type("R", (), {"request_id": rid}),
             FakeBlocks(([10, 11, 12, 13],)), 0)
-        sched.build_save_meta(rid, scheduled_tokens=64)  # cursor -> 4
-        # preempt + resume to zero
-        sched.sync_running_request(rid, ([10, 11, 12, 13],), resumed=True,
-                                num_computed_tokens=0)
-        m = sched.build_save_meta(rid, scheduled_tokens=64)
-        assert m.group_block_ids == ((10, 11, 12, 13),), f"round {i}"
+        sched.build_save_meta(rid, scheduled_tokens=64)
         free, delay = conn.request_finished(
             type("R", (), {"request_id": rid}), None)
         assert (free, delay) == (True, None)
@@ -232,21 +185,20 @@ def test_abort_resume_stress_1000_iterations_zero_residue():
 
 
 # ------------------------------------------------------------------
-# 9: preemption-resume LOAD metadata
+# 9: external-restore load metadata
 # ------------------------------------------------------------------
-# vLLM v1 carries preempted->rescheduled requests in
-# scheduled_cached_reqs.resumed_req_ids, NOT scheduled_new_reqs. The
-# connector historically built load meta ONLY from scheduled_new_reqs,
-# so a resumed request's accepted external tokens
-# (get_num_new_matched_tokens -> core skips
-# recompute) was never matched by a worker-side load -> forward read
-# unrestored KV and emitted wrong tokens (4B TP2 lifecycle gate).
+# The restore path: get_num_new_matched_tokens records a HIT, the core
+# allocates fresh blocks, update_state_after_alloc credits the external
+# tokens. The load plan must carry every credited attention page plus
+# the mamba snapshot written into the CURR slot only (v0.23.0 reads
+# CURR in every kernel path); the first post-restore save pass must not
+# re-write the restored range, and later boundaries must still save.
 
 def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
     """2-group hybrid (uniform bs=16, mamba snapshot at 544) with a
-    request that re-entered after preemption: the lookup hook reset state and
-    recorded a HIT at boundary 544, then the core allocated fresh blocks
-    and credited ``ext`` external tokens."""
+    request holding an external credit: the lookup hook recorded a HIT
+    at boundary 544, then the core allocated fresh blocks and credited
+    ``ext`` external tokens."""
     groups = [
         _attn(),
         GroupInfo(group_idx=1, kind="mamba", layer_names=("m.0",),
@@ -267,7 +219,7 @@ def _hybrid_resumed_setup(committed, scheduled=64, ext=544):
 
 
 def test_resumed_load_meta_restores_credited_pages():
-    """Resumed request with 544 credited external tokens gets load meta
+    """A request with 544 credited external tokens gets load meta
     carrying all 34 attention pages + the mamba snapshot written into
     the CURR slot only (v0.23.0 reads CURR in every kernel path)."""
     sched = _hybrid_resumed_setup(set(range(34)))
@@ -327,46 +279,10 @@ def test_incremental_boundaries_after_restore_are_saved():
     assert m.group_block_ids[1] == tuple(want_mamba), m
 
 
-def test_resume_rollback_still_overrides_the_skip():
-    """Preemption after the restore rolls the watermark back per the
-    resumed progress -- the skip must never keep the save cursor ahead
-    of what vLLM says is computed."""
-    sched = _hybrid_resumed_setup(set(range(34)))
-    # Preempted back to 32 tokens (2 blocks); the replaced tables
-    # cover the resumed frontier (6 blocks after this pass's sched):
-    # the brake rolls the watermark to 2, so the re-crossed
-    # boundaries re-emit instead of staying hidden behind the skip
-    sched.sync_running_request("r1",
-                            (list(range(100, 106)),
-                             [0, 0, 0, 0, 0, 205]),
-                            resumed=True, num_computed_tokens=32)
-    m = sched.build_save_meta("r1", scheduled_tokens=64)
-    assert m.group_block_ids[0] == (102, 103, 104, 105), m
-
-
-def test_resumed_load_meta_without_credit_is_quiet():
-    """Resume covered entirely by the LOCAL prefix cache (ext=0, no
-    external boundary): no load plan is built at all."""
-    from types import SimpleNamespace
-    sched = _hybrid_resumed_setup(set(range(34)), ext=0)
-    conn = _sched_side_connector(sched)
-    scheduler_output = SimpleNamespace(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=["r1"], resumed_req_ids={"r1"},
-            # the resumed table covers the credited frontier: align
-            # mode nulls every mamba column but the running slot
-            new_block_ids=[(list(range(100, 134)), [0] * 37 + [201])],
-            num_computed_tokens=[544]),
-        num_scheduled_tokens={"r1": 64})
-    meta = conn.build_connector_meta(scheduler_output)
-    assert "r1" not in meta.reqs_to_load.requests
-
-
-def test_connector_meta_includes_resumed_load():
-    """End-to-end at connector level: build_connector_meta must emit the
-    resumed request's load meta (scheduled_cached_reqs.resumed_req_ids),
-    not only scheduled_new_reqs."""
+def test_resume_from_preemption_raises():
+    """Byte-identical to main: any request in resumed_req_ids fail-stops
+    the scheduler. Preemption-resume is an untested path; a loud crash
+    beats a maybe-wrong silent recovery."""
     from types import SimpleNamespace
     sched = _hybrid_resumed_setup(set(range(34)))
     conn = _sched_side_connector(sched)
@@ -374,13 +290,8 @@ def test_connector_meta_includes_resumed_load():
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=["r1"], resumed_req_ids={"r1"},
-            # the resumed table covers the credited frontier: align
-            # mode nulls every mamba column but the running slot
             new_block_ids=[(list(range(100, 134)), [0] * 37 + [201])],
             num_computed_tokens=[544]),
         num_scheduled_tokens={"r1": 64})
-    meta = conn.build_connector_meta(scheduler_output)
-    load = meta.reqs_to_load.requests.get("r1")
-    assert load is not None, "resumed request must receive load metadata"
-    assert len(load.block_hashes) == 34, load
-    assert load.group_block_ids[0] == tuple(range(100, 134)), load
+    with pytest.raises(RuntimeError, match="Resuming from preemption"):
+        conn.build_connector_meta(scheduler_output)

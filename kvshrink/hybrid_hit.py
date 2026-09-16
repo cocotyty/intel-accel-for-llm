@@ -53,9 +53,6 @@ class HybridHitPolicy:
         # full attention first (tighter initial bound)
         self._ordered: list[GroupInfo] = sorted(
             groups, key=lambda g: 0 if g.kind == "attention" else 1)
-        # Snapshots are restorable only on block boundaries, and only
-        # a group of recurrent layers carries a snapshot to restore.
-        self._has_mamba = any(g.kind == "mamba" for g in groups)
 
     # ------------------------------------------------------------------
     def _lookup(self, group: GroupInfo, block_hashes: list[int],
@@ -86,10 +83,10 @@ class HybridHitPolicy:
     ) -> int:
         """Fixed-point convergence over all groups; returns the
         restorable prefix in tokens (the snapshot boundary)."""
-        candidate = max_length
-        if self._has_mamba:
-            # the last prompt token is always recomputed (logprobs + state)
-            candidate = (candidate - 1) // self._block_size * self._block_size
+        # The last prompt token is always recomputed (logprobs + state).
+        # Without the cap a full-prompt hit leaves the scheduler nothing
+        # to run (sync path asserts num_new_tokens > 0).
+        candidate = (max_length - 1) // self._block_size * self._block_size
 
         while True:
             previous = candidate

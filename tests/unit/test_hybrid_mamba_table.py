@@ -145,14 +145,14 @@ def test_save_meta_prefill_puts_every_boundary():
     track_new_request(sched, "r1", block_hashes=list(range(34)),
                      num_computed_tokens=0)
     for k in range(1, 35):
-        sched.sync_running_request("r1", ([100 + k],), resumed=False,
+        sched.sync_running_request("r1", ([100 + k],),
                                 num_computed_tokens=(k - 1) * 544)
         meta = sched.build_save_meta("r1", scheduled_tokens=544)
         assert meta.block_hashes == [f"{k - 1}"], (k, meta)
         assert meta.group_block_ids == ((100 + k,),), (k, meta)
     # the next pass: credit catches up (nc = 34 blocks), the offer is
     # empty -- no duplicate put
-    sched.sync_running_request("r1", ([],), resumed=False,
+    sched.sync_running_request("r1", ([],),
                             num_computed_tokens=34 * 544)
     meta = sched.build_save_meta("r1", scheduled_tokens=544)
     assert meta.block_hashes == [] and meta.group_block_ids == ((),), meta
@@ -258,7 +258,8 @@ def test_completeness_intact_boundary_unchanged():
     backend = _Store(set(), committed_pairs=_hybrid_pairs([0, 1], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544)
     req = type("R", (), {
-        "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
+        "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088,
+            "num_prompt_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
     assert ext == 544, ext
     sched.update_state_after_alloc(
@@ -278,7 +279,8 @@ def test_mamba_partial_recovery_with_earlier_snapshot():
     backend = _Store(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544)
     req = type("R", (), {
-        "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088})
+        "request_id": "r1", "block_hashes": [0, 1], "num_tokens": 1088,
+            "num_prompt_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
     assert ext == 544, ext  # earlier intact mamba snapshot -> recover
 
@@ -293,7 +295,7 @@ def test_partial_recovery_load_meta_targets_earlier_snapshot():
     backend = _Store(set(), committed_pairs=_hybrid_pairs([0], [0, 1]))
     sched = HybridRequestScheduler(groups, backend, 544)
     req = type("R", (), {"request_id": "r1", "block_hashes": [0, 1],
-                         "num_tokens": 1088})
+                         "num_tokens": 1088, "num_prompt_tokens": 1088})
     ext, _ = sched.get_num_new_matched_tokens(req, 0)
     assert ext == 544, ext
     sched.update_state_after_alloc(
