@@ -39,7 +39,6 @@ class _LiveRequest:
     # get_num_new_matched_tokens reads these fields.
     request_id = "r1"
     num_tokens = 10 ** 9
-    num_prompt_tokens = 10 ** 9
 
 
 class _Store:
@@ -65,7 +64,6 @@ def test_second_request_hits_decode_produced_blocks():
     st = ReqState(
         block_hashes=live.block_hashes,
         num_computed_tokens=0,
-        num_prompt_tokens=32,
         group_block_ids=[[10, 11]])
     sched._req_states["r1"] = st
     meta_prefill = sched.build_save_meta("r1", scheduled_tokens=32)

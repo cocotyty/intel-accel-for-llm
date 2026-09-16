@@ -313,7 +313,6 @@ def test_recurrent_models_force_full_async(selected_layers):
         request_id = "r1"
         block_hashes = [1, 2]
         num_tokens = 48
-        num_prompt_tokens = 48
 
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],

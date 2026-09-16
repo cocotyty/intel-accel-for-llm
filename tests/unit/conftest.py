@@ -105,15 +105,12 @@ def HybridRequestScheduler(groups, store, block_size,
     return conn
 
 
-def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0, num_prompt_tokens=0):
+def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0):
     """Register a fresh ReqState (what get_num_new_matched_tokens does)."""
     from kvshrink.kvshrink_connector import ReqState
-    if num_prompt_tokens == 0 and block_hashes:
-        num_prompt_tokens = len(block_hashes) * sched.block_size
     sched._req_states[req_id] = ReqState(
         block_hashes=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
-        num_prompt_tokens=num_prompt_tokens,
         group_block_ids=[[] for _ in sched._groups],
     )
 
