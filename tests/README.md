@@ -111,6 +111,12 @@ All optional except the model; defaults shown.
 | `GATE_STARTUP_TIMEOUT` | `600` | Seconds to wait for `/health` |
 | `GATE_GPU_FREE_TIMEOUT` | `60` | Seconds to wait for the previous engine to release the GPUs before starting the next one. Killing `vllm` does not reclaim anything immediately: the engine core and one worker per rank exit separately, and racing the next engine against them made a worker die mid-forward several gates into a suite run |
 | `GATE_GPU_FREE_MIB` | `1024` | GPU memory below which the card counts as free; a few hundred MiB of residue from other tenants is normal |
+| `GATE_GSM8K_LIMIT` | `50` | Questions per pass in the accuracy gate |
+| `GATE_GSM8K_PARALLEL` | `8` | Concurrent requests per pass in the accuracy gate |
+| `GATE_GSM8K_MAX_TOKENS` | `1024` | Generation cap per answer (thinking mode is disabled, so answers are short direct CoT) |
+| `GATE_GSM8K_ACC_FLOOR` | `0.5` | Minimum cold-pass accuracy; below this the engine/model setup is broken, not the cache |
+| `GATE_GSM8K_ACC_TOLERANCE` | `0.05` | Allowed warm-minus-cold accuracy drop. Restoring a GDN prefix and recomputing the tail is numerically (not bit-) identical to a full scan, and greedy decoding amplifies the difference, so borderline answers flip; a corrupted restore collapses accuracy far below this |
+| `GATE_GSM8K_DATA` | `_data/gsm8k/test.jsonl` | Cached copy of the GSM8K test split; downloaded once, reused afterwards |
 
 ### Gates
 
@@ -120,6 +126,7 @@ All optional except the model; defaults shown.
 | `probe_cold_hot.sh` | After a restart, does a run that RESTORES KV and GDN state produce byte-identical output to the run that computed it? Also asserts the hot run really hit the cache (otherwise identical output would prove nothing) and that no fail-closed guard fired |
 | `probe_pure_attention.sh` | Does an attention-only model still take the original code path, with unchanged output and no hybrid initialisation? |
 | `probe_hit_benefit.sh` | Is the feature worth its cost? Interleaves recompute and restore in one process and reports median TTFT for each. Fails if restoring is not faster |
+| `probe_accuracy_gsm8k.sh` | Does restoring KV cost accuracy on a real workload? Answers an 8-shot GSM8K slice twice -- cold (computed) then warm (vLLM's prefix cache dropped, so every answer starts from restored KV) -- and fails if warm accuracy drops beyond the tolerance, the cold pass is below the floor, or the warm pass did not actually hit the external cache. The few-shot prefix is what makes prompts long enough to cross hybrid block boundaries; thinking mode is disabled so answers fit the generation cap. Runs on both the hybrid and the attention model |
 
 ### Development loop
 
