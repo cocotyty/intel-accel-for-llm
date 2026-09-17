@@ -44,11 +44,6 @@ class ScratchPool:
 
     def allocate(self, count: int, shape: Optional[Sequence[int]] = None,
                  dtype: Optional[torch.dtype] = None) -> List[torch.Tensor]:
-        shape = self.block_shape if shape is None else tuple(shape)
-        dtype = self.dtype if dtype is None else dtype
-        block_bytes = math.prod(shape) * torch.tensor([], dtype=dtype).element_size()
-        if block_bytes != self.block_bytes:
-            raise ValueError(f"ScratchPool: block size {block_bytes} != {self.block_bytes}")
         free = self._free
         if count > len(free):
             raise RuntimeError(f"ScratchPool exhausted: need {count}, {len(free)}/{len(self._blocks)} free")
@@ -57,16 +52,7 @@ class ScratchPool:
         del free[cut:]
         self._allocate_count += count
         blocks = self._blocks
-        if shape == self.block_shape and dtype == self.dtype:
-            return [blocks[i] for i in idx]
-        # Hybrid attention and Mamba pages share a byte size, not a dtype/shape.
-        # Keep the registered backing allocation and its RDMA slot indices.
-        result = []
-        for i in idx:
-            block = blocks[i].view(dtype).view(shape)
-            block.block_idx = i
-            result.append(block)
-        return result
+        return [blocks[i] for i in idx]
 
     def release(self, tensors: List[torch.Tensor]):
         self._free.extend(t.block_idx for t in tensors)  # type: ignore[attr-defined]

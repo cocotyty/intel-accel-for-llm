@@ -196,8 +196,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 self._bind_intel_accel()
 
         self._groups, self.block_size = parse_kv_cache_config(kv_cache_config)
-        # Number of logical KV blocks (scheduler side of the block ID space).
-        self.num_blocks = kv_cache_config.num_blocks
         self._has_mamba = any(g.kind == "mamba" for g in self._groups)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba" for ln in g.layer_names)
@@ -413,49 +411,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Exclude speculative draft layers while preserving registration order.
         kv_caches = {ln: cache for ln, cache in kv_caches.items()
                      if extract_layer_index(ln) < self.num_layers}
-        # The scheduler addresses KV blocks (`self.num_blocks` logical pages of
-        # `block_size` tokens each). Attention kernels may lay every such page
-        # out as `num_blocks_per_kv_block` consecutive kernel blocks -- vLLM
-        # computes it as `kv_cache_spec.block_size // kernel_block_size`. On a
-        # hybrid model the page size has to match Mamba's, which forces
-        # `block_size` up to 528, while FlashAttention caps the kernel block
-        # size at {16, 32, 64} for float32 SSM hybrid models (the same NaN
-        # issue as https://github.com/Dao-AILab/flash-attention/issues/1974),
-        # so the ratio lands on 528 // 16 = 33. Tensor dimension 0 is that
-        # finer space and scheduler block IDs cannot index it directly.
-        #
-        # Re-view each logical page as one row, keeping the kernel-level layout
-        # as the trailing dimensions:
-        #   (kernel_blocks, 2, kernel_block_size, heads, head_dim)
-        #       -> (num_blocks, num_blocks_per_kv_block, 2, kernel_block_size,
-        #           heads, head_dim)
-        # This is a plain view, so nothing is copied.
-        for group in self._groups:
-            if group.kind != "attention":
-                continue
-            for ln in group.layer_names:
-                if ln not in kv_caches:
-                    continue
-                cache = kv_caches[ln]
-                num_blocks_per_kv_block, remainder = divmod(
-                    cache.shape[0], self.num_blocks)
-                page_size_bytes = group.spec.page_size_bytes
-                if remainder or cache.numel() != (
-                        self.num_blocks * page_size_bytes // cache.element_size()):
-                    raise ValueError(
-                        f"Layer {ln} has {cache.shape[0]} tensor rows of "
-                        f"{cache.shape[1:]}, which is not "
-                        f"{self.num_blocks} KV blocks of {page_size_bytes} "
-                        f"bytes ({cache.dtype})")
-                kv_caches[ln] = cache.view(
-                    self.num_blocks, num_blocks_per_kv_block, *cache.shape[1:])
+        # The store binds each layer's view: attention re-views along the logical
+        # page, Mamba as one opaque page per block (see kvstore._bind_pools).
+        layer_kinds = {ln: group.kind for group in self._groups
+                       for ln in group.layer_names if ln in kv_caches}
         self._mamba_layers = self._mamba_layers.intersection(kv_caches)
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            block_dim=0,
             kv_caches=kv_caches,
+            layer_kinds=layer_kinds,
             rank=self.rank,
             tp_size=self.tp_size,
         )

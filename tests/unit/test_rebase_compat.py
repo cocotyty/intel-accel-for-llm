@@ -9,7 +9,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from iaxl.kvflow.scratch_pool import ScratchPool
 from iaxl.kvstore import kvstore as module
 
 
@@ -40,7 +39,8 @@ def test_dim1_benchmark_and_global_compression_skip(store_factory):
 def test_hybrid_bound_pages_and_namespaces(store_factory):
     backing = torch.arange(3 * 64, dtype=torch.uint8).view(3, 64)
     conv = backing[:, :16]
-    store = store_factory("test", block_dim=0, kv_caches={"m0": [conv]})
+    store = store_factory("test", kv_caches={"m0": [conv]},
+                          layer_kinds={"m0": "mamba"})
     pages = store.kv_caches["m0"]
     assert pages.data_ptr() == backing.data_ptr()
     assert torch.equal(pages, backing)
@@ -51,12 +51,49 @@ def test_hybrid_bound_pages_and_namespaces(store_factory):
     assert store.tensorzip.get.call_args.kwargs["label"] == "mamba"
 
 
+def test_attention_is_reviewed_along_the_logical_block(store_factory):
+    """A logical page spans `ratio` kernel blocks: binding re-views dim 0 so
+    scheduler block IDs index it, keeping the trailing dims untouched."""
+    num_blocks, ratio, kernel_tokens = 3, 4, 2
+    attn = torch.arange(
+        num_blocks * ratio * 2 * kernel_tokens * 2, dtype=torch.float32).reshape(
+            num_blocks * ratio, 2, kernel_tokens, 2)
+    page_elements = ratio * 2 * kernel_tokens * 2
+    mamba = [torch.zeros(num_blocks, page_elements)]  # same page bytes
+    store = store_factory("test", kv_caches={"a0": attn, "m0": mamba},
+                          layer_kinds={"a0": "attention", "m0": "mamba"})
+    pages = store.kv_caches["a0"]
+    assert pages.shape == (num_blocks, ratio, 2, kernel_tokens, 2)
+    assert pages[1].data_ptr() == attn[ratio].data_ptr()
+    assert pages.untyped_storage().data_ptr() == attn.untyped_storage().data_ptr()
+    assert store.kv_caches["m0"].shape == (num_blocks, page_elements * 4)
+    assert store.block_dim == 0
+
+
+def test_attention_page_mismatch_is_rejected(store_factory):
+    attn = torch.zeros(4, 2, 2, 2)
+    mamba = [torch.zeros(3, 16)]  # 64 B pages against attention's 32 B rows
+    with pytest.raises(ValueError, match="pages of"):
+        store_factory("test", kv_caches={"a0": attn, "m0": mamba},
+                      layer_kinds={"a0": "attention", "m0": "mamba"})
+
+
 def test_controller_does_not_require_block_dim(store_factory):
     store = store_factory("test", layer_names=["a0"])
     assert store.has_only_mode
     assert store.kvcache_shape is None
     with pytest.raises(ValueError, match="block_dim is required"):
         store_factory("test", kv_caches={"a0": torch.zeros(2, 3)})
+
+
+def test_both_shells_share_the_layer_kinds_kwarg():
+    """The dispatch picks one shell at import; both must accept the connector call."""
+    import inspect
+    from iaxl.remote_pool.kvstore_remote import KVStoreRemote
+
+    for cls in (module.KVStoreLocal, KVStoreRemote):
+        params = inspect.signature(cls.__init__).parameters
+        assert "layer_kinds" in params and "layer_names" in params, cls
 
 
 def test_attention_connector_calls_remote_store_without_label(monkeypatch):
@@ -85,32 +122,6 @@ def test_attention_connector_calls_remote_store_without_label(monkeypatch):
     drive_start_load(worker, KVShrinkConnectorMetadata(requests, requests))
     worker.save_kv_layer("a0", None, None)
     assert [call[-1] for call in calls] == ["get", "put"]
-
-
-def test_scratch_mixed_dtype_pages_keep_bytes_slots_and_lifetime(monkeypatch):
-    import iaxl.kvflow.scratch_pool as scratch
-
-    monkeypatch.setattr(scratch, "envs", SimpleNamespace(
-        IAXL_SCRATCH_POOL_SIZE_GB=128 / 1024**3))
-    pool = ScratchPool((2, 4), torch.float32, pin_memory=False)
-    attn = pool.allocate(1)[0]
-    attn.fill_(7)
-    mamba = pool.allocate(1, (32,), torch.uint8)[0]
-    mamba.fill_(19)
-    assert mamba.shape == (32,) and mamba.dtype == torch.uint8
-    assert mamba.data_ptr() == pool.pool.data_ptr() + mamba.block_idx * 32
-    assert mamba.block_idx != attn.block_idx
-    assert torch.all(attn == 7)
-    before = pool.available_count()
-    with pytest.raises(ValueError, match="block size"):
-        pool.allocate(1, (33,), torch.uint8)
-    assert pool.available_count() == before
-    pool.release([mamba])
-    reused = pool.allocate(1)[0]
-    assert reused.data_ptr() == mamba.data_ptr()
-    assert torch.all(reused.view(torch.uint8) == 19)
-    pool.release([attn, reused])
-    assert pool.available_count() == 4
 
 
 @pytest.mark.parametrize("device,sync,expected", [
