@@ -7,7 +7,7 @@ import pytest
 from types import SimpleNamespace
 
 from conftest import HybridWorker, drive_start_load, make_spec
-from iaxl import PageLayout
+from iaxl.kvstore import PageLayout
 from kvshrink.kvshrink_connector import (
     GroupInfo, KVShrinkConnectorMetadata, ReqMeta, RequestMetadata)
 

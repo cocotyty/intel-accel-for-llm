@@ -32,8 +32,9 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
-from iaxl import KVStore, PageLayout, setup_root_logger
+from iaxl import KVStore, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
+from iaxl.kvstore import PageLayout
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .hybrid_hit import HybridHitPolicy

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from iaxl import PageLayout
+from iaxl.kvstore import PageLayout
 from iaxl.kvstore import kvstore as module
 
 
