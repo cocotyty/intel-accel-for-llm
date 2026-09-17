@@ -196,6 +196,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 self._bind_intel_accel()
 
         self._groups, self.block_size = parse_kv_cache_config(kv_cache_config)
+        # Number of logical KV blocks (scheduler side of the block ID space).
+        self.num_blocks = kv_cache_config.num_blocks
         self._has_mamba = any(g.kind == "mamba" for g in self._groups)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba" for ln in g.layer_names)
@@ -328,7 +330,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         start = state.num_computed_tokens // self.block_size
         # Prefill steps stay within the prompt, whose hashes cover every
         # full block; the decode overshoot case never reaches here (the
-        # is_prefill gate filters it).
+        # num_output_tokens gate filters it).
         end = (state.num_computed_tokens + scheduled_tokens) // self.block_size
         block_hashes = state.block_hashes[start:end]
         if block_hashes:
@@ -359,14 +361,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        # A request's first schedule is always prefill. The > 1 also skips
-        # the full-hit case (all but one token restored): its one computed
-        # block can never serve a hit under the last-token exclusion.
+        # A request's first schedule is always prefill. 1-token schedules
+        # (full-hit-minus-one tail, single-token prompt) complete no full
+        # block, so the save window is empty and nothing is issued.
         for request in scheduler_output.scheduled_new_reqs:
-            if scheduler_output.num_scheduled_tokens[request.req_id] > 1:
-                self._add_request_to_save(
-                    request.req_id, scheduler_output.num_scheduled_tokens[request.req_id]
-                )
+            self._add_request_to_save(
+                request.req_id, scheduler_output.num_scheduled_tokens[request.req_id]
+            )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached_reqs.req_ids):
@@ -379,9 +380,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             # num_output_tokens counts async-scheduling placeholders, which
             # are only added for decode steps -- 0 means still in prefill.
             # This filters MTP decode, which schedules 1 + num_spec > 1.
-            is_prefill = (scheduler_output.num_scheduled_tokens[req_id] > 1
-                          and cached_reqs.num_output_tokens[index] == 0)
-            if not is_prefill:
+            if cached_reqs.num_output_tokens[index] != 0:
                 continue
             if block_ids:
                 for group_ids, ids in zip(state.group_block_ids, block_ids):
@@ -413,6 +412,42 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Exclude speculative draft layers while preserving registration order.
         kv_caches = {ln: cache for ln, cache in kv_caches.items()
                      if extract_layer_index(ln) < self.num_layers}
+        # The scheduler addresses KV blocks (`self.num_blocks` logical pages of
+        # `block_size` tokens each). Attention kernels may lay every such page
+        # out as `num_blocks_per_kv_block` consecutive kernel blocks -- vLLM
+        # computes it as `kv_cache_spec.block_size // kernel_block_size`. On a
+        # hybrid model the page size has to match Mamba's, which forces
+        # `block_size` up to 528, while FlashAttention caps the kernel block
+        # size at {16, 32, 64} for float32 SSM hybrid models (the same NaN
+        # issue as https://github.com/Dao-AILab/flash-attention/issues/1974),
+        # so the ratio lands on 528 // 16 = 33. Tensor dimension 0 is that
+        # finer space and scheduler block IDs cannot index it directly.
+        #
+        # Re-view each logical page as one row, keeping the kernel-level layout
+        # as the trailing dimensions:
+        #   (kernel_blocks, 2, kernel_block_size, heads, head_dim)
+        #       -> (num_blocks, num_blocks_per_kv_block, 2, kernel_block_size,
+        #           heads, head_dim)
+        # This is a plain view, so nothing is copied.
+        for group in self._groups:
+            if group.kind != "attention":
+                continue
+            for ln in group.layer_names:
+                if ln not in kv_caches:
+                    continue
+                cache = kv_caches[ln]
+                num_blocks_per_kv_block, remainder = divmod(
+                    cache.shape[0], self.num_blocks)
+                page_size_bytes = group.spec.page_size_bytes
+                if remainder or cache.numel() != (
+                        self.num_blocks * page_size_bytes // cache.element_size()):
+                    raise ValueError(
+                        f"Layer {ln} has {cache.shape[0]} tensor rows of "
+                        f"{cache.shape[1:]}, which is not "
+                        f"{self.num_blocks} KV blocks of {page_size_bytes} "
+                        f"bytes ({cache.dtype})")
+                kv_caches[ln] = cache.view(
+                    self.num_blocks, num_blocks_per_kv_block, *cache.shape[1:])
         self._mamba_layers = self._mamba_layers.intersection(kv_caches)
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
@@ -460,6 +495,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if request.is_async:
                 async_reqs.append((req_id, request))
             else:
+                # Sync path only supports pure-attention models (single KV
+                # group), so group 0 is the whole table.
                 block_ids, block_hashes = request.for_group(0)
                 sync_block_ids.extend(block_ids)
                 sync_block_hashes.extend(block_hashes)
@@ -553,6 +590,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         """Submit Mamba states after forward; these layers have no save hook."""
         if self._connector_metadata is None or not self._mamba_layers:
+            return
+        metadata = self._get_connector_metadata()
+        if not metadata.reqs_to_save.requests:
             return
         for ln in self._mamba_layers:
             self.save_kv_layer(ln, None, None)

@@ -133,10 +133,12 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
         _group(0, "attention", [attn]), _group(1, "mamba", [mamba, draft]),
     ], [attn, mamba, draft])
     worker.num_layers = 2
+    worker.num_blocks = 2
     worker.model_config = SimpleNamespace(model="test-model")
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(
         static_forward_context={}))
-    caches = {attn: torch.empty(2, 1), mamba: [torch.empty(2, 1)],
+    caches = {attn: torch.zeros(2, 64, dtype=torch.uint8),
+              mamba: [torch.empty(2, 1)],
               draft: [torch.empty(2, 1)]}
     captured = {}
 
@@ -152,3 +154,61 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
     drive_start_load(worker, _meta(((5,), (6,))))
     assert worker.kvstore.submitted == [
         ("kv", [attn], [5]), ("mamba", [mamba], [6])]
+
+
+def test_attention_registration_uses_logical_pages(monkeypatch):
+    """A 528-token logical page spans 33 kernel blocks of 16 tokens.
+
+    The scheduler's block IDs index logical pages, while an attention
+    tensor's dimension 0 indexes kernel blocks. Restoring page 1 must
+    rewrite exactly its 33 kernel blocks and leave its neighbours alone.
+    """
+    import torch
+    import kvshrink.kvshrink_connector as module
+
+    layer = "model.layers.0"
+    num_blocks, kernel_blocks, kernel_tokens = 3, 33, 16
+    cache = torch.arange(
+        num_blocks * kernel_blocks * 2 * kernel_tokens * 2,
+        dtype=torch.float32).reshape(
+            num_blocks * kernel_blocks, 2, kernel_tokens, 2)
+    page_bytes = (kernel_blocks * cache[0].numel() * cache.element_size())
+    worker = _worker([GroupInfo(0, "attention", (layer,),
+                                SimpleNamespace(page_size_bytes=page_bytes))],
+                     [layer])
+    worker.num_layers = 1
+    worker.num_blocks = num_blocks
+    worker.model_config = SimpleNamespace(model="test")
+    captured = {}
+
+    def store(**kwargs):
+        captured.update(kwargs)
+        return _FakeStore([layer])
+
+    monkeypatch.setattr(module, "KVStore", store)
+    worker.register_kv_caches({layer: cache})
+    pages = captured["kv_caches"][layer]
+    assert pages.shape == (num_blocks, kernel_blocks, 2, kernel_tokens, 2)
+    assert pages[1].data_ptr() == cache[kernel_blocks].data_ptr()
+
+    reference = cache.clone()
+    cache[kernel_blocks:2 * kernel_blocks].zero_()
+    pages[1].copy_(reference[kernel_blocks:2 * kernel_blocks])
+    assert torch.equal(cache, reference)
+
+
+def test_attention_registration_rejects_mismatched_page_size(monkeypatch):
+    """A tensor that does not add up to num_blocks whole pages is rejected."""
+    import torch
+    import kvshrink.kvshrink_connector as module
+
+    layer = "model.layers.0"
+    worker = _worker([GroupInfo(0, "attention", (layer,),
+                                SimpleNamespace(page_size_bytes=999))],
+                     [layer])
+    worker.num_layers = 1
+    worker.num_blocks = 3
+    worker.model_config = SimpleNamespace(model="test")
+    monkeypatch.setattr(module, "KVStore", lambda **kwargs: _FakeStore([layer]))
+    with pytest.raises(ValueError, match="not 3 KV blocks"):
+        worker.register_kv_caches({layer: torch.zeros(4, 2, dtype=torch.float32)})

@@ -306,8 +306,23 @@ class KVFlow:
                 work_stream=self.get_stream,
             )
             if first_tensor:
-                if stream_sync_on_get:
-                    ctx.xfer_wait_cur_stream()
+                # vLLM zeroes freshly allocated attention KV blocks on the
+                # compute stream before any connector load runs (see
+                # gpu_model_runner._update_states / KVBlockZeroer). It does so
+                # only for hybrid models (needs_kv_cache_zeroing ==
+                # has_mamba_layers), because attention (bf16/fp8) and Mamba/SSM
+                # (fp32) layers share one block pool: a block recycled from an
+                # SSM state can hold fp32 bit patterns that read as NaN/Inf in
+                # the attention dtype, and attention kernels mask unused
+                # positions by multiplying by zero, which cannot clear a NaN
+                # (0 * NaN = NaN). Rationale and details:
+                #   https://github.com/vllm-project/vllm/pull/35219
+                #
+                # Our copies run on a private stream, so without an explicit
+                # dependency an H2D load can be issued before that zeroing
+                # and get erased. Wait for the compute stream on the device
+                # side; CPU synchronization (blocking) stays opt-in.
+                ctx.xfer_wait_cur_stream(sync_cur_stream=stream_sync_on_get)
                 first_tensor = False
             ctx.unzip_from_mem(
                 self.mem, label, tensor_key, chunk_labels, chunk_indices, cpu_tensors
