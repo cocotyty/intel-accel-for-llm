@@ -42,13 +42,14 @@ def _bind_pools(
     """Give every layer a view whose dimension 0 is the logical KV block.
 
     Mamba stores both states of a page in one backing allocation, so it binds
-    as one opaque page per block. A hybrid model makes the logical page (528
-    tokens) several kernel blocks -- vLLM computes the ratio as
+    as one opaque page per block. On a hybrid model a logical page can span
+    several attention kernel blocks -- vLLM computes the ratio as
     `kv_cache_spec.block_size // kernel_block_size`, and FlashAttention caps
-    the kernel block at {16, 32, 64} for float32 SSM models (the NaN issue in
-    https://github.com/Dao-AILab/flash-attention/issues/1974) -- so attention
-    is re-viewed along the logical block, keeping the trailing dims. Both are
-    plain views: nothing is copied, and the scheduler's block IDs index them.
+    the kernel block below the page size for float32 SSM models (the NaN issue
+    in https://github.com/Dao-AILab/flash-attention/issues/1974) -- so
+    attention is re-viewed along the logical block, keeping the trailing dims.
+    Both are plain views: nothing is copied, and the scheduler's block IDs
+    index them.
     """
     if kv_caches is None:
         return None

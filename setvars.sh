@@ -74,8 +74,8 @@ printf '%s\n' \
 # ---- Cache / compression ----------------------------------------------------
 export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy LSB truncation: 'auto', 0 (off), or N bits
 export IAXL_KV_DATA_SHUFFLE=${IAXL_KV_DATA_SHUFFLE:-0}                   # Byte-shuffle before compression (0/1)
-# Hybrid models use 528-token pages (1056 KiB), which the old 256 KiB default
-# rejected mid-request; dst keeps headroom for incompressible blocks.
+# A hybrid page can be larger than the old 256 KiB default, which aborted
+# compression mid-request; dst keeps headroom for incompressible blocks.
 export IAXL_ZIP_SRC_CAP=${IAXL_ZIP_SRC_CAP:-2097152}                      # Source/decompressed block capacity (2 MiB)
 export IAXL_ZIP_DST_CAP=${IAXL_ZIP_DST_CAP:-2097152}                      # Compressed-output capacity (2 MiB)
 export IAXL_CACHE_DIR=${IAXL_CACHE_DIR:-_data/kvcache}                   # Base directory for persisted cache files

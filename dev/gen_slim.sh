@@ -39,6 +39,9 @@ rm -rf tests/unit tests/gpu tests/README.md \
 # Files the hybrid change must leave exactly as main has them.
 git -C "$FULL" show upstream/main:README.md > README.md
 git -C "$FULL" show upstream/main:doc/design/kvshrink.md > doc/design/kvshrink.md
+# Deployment knobs and ignore rules are ours, not the PR's.
+git -C "$FULL" show upstream/main:setvars.sh > setvars.sh
+git -C "$FULL" show upstream/main:.gitignore > .gitignore
 
 python3 "$FULL/dev/trim_docstrings.py" \
     kvshrink/kvshrink_connector.py
