@@ -42,6 +42,8 @@ git -C "$FULL" show upstream/main:doc/design/kvshrink.md > doc/design/kvshrink.m
 # Deployment knobs and ignore rules are ours, not the PR's.
 git -C "$FULL" show upstream/main:setvars.sh > setvars.sh
 git -C "$FULL" show upstream/main:.gitignore > .gitignore
+# The duplicate-key batch-get fix ships as a separate PR.
+git -C "$FULL" show upstream/main:iaxl/csrc/kv_pool/mem.cpp > iaxl/csrc/kv_pool/mem.cpp
 
 python3 "$FULL/dev/trim_docstrings.py" \
     kvshrink/kvshrink_connector.py
