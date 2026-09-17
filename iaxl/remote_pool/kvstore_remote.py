@@ -8,9 +8,12 @@ kv_caches and tracks per-job completion pushed back by the daemon."""
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from ..kvstore.kvstore import PageLayout
 
 from ..envs import envs
 from . import rpc
@@ -35,7 +38,7 @@ class KVStoreRemote:
         model_name: str,
         block_dim: Optional[int] = None,
         kv_caches: Optional[Dict[str, torch.Tensor]] = None,
-        layer_meta: Optional[Dict[str, tuple[str, int, int]]] = None,  # the daemon binds the pools
+        page_layout: Optional["PageLayout"] = None,  # the daemon binds the pools
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
@@ -44,7 +47,7 @@ class KVStoreRemote:
     ):
         if kv_caches is None and layer_names is None:
             raise ValueError("At least one of kv_caches or layer_names must be provided")
-        if kv_caches is not None and block_dim is None and layer_meta is None:
+        if kv_caches is not None and block_dim is None and page_layout is None:
             raise ValueError("block_dim is required when kv_caches is provided")
 
         ip = daemon_ip or envs.IAXL_RDMA_DAEMON_IP
@@ -53,9 +56,9 @@ class KVStoreRemote:
             raise ValueError("daemon_ip (IAXL_RDMA_DAEMON_IP) is required")
 
         self.kv_caches = kv_caches
-        # The daemon binds the pools, and the caller that declares the layer
-        # geometry already has the block axis first.
-        self.block_dim = 0 if layer_meta is not None else block_dim
+        # The daemon binds the pools, and the caller that declares the page
+        # layout already has the block axis first.
+        self.block_dim = 0 if page_layout is not None else block_dim
         self.rank = rank
         self.tp_size = tp_size
         self.has_only_mode = kv_caches is None

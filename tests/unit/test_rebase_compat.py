@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from iaxl import PageLayout
 from iaxl.kvstore import kvstore as module
 
 
@@ -40,7 +41,7 @@ def test_hybrid_bound_pages_and_namespaces(store_factory):
     backing = torch.arange(3 * 64, dtype=torch.uint8).view(3, 64)
     conv = backing[:, :16]
     store = store_factory("test", kv_caches={"m0": [conv]},
-                          layer_meta={"m0": ("mamba", 3, 64)})
+                          page_layout=PageLayout(3, 64, {"m0": "mamba"}))
     pages = store.kv_caches["m0"]
     assert pages.data_ptr() == backing.data_ptr()
     assert torch.equal(pages, backing)
@@ -61,9 +62,10 @@ def test_attention_is_reviewed_along_the_logical_block(store_factory):
     page_elements = ratio * 2 * kernel_tokens * 2
     mamba = [torch.zeros(num_blocks, page_elements)]  # same page bytes
     page_bytes = page_elements * 4  # float32
-    store = store_factory("test", kv_caches={"a0": attn, "m0": mamba},
-                          layer_meta={"a0": ("attention", num_blocks, page_bytes),
-                                      "m0": ("mamba", num_blocks, page_bytes)})
+    store = store_factory(
+        "test", kv_caches={"a0": attn, "m0": mamba},
+        page_layout=PageLayout(num_blocks, page_bytes,
+                               {"a0": "attention", "m0": "mamba"}))
     pages = store.kv_caches["a0"]
     assert pages.shape == (num_blocks, ratio, 2, kernel_tokens, 2)
     assert pages[1].data_ptr() == attn[ratio].data_ptr()
@@ -80,14 +82,14 @@ def test_controller_does_not_require_block_dim(store_factory):
         store_factory("test", kv_caches={"a0": torch.zeros(2, 3)})
 
 
-def test_both_shells_share_the_layer_meta_kwarg():
+def test_both_shells_share_the_page_layout_kwarg():
     """The dispatch picks one shell at import; both must accept the connector call."""
     import inspect
     from iaxl.remote_pool.kvstore_remote import KVStoreRemote
 
     for cls in (module.KVStoreLocal, KVStoreRemote):
         params = inspect.signature(cls.__init__).parameters
-        assert "layer_meta" in params and "layer_names" in params, cls
+        assert "page_layout" in params and "layer_names" in params, cls
 
 
 def test_attention_connector_calls_remote_store_without_label(monkeypatch):

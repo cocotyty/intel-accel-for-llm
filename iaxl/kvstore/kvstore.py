@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from dataclasses import dataclass
 import torch
 import numpy as np
 from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
@@ -26,6 +27,21 @@ def _get_default_cache_size_gb() -> float:
     return available_bytes / (10 * 1024**3)
 
 
+@dataclass(frozen=True)
+class PageLayout:
+    """Model-level page geometry plus the per-layer cache kinds.
+
+    vLLM gives every KV cache group the same page size and the pool a single
+    block count, so only the kind varies per layer. The connector resolves
+    this from `KVCacheConfig` and the group `KVCacheSpec` -- the same source
+    vLLM's own connectors read (`offloading/worker.py`, `nixl/worker.py`).
+    """
+
+    num_blocks: int
+    page_bytes: int
+    kinds: Mapping[str, str]  # layer name -> "attention" | "mamba"
+
+
 def _opaque_pages(
     tensor: torch.Tensor, num_blocks: int, page_bytes: int
 ) -> torch.Tensor:
@@ -38,36 +54,31 @@ def _opaque_pages(
 
 def _bind_pools(
     kv_caches: Optional[Dict[str, torch.Tensor | list]],
-    layer_meta: Optional[Mapping[str, tuple[str, int, int]]] = None,
+    layout: Optional[PageLayout] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Give every layer a view whose dimension 0 is the logical KV block.
 
-    Geometry comes from vLLM's `KVCacheConfig`, never from the tensors: the
-    connector resolves `(kind, num_blocks, page_bytes)` per layer out of
-    `kv_cache_config` and the group's `KVCacheSpec`, the same source vLLM's
-    own connectors read (`offloading/worker.py`, `nixl/worker.py`). Mamba
-    keeps both states of a page in one backing allocation, so it binds as one
-    opaque page per block; attention re-views dim 0 along the logical page,
-    keeping the trailing dims (a logical page spans several kernel blocks on
-    a hybrid model). Both are plain views: nothing is copied, and the
-    scheduler's block IDs index them.
+    The geometry comes from `PageLayout` (resolved from vLLM's
+    `KVCacheConfig`), never from the tensors. Mamba keeps both states of a
+    page in one backing allocation, so it binds as one opaque page per block;
+    attention re-views dim 0 along the logical page, keeping the trailing
+    dims (a logical page spans several kernel blocks on a hybrid model). Both
+    are plain views: nothing is copied, and the scheduler's block IDs index
+    them.
     """
     if kv_caches is None:
         return None
-    meta = layer_meta or {}
     pools: Dict[str, torch.Tensor] = {}
     for layer_name, entry in kv_caches.items():
-        info = meta.get(layer_name)
-        if info is None:
-            pools[layer_name] = entry
-            continue
-        kind, num_blocks, page_bytes = info
+        kind = layout.kinds.get(layer_name) if layout is not None else None
         if kind == "mamba":
             tensor = entry[0] if isinstance(entry, (list, tuple)) else entry
-            pools[layer_name] = _opaque_pages(tensor, num_blocks, page_bytes)
-        elif entry.shape[0] != num_blocks:
-            ratio = entry.shape[0] // num_blocks
-            pools[layer_name] = entry.view(num_blocks, ratio, *entry.shape[1:])
+            pools[layer_name] = _opaque_pages(
+                tensor, layout.num_blocks, layout.page_bytes)
+        elif kind == "attention" and entry.shape[0] != layout.num_blocks:
+            ratio = entry.shape[0] // layout.num_blocks
+            pools[layer_name] = entry.view(
+                layout.num_blocks, ratio, *entry.shape[1:])
         else:
             pools[layer_name] = entry
     return pools
@@ -81,7 +92,7 @@ class KVStoreLocal:
         model_name: str,
         block_dim: Optional[int] = None,
         kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
-        layer_meta: Optional[Mapping[str, tuple[str, int, int]]] = None,
+        page_layout: Optional[PageLayout] = None,
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
@@ -92,7 +103,7 @@ class KVStoreLocal:
                 "At least one of kv_caches or layer_names must be provided"
             )
 
-        if kv_caches is not None and block_dim is None and layer_meta is None:
+        if kv_caches is not None and block_dim is None and page_layout is None:
             raise ValueError("block_dim is required when kv_caches is provided")
 
         if kv_caches is not None and layer_names is not None:
@@ -103,10 +114,10 @@ class KVStoreLocal:
                     f"kv_caches keys {kv_keys} must match layer_names {layer_set}"
                 )
 
-        self.kv_caches = _bind_pools(kv_caches, layer_meta)
-        # Binding puts the block axis first, so a caller that declares the layer
-        # geometry does not repeat it; the raw path keeps the caller's block_dim.
-        block_dim = 0 if layer_meta is not None else block_dim
+        self.kv_caches = _bind_pools(kv_caches, page_layout)
+        # Binding puts the block axis first, so a caller that declares the page
+        # layout does not repeat it; the raw path keeps the caller's block_dim.
+        block_dim = 0 if page_layout is not None else block_dim
         self.block_dim = block_dim
         self.rank = rank
         self.tp_size = tp_size

@@ -7,6 +7,7 @@ import pytest
 from types import SimpleNamespace
 
 from conftest import HybridWorker, drive_start_load, make_spec
+from iaxl import PageLayout
 from kvshrink.kvshrink_connector import (
     GroupInfo, KVShrinkConnectorMetadata, ReqMeta, RequestMetadata)
 
@@ -134,6 +135,7 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
     ], [attn, mamba, draft])
     worker.num_layers = 2
     worker._num_blocks = 2
+    worker._page_bytes = 64
     worker.model_config = SimpleNamespace(model="test-model")
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(
         static_forward_context={}))
@@ -151,10 +153,9 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
     assert worker._layer_names == [attn, mamba]
     assert worker._mamba_layers == {mamba}
     assert list(captured["kv_caches"]) == [attn, mamba]
-    assert captured["layer_meta"] == {
-        attn: ("attention", 2, 64),   # FullAttentionSpec(bs=16, 1 kv head, bf16)
-        mamba: ("mamba", 2, 4),       # MambaSpec(bs=16, ((1,1),), fp32)
-    }
+    assert captured["page_layout"] == PageLayout(
+        num_blocks=2, page_bytes=64,
+        kinds={attn: "attention", mamba: "mamba"})
     drive_start_load(worker, _meta(((5,), (6,))))
     assert worker.kvstore.submitted == [
         ("kv", [attn], [5]), ("mamba", [mamba], [6])]
