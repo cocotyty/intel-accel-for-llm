@@ -188,6 +188,7 @@ def test_attention_registration_uses_logical_pages(monkeypatch):
     monkeypatch.setattr(module, "KVStore", store)
     worker.register_kv_caches({layer: cache})
     pages = captured["kv_caches"][layer]
+    assert captured["block_dim"] == 0
     assert pages.shape == (num_blocks, kernel_blocks, 2, kernel_tokens, 2)
     assert pages[1].data_ptr() == cache[kernel_blocks].data_ptr()
 

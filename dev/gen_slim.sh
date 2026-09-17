@@ -37,8 +37,8 @@ rm -rf tests/unit tests/gpu tests/README.md \
     doc/design/main-vs-hybrid-diff.md
 
 # Files the hybrid change must leave exactly as main has them.
-git -C "$FULL" show main:README.md > README.md
-git -C "$FULL" show main:doc/design/kvshrink.md > doc/design/kvshrink.md
+git -C "$FULL" show upstream/main:README.md > README.md
+git -C "$FULL" show upstream/main:doc/design/kvshrink.md > doc/design/kvshrink.md
 
 python3 "$FULL/dev/trim_docstrings.py" \
     kvshrink/kvshrink_connector.py

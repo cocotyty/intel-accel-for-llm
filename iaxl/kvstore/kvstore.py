@@ -4,10 +4,11 @@
 import logging
 import torch
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
+from ..remote_pool.remote_tensor import RemoteTensor
 from ..utils.profiler import (
     profile_scope,
     profile_cross_scope,
@@ -45,13 +46,14 @@ def _bind_pools(
     return pools
 
 
-class KVStore:
+class KVStoreLocal:
     LABEL = "kv"
 
     def __init__(
         self,
         model_name: str,
-        kv_caches: Optional[Dict[str, torch.Tensor]] = None,
+        block_dim: Optional[int] = None,
+        kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
@@ -62,6 +64,9 @@ class KVStore:
                 "At least one of kv_caches or layer_names must be provided"
             )
 
+        if kv_caches is not None and block_dim is None:
+            raise ValueError("block_dim is required when kv_caches is provided")
+
         if kv_caches is not None and layer_names is not None:
             kv_keys = set(kv_caches.keys())
             layer_set = set(layer_names)
@@ -71,6 +76,7 @@ class KVStore:
                 )
 
         self.kv_caches = _bind_pools(kv_caches)
+        self.block_dim = block_dim
         self.rank = rank
         self.tp_size = tp_size
 
@@ -84,6 +90,21 @@ class KVStore:
         )
 
         self.has_only_mode = kv_caches is None
+
+        if self.kv_caches:
+            first_tensor = next(iter(self.kv_caches.values()))
+            self.kvcache_shape = list(first_tensor.shape)
+
+            self.block_shape = list(first_tensor.shape)
+            self.block_shape[block_dim] = 1
+            self.block_shape = tuple(
+                self.block_shape[i]
+                for i in range(len(self.block_shape))
+                if i != block_dim
+            )
+        else:
+            self.kvcache_shape = None
+            self.block_shape = None
 
         if self.has_only_mode:
             final_persist_dir = f"{model_name}_rank0"
@@ -109,12 +130,14 @@ class KVStore:
         logger.info(
             "KVStore initialized successfully: "
             "model_name=%s, rank=%d, has_only_mode=%s, "
-            "num_layers=%d, "
+            "num_layers=%d, block_dim=%s, block_shape=%s, "
             "pool_size_gb=%.2f, persist_dir=%s",
             model_name,
             self.rank,
             self.has_only_mode,
             len(self.layer_names),
+            self.block_dim,
+            self.block_shape,
             pool_size_gb,
             final_persist_dir,
         )
@@ -169,14 +192,21 @@ class KVStore:
 
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
+        # skip_compression_count counts GLOBAL layers, but put() may be called with
+        # a single layer / subset (layerwise async), where flow compares against the
+        # per-call tensor index. Rebase onto this call's first layer so "skip the
+        # first N layers" holds regardless of how puts are batched.
+        base = self.layer_names.index(layer_names[0])
+        local_skip = max(0, self.skip_compression_count - base)
+
         result = self.tensorzip.put(
             label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=0,
+            chunk_dim=self.block_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
-            skip_compression_count=self.skip_compression_count,
+            skip_compression_count=local_skip,
         )
 
         if label is not None or self.layer_names[-1] in layer_names:
@@ -228,7 +258,7 @@ class KVStore:
         return self.tensorzip.get(
             label=label or self.LABEL,
             tensors=tensors,
-            chunk_dim=0,
+            chunk_dim=self.block_dim,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
@@ -285,6 +315,7 @@ class KVStore:
         status = self.tensorzip.status()
         status["rank"] = self.rank
         status["num_layers"] = len(self.layer_names)
+        status["kvcache_shape"] = self.kvcache_shape
         return status
 
     def metrics(self, params: Optional[dict] = None) -> dict:
@@ -321,3 +352,13 @@ class KVStore:
 
     def get_evict_candidates(self, max_count: int) -> List[str]:
         return self.tensorzip.get_evict_candidates(max_count)
+
+
+if TYPE_CHECKING:  # the two shells share one interface; pick the local one for typing
+    KVStore = KVStoreLocal
+elif envs.IAXL_RDMA_ENABLE:
+    from ..remote_pool.kvstore_remote import KVStoreRemote
+
+    KVStore = KVStoreRemote
+else:
+    KVStore = KVStoreLocal

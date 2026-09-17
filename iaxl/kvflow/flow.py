@@ -19,7 +19,9 @@ from ..torch_ext import Record
 from ..torch_ext import Context, GpuTransferDirection
 from ..torch_ext import Mem, Storage
 from .. import torch_ext as _iqt
+from ..utils import cuda_available
 from .scratch_pool import ScratchPool
+from ..remote_pool.remote_tensor import RemoteTensor
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ stream_sync_on_get = envs.IAXL_CACHE_STREAM_SYNC_ON_GET
 
 
 def get_accelerator_device() -> str:
-    if torch.cuda.is_available():
+    if cuda_available():
         return "cuda"
     elif torch.xpu.is_available():
         return "xpu"
@@ -80,7 +82,7 @@ class KVFlow:
             return
 
         self.device_type = get_accelerator_device()
-        if self.device_type is None:
+        if self.device_type is None and not envs.IAXL_RDMA_ENABLE:
             raise RuntimeError(
                 "No accelerator available, KVFlow requires GPU support (CUDA or XPU)"
             )
@@ -96,7 +98,7 @@ class KVFlow:
 
         self.cache_size_bytes = int(cache_size_gb * 1024**3)
 
-        self.chunk_pool = ScratchPool(cache_size_gb=cache_size_gb)
+        self.chunk_pool: Optional[ScratchPool] = None  # created on first put/get, once block shape is known
 
         self.mem = Mem(
             capacity_bytes=self.cache_size_bytes,
@@ -119,6 +121,9 @@ class KVFlow:
     def _ensure_streams(self):
         if self._streams_initialized:
             return
+        if self.device_type is None:  # remote_pool daemon: no GPU, RDMA data plane
+            self._streams_initialized = True
+            return
         if self.device_type == "cuda":
             self.cur_stream = torch.cuda.current_stream()
             self.put_stream = torch.cuda.Stream()
@@ -133,6 +138,21 @@ class KVFlow:
             self.get_stream_ctx = lambda: torch.xpu.stream(self.get_stream)
         self._streams_initialized = True
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
+
+    def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
+        if self.chunk_pool is None:
+            self.chunk_pool = ScratchPool(block_shape, dtype, pin_memory=self.device_type is not None)
+            if envs.IAXL_RDMA_ENABLE:
+                pool = self.chunk_pool.pool
+                _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
+
+    def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
+        if isinstance(tensor, RemoteTensor):
+            return Context.create_remote(
+                tensor.base, tensor.dev_id, list(tensor.shape), tensor.element_size(),
+                chunk_dim, direction, description,
+            )
+        return Context.create(tensor, chunk_dim, direction, description, work_stream=work_stream)
 
     @profile_func(
         lambda self,
@@ -167,7 +187,7 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu, (
+            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
             )
             assert tensor.device == first_t.device, (
@@ -183,13 +203,14 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
+        self._ensure_pool(chunk_shape, first_t.dtype)
 
         for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
             cpu_tensors = self.chunk_pool.allocate(
                 num_chunks, chunk_shape, tensor.dtype
             )
 
-            ctx = Context.create(
+            ctx = self._create_ctx(
                 tensor,
                 chunk_dim,
                 GpuTransferDirection.D2H,
@@ -197,7 +218,8 @@ class KVFlow:
                 work_stream=self.put_stream,
             )
             if first_tensor:
-                ctx.xfer_wait_cur_stream(sync_cur_stream=True)
+                if self.device_type is not None:
+                    ctx.xfer_wait_cur_stream(sync_cur_stream=True)
                 first_tensor = False
             ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
             ctx.xfer_finish()
@@ -276,7 +298,7 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu, (
+            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
             )
             assert tensor.device == first_t.device, (
@@ -291,6 +313,7 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
+        self._ensure_pool(chunk_shape, first_t.dtype)
 
         first_tensor = True
         for tensor_key, tensor in tensors.items():
@@ -298,7 +321,7 @@ class KVFlow:
                 num_chunks, chunk_shape, tensor.dtype
             )
 
-            ctx = Context.create(
+            ctx = self._create_ctx(
                 tensor,
                 chunk_dim,
                 GpuTransferDirection.H2D,
@@ -322,7 +345,8 @@ class KVFlow:
                 # dependency an H2D load can be issued before that zeroing
                 # and get erased. Wait for the compute stream on the device
                 # side; CPU synchronization (blocking) stays opt-in.
-                ctx.xfer_wait_cur_stream(sync_cur_stream=stream_sync_on_get)
+                if self.device_type is not None:
+                    ctx.xfer_wait_cur_stream(sync_cur_stream=stream_sync_on_get)
                 first_tensor = False
             ctx.unzip_from_mem(
                 self.mem, label, tensor_key, chunk_labels, chunk_indices, cpu_tensors
@@ -419,22 +443,22 @@ class KVFlow:
         unpersisted = self.mem.unpersisted_count
         group_count = self.mem.group_count
 
-        with self.chunk_pool._lock:
-            pool_total_tensors = self.chunk_pool._total_tensors
-            pool_total_bytes = self.chunk_pool._total_bytes
-            pool_available = sum(len(p) for p in self.chunk_pool._pools.values())
-            pool_in_use = (
-                self.chunk_pool._allocate_count - self.chunk_pool._release_count
-            )
+        pool = self.chunk_pool
+        if pool is None:
+            pool_total_tensors = pool_total_bytes = pool_available = pool_in_use = 0
             pool_shapes = []
-            for (shape, dtype), tensors in self.chunk_pool._pools.items():
-                pool_shapes.append(
-                    {
-                        "shape": list(shape),
-                        "dtype": str(dtype),
-                        "available": len(tensors),
-                    }
-                )
+        else:
+            pool_total_tensors = pool.num_blocks
+            pool_total_bytes = pool.total_bytes()
+            pool_available = pool.available_count()
+            pool_in_use = pool_total_tensors - pool_available
+            pool_shapes = [
+                {
+                    "shape": list(pool.block_shape),
+                    "dtype": str(pool.dtype),
+                    "available": pool_available,
+                }
+            ]
 
         return {
             "has_only_mode": False,

@@ -245,7 +245,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._groups,
             lambda g, h: self._store().has(
                 [_hash_str(h)],
-                label="mamba" if self._groups[g].kind == "mamba" else "kv",
+                **({"label": "mamba" if self._groups[g].kind == "mamba" else "kv"}
+                   if self._has_mamba else {}),
             )[0],
             self.block_size, num_computed_tokens)
         matched_tokens = policy.find_longest_cache_hit(
@@ -453,6 +454,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
+            block_dim=0,
             kv_caches=kv_caches,
             rank=self.rank,
             tp_size=self.tp_size,
@@ -524,7 +526,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     block_hashs=block_hashes,
                     layer_names=layer_names,
                     description=req_id,
-                    label="mamba" if group.kind == "mamba" else "kv",
+                    **({"label": "mamba" if group.kind == "mamba" else "kv"}
+                       if self._mamba_layers else {}),
                 ))
             self._pending_load_tasks[req_id] = tasks
             self._pending_load_layers[req_id] = request.async_load_layers
@@ -583,7 +586,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 block_indices=block_ids,
                 block_hashs=block_hashes,
                 layer_names=[layer_name],
-                label="mamba" if layer_name in self._mamba_layers else "kv",
+                **({"label": "mamba" if layer_name in self._mamba_layers else "kv"}
+                   if self._mamba_layers else {}),
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
