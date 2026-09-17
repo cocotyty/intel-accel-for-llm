@@ -35,7 +35,7 @@ class KVStoreRemote:
         model_name: str,
         block_dim: Optional[int] = None,
         kv_caches: Optional[Dict[str, torch.Tensor]] = None,
-        layer_kinds: Optional[Dict[str, str]] = None,  # the daemon binds the pools
+        layer_meta: Optional[Dict[str, tuple[str, int, int]]] = None,  # the daemon binds the pools
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
@@ -44,7 +44,7 @@ class KVStoreRemote:
     ):
         if kv_caches is None and layer_names is None:
             raise ValueError("At least one of kv_caches or layer_names must be provided")
-        if kv_caches is not None and block_dim is None and layer_kinds is None:
+        if kv_caches is not None and block_dim is None and layer_meta is None:
             raise ValueError("block_dim is required when kv_caches is provided")
 
         ip = daemon_ip or envs.IAXL_RDMA_DAEMON_IP
@@ -53,9 +53,9 @@ class KVStoreRemote:
             raise ValueError("daemon_ip (IAXL_RDMA_DAEMON_IP) is required")
 
         self.kv_caches = kv_caches
-        # The daemon binds the pools, and the caller that declares layer kinds
-        # already has the block axis first.
-        self.block_dim = 0 if layer_kinds is not None else block_dim
+        # The daemon binds the pools, and the caller that declares the layer
+        # geometry already has the block axis first.
+        self.block_dim = 0 if layer_meta is not None else block_dim
         self.rank = rank
         self.tp_size = tp_size
         self.has_only_mode = kv_caches is None
@@ -82,7 +82,7 @@ class KVStoreRemote:
                 for n, t in kv_caches.items()
             }
             self.rpc.call(rpc.REGISTER_KV_CACHES, rpc.pack_json({
-                "layers": layers, "block_dim": block_dim, "model_name": model_name,
+                "layers": layers, "block_dim": self.block_dim, "model_name": model_name,
                 "rank": rank, "tp_size": tp_size}))
             self.layer_names = list(kv_caches.keys())
             first = next(iter(kv_caches.values()))

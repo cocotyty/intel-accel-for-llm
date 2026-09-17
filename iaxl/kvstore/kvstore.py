@@ -26,53 +26,47 @@ def _get_default_cache_size_gb() -> float:
     return available_bytes / (10 * 1024**3)
 
 
-def _opaque_pages(tensor: torch.Tensor) -> torch.Tensor:
-    """One opaque byte page per block, over the layer's own storage."""
-    page_bytes = tensor.stride(0) * tensor.element_size()
-    base = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(tensor.untyped_storage())
-    return torch.as_strided(
-        base, size=(tensor.shape[0], page_bytes), stride=(page_bytes, 1), storage_offset=0
+def _opaque_pages(
+    tensor: torch.Tensor, num_blocks: int, page_bytes: int
+) -> torch.Tensor:
+    """One opaque byte page per block, over the layer's whole storage."""
+    base = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+        tensor.untyped_storage()
     )
+    return base.view(num_blocks, page_bytes)
 
 
 def _bind_pools(
     kv_caches: Optional[Dict[str, torch.Tensor | list]],
-    layer_kinds: Optional[Mapping[str, str]] = None,
+    layer_meta: Optional[Mapping[str, tuple[str, int, int]]] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Give every layer a view whose dimension 0 is the logical KV block.
 
-    Mamba stores both states of a page in one backing allocation, so it binds
-    as one opaque page per block. On a hybrid model a logical page can span
-    several attention kernel blocks -- vLLM computes the ratio as
-    `kv_cache_spec.block_size // kernel_block_size`, and FlashAttention caps
-    the kernel block below the page size for float32 SSM models (the NaN issue
-    in https://github.com/Dao-AILab/flash-attention/issues/1974) -- so
-    attention is re-viewed along the logical block, keeping the trailing dims.
-    Both are plain views: nothing is copied, and the scheduler's block IDs
-    index them.
+    Geometry comes from vLLM's `KVCacheConfig`, never from the tensors: the
+    connector resolves `(kind, num_blocks, page_bytes)` per layer out of
+    `kv_cache_config` and the group's `KVCacheSpec`, the same source vLLM's
+    own connectors read (`offloading/worker.py`, `nixl/worker.py`). Mamba
+    keeps both states of a page in one backing allocation, so it binds as one
+    opaque page per block; attention re-views dim 0 along the logical page,
+    keeping the trailing dims (a logical page spans several kernel blocks on
+    a hybrid model). Both are plain views: nothing is copied, and the
+    scheduler's block IDs index them.
     """
     if kv_caches is None:
         return None
-    kinds = layer_kinds or {}
-    mamba = [entry[0] if isinstance(entry, (list, tuple)) else entry
-             for layer_name, entry in kv_caches.items()
-             if kinds.get(layer_name) == "mamba"]
-    num_blocks = mamba[0].shape[0] if mamba else None
-    page_bytes = mamba[0].stride(0) * mamba[0].element_size() if mamba else None
-
+    meta = layer_meta or {}
     pools: Dict[str, torch.Tensor] = {}
     for layer_name, entry in kv_caches.items():
-        kind = kinds.get(layer_name)
+        info = meta.get(layer_name)
+        if info is None:
+            pools[layer_name] = entry
+            continue
+        kind, num_blocks, page_bytes = info
         if kind == "mamba":
-            pools[layer_name] = _opaque_pages(
-                entry[0] if isinstance(entry, (list, tuple)) else entry)
-        elif kind == "attention" and num_blocks and entry.shape[0] != num_blocks:
-            ratio, remainder = divmod(entry.shape[0], num_blocks)
-            if remainder or entry.stride(0) * ratio * entry.element_size() != page_bytes:
-                raise ValueError(
-                    f"Layer {layer_name} has {entry.shape[0]} rows of "
-                    f"{entry.shape[1:]} ({entry.dtype}), not {num_blocks} "
-                    f"pages of {page_bytes} bytes")
+            tensor = entry[0] if isinstance(entry, (list, tuple)) else entry
+            pools[layer_name] = _opaque_pages(tensor, num_blocks, page_bytes)
+        elif entry.shape[0] != num_blocks:
+            ratio = entry.shape[0] // num_blocks
             pools[layer_name] = entry.view(num_blocks, ratio, *entry.shape[1:])
         else:
             pools[layer_name] = entry
@@ -87,7 +81,7 @@ class KVStoreLocal:
         model_name: str,
         block_dim: Optional[int] = None,
         kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
-        layer_kinds: Optional[Mapping[str, str]] = None,
+        layer_meta: Optional[Mapping[str, tuple[str, int, int]]] = None,
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
@@ -98,7 +92,7 @@ class KVStoreLocal:
                 "At least one of kv_caches or layer_names must be provided"
             )
 
-        if kv_caches is not None and block_dim is None and layer_kinds is None:
+        if kv_caches is not None and block_dim is None and layer_meta is None:
             raise ValueError("block_dim is required when kv_caches is provided")
 
         if kv_caches is not None and layer_names is not None:
@@ -109,10 +103,10 @@ class KVStoreLocal:
                     f"kv_caches keys {kv_keys} must match layer_names {layer_set}"
                 )
 
-        self.kv_caches = _bind_pools(kv_caches, layer_kinds)
+        self.kv_caches = _bind_pools(kv_caches, layer_meta)
         # Binding puts the block axis first, so a caller that declares the layer
-        # kinds does not repeat it; the raw path keeps the caller's block_dim.
-        block_dim = 0 if layer_kinds is not None else block_dim
+        # geometry does not repeat it; the raw path keeps the caller's block_dim.
+        block_dim = 0 if layer_meta is not None else block_dim
         self.block_dim = block_dim
         self.rank = rank
         self.tp_size = tp_size

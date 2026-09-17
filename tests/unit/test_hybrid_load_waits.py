@@ -133,6 +133,7 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
         _group(0, "attention", [attn]), _group(1, "mamba", [mamba, draft]),
     ], [attn, mamba, draft])
     worker.num_layers = 2
+    worker._num_blocks = 2
     worker.model_config = SimpleNamespace(model="test-model")
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(
         static_forward_context={}))
@@ -150,7 +151,10 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
     assert worker._layer_names == [attn, mamba]
     assert worker._mamba_layers == {mamba}
     assert list(captured["kv_caches"]) == [attn, mamba]
-    assert captured["layer_kinds"] == {attn: "attention", mamba: "mamba"}
+    assert captured["layer_meta"] == {
+        attn: ("attention", 2, 64),   # FullAttentionSpec(bs=16, 1 kv head, bf16)
+        mamba: ("mamba", 2, 4),       # MambaSpec(bs=16, ((1,1),), fp32)
+    }
     drive_start_load(worker, _meta(((5,), (6,))))
     assert worker.kvstore.submitted == [
         ("kv", [attn], [5]), ("mamba", [mamba], [6])]

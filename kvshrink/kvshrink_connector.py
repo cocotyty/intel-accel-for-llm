@@ -112,8 +112,8 @@ def _hash_str(block_hash) -> str:
 
 def parse_kv_cache_config(
     kv_cache_config: KVCacheConfig,
-) -> tuple[list[GroupInfo], int]:
-    """Parse vLLM KV cache groups and common block size.
+) -> tuple[list[GroupInfo], int, int]:
+    """Parse vLLM KV cache groups, common block size and block count.
     All groups must share the same block size."""
     groups: list[GroupInfo] = []
     sizes: set[int] = set()
@@ -128,7 +128,7 @@ def parse_kv_cache_config(
         raise RuntimeError(
             f"kvshrink requires a common block size across groups, got {sorted(sizes)}"
         )
-    return groups, sizes.pop()
+    return groups, sizes.pop(), int(kv_cache_config.num_blocks)
 
 
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
@@ -195,7 +195,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
 
-        self._groups, self.block_size = parse_kv_cache_config(kv_cache_config)
+        self._groups, self.block_size, self._num_blocks = parse_kv_cache_config(
+            kv_cache_config)
         self._has_mamba = any(g.kind == "mamba" for g in self._groups)
         self._mamba_layers = frozenset(
             ln for g in self._groups if g.kind == "mamba" for ln in g.layer_names)
@@ -411,17 +412,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Exclude speculative draft layers while preserving registration order.
         kv_caches = {ln: cache for ln, cache in kv_caches.items()
                      if extract_layer_index(ln) < self.num_layers}
-        # The store binds each layer's view: attention re-views along the logical
-        # page, Mamba as one opaque page per block (see kvstore._bind_pools).
-        layer_kinds = {ln: group.kind for group in self._groups
-                       for ln in group.layer_names if ln in kv_caches}
+        # Per-layer geometry comes from vLLM's KVCacheConfig -- the block count
+        # and the group's page size -- not from the tensors; the store only
+        # binds the views (see kvstore._bind_pools).
+        layer_meta = {ln: (group.kind, self._num_blocks, group.spec.page_size_bytes)
+                      for group in self._groups
+                      for ln in group.layer_names if ln in kv_caches}
         self._mamba_layers = self._mamba_layers.intersection(kv_caches)
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             kv_caches=kv_caches,
-            layer_kinds=layer_kinds,
+            layer_meta=layer_meta,
             rank=self.rank,
             tp_size=self.tp_size,
         )
