@@ -400,7 +400,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         # True = defer freeing to get_finished() (async load/save may still run).
         self._req_states.pop(request.request_id, None)
-        self._reqs_to_load.requests.pop(request.request_id, None)
         return True, None
 
     def request_finished_all_groups(
