@@ -40,7 +40,7 @@ def _state(sched, live, hashes):
     st = ReqState(
         block_hashes=(live.block_hashes
                            if live is not None else list(hashes)),
-        group_block_ids=[[] for _ in sched._groups])
+        group_block_ids=[[] for _ in sched.groups])
     sched._req_states["r1"] = st
     return st
 

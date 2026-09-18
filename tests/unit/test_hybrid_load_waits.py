@@ -7,7 +7,6 @@ import pytest
 from types import SimpleNamespace
 
 from conftest import HybridWorker, drive_start_load, make_spec
-from iaxl.kvstore import PageLayout
 from kvshrink.kvshrink_connector import (
     GroupInfo, KVShrinkConnectorMetadata, ReqMeta, RequestMetadata)
 
@@ -134,14 +133,15 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
         _group(0, "attention", [attn]), _group(1, "mamba", [mamba, draft]),
     ], [attn, mamba, draft])
     worker.num_layers = 2
-    worker._num_blocks = 2
-    worker._page_bytes = 64
+    worker.num_blocks = 2
+    worker.page_bytes = 64
     worker.model_config = SimpleNamespace(model="test-model")
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(
         static_forward_context={}))
+    # One page is 64 bytes; the fp32 mamba state is 2 rows x 16 x 4 B.
     caches = {attn: torch.zeros(2, 64, dtype=torch.uint8),
-              mamba: [torch.empty(2, 1)],
-              draft: [torch.empty(2, 1)]}
+              mamba: [torch.empty(2, 16)],
+              draft: [torch.empty(2, 16)]}
     captured = {}
 
     def store(**kwargs):
@@ -150,12 +150,12 @@ def test_registration_preserves_order_and_excludes_draft_layers(monkeypatch):
 
     monkeypatch.setattr(module, "KVStore", store)
     worker.register_kv_caches(caches)
-    assert worker._layer_names == [attn, mamba]
-    assert worker._mamba_layers == {mamba}
-    assert list(captured["kv_caches"]) == [attn, mamba]
-    assert captured["page_layout"] == PageLayout(
-        num_blocks=2, page_bytes=64,
-        kinds={attn: "attention", mamba: "mamba"})
+    # Draft layers are dropped and mamba layers are reordered to the front.
+    assert worker._layer_names == [mamba, attn]
+    assert worker.mamba_layers == {mamba}
+    assert list(captured["kv_caches"]) == [mamba, attn]
+    assert captured["block_dim"] == 0
     drive_start_load(worker, _meta(((5,), (6,))))
+    # Mamba groups are submitted before the attention group.
     assert worker.kvstore.submitted == [
-        ("kv", [attn], [5]), ("mamba", [mamba], [6])]
+        ("mamba", [mamba], [6]), ("kv", [attn], [5])]

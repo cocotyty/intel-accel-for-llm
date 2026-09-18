@@ -73,8 +73,8 @@ def HybridRequestScheduler(groups, store, block_size,
     from kvshrink.kvshrink_connector import KVShrinkConnector, RequestMetadata, ReqMeta
 
     conn = object.__new__(KVShrinkConnector)
-    conn._groups = list(groups)
-    conn._has_mamba = any(g.kind == "mamba" for g in groups)
+    conn.groups = list(groups)
+    conn.has_mamba = any(g.kind == "mamba" for g in groups)
     conn.kvstore = store
     conn.block_size = block_size
     conn._async_load_layer_config = async_load_config or AsyncLoadLayerConfig(enabled=False)
@@ -111,7 +111,7 @@ def track_new_request(sched, req_id, block_hashes, num_computed_tokens=0):
     sched._req_states[req_id] = ReqState(
         block_hashes=list(block_hashes),
         num_computed_tokens=num_computed_tokens,
-        group_block_ids=[[] for _ in sched._groups],
+        group_block_ids=[[] for _ in sched.groups],
     )
 
 
@@ -120,7 +120,9 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     from kvshrink.kvshrink_connector import KVShrinkConnector
 
     conn = object.__new__(KVShrinkConnector)
-    conn._groups = list(groups)
+    conn.groups = list(groups)
+    conn.has_mamba = any(g.kind == "mamba" for g in groups)
+    conn.vllm_device = "cpu"  # skip the device-side sync in start_load_kv
     conn.rank = rank
     conn.tp_size = tp_size
     conn.kvstore = None
@@ -131,9 +133,9 @@ def HybridWorker(groups, layer_infos, rank=0, tp_size=1):
     conn._pending_load_layers = {}
     conn._early_promoted_tasks = {}
     conn._active_promoted_tasks = {}
-    conn._layer_group = {
+    conn.layer_group = {
         ln: g.group_idx for g in groups for ln in g.layer_names}
-    conn._mamba_layers = frozenset(
+    conn.mamba_layers = frozenset(
         ln for g in groups if g.kind == "mamba" for ln in g.layer_names)
     conn._last_layer_name = order[-1] if order else None
     conn._current_put_tasks = {}

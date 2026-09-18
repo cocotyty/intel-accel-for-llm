@@ -34,11 +34,10 @@ if TYPE_CHECKING:
 
 from iaxl import KVStore, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
-from iaxl.kvstore import PageLayout
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
-from .hybrid_hit import HybridHitPolicy
 from .async_load_config import load_async_load_layer_config_from_env
+from .kv_cache_pages import PageLayout, bind_pages
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -66,6 +65,9 @@ class ReqMeta:
 @dataclass
 class ReqState:
     num_computed_tokens: int = 0
+    # Presence per namespace ("kv"/"mamba"), truncated at the first miss,
+    # from one batched store query per namespace at request start.
+    existence_cache: dict[str, list[bool]] = field(default_factory=dict)
     # Reference to the vLLM request's block_hashes list.
     block_hashes: list = field(default_factory=list)
     group_block_ids: list[list[int]] = field(default_factory=list)
@@ -87,7 +89,7 @@ class RequestMetadata:
     ) -> None:
         self.requests[req_id] = ReqMeta(
             group_block_ids,
-            [_hash_str(h) for h in block_hashes],
+            [hash_str(h) for h in block_hashes],
             is_async,
             async_load_layers,
         )
@@ -107,8 +109,37 @@ class GroupInfo:
     spec: object = None
 
 
-def _hash_str(block_hash) -> str:
+def hash_str(block_hash) -> str:
     return block_hash.hex() if isinstance(block_hash, bytes) else str(block_hash)
+
+
+def find_longest_prefix(
+    kv_flags: list[bool],
+    mamba_flags: Optional[list[bool]],
+    block_size: int,
+    num_tokens: int,
+) -> int:
+    """Longest restorable prefix, in tokens.
+
+    Attention restores a leading run of blocks. A GDN snapshot restores a
+    prefix only at an aligned boundary, and the page for boundary ``b`` is
+    keyed by block ``b - 1``'s hash. The last prompt token is always
+    recomputed, so the candidate never covers the whole prompt.
+
+    `kv_flags` / `mamba_flags` are the store's presence answers, truncated at
+    the first miss; that is exact for attention and conservative for mamba
+    (the scan stops at the first hole rather than looking past it).
+    """
+    limit = (num_tokens - 1) // block_size
+    blocks = 0
+    for exists in kv_flags[:limit]:
+        if not exists:
+            break
+        blocks += 1
+    if mamba_flags is not None:
+        while blocks > 0 and not mamba_flags[blocks - 1]:
+            blocks -= 1
+    return blocks * block_size
 
 
 def parse_kv_cache_config(
@@ -181,8 +212,19 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Early-promoted tasks active for the current forward pass.
         self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
 
+        (self.groups, self.block_size, self.num_blocks,
+         self.page_bytes) = parse_kv_cache_config(kv_cache_config)
+        self.has_mamba = any(g.kind == "mamba" for g in self.groups)
+        self.mamba_layers = frozenset(
+            ln for g in self.groups if g.kind == "mamba" for ln in g.layer_names)
+        self.layer_group = {
+            ln: g.group_idx for g in self.groups for ln in g.layer_names}
+
+        # The configured layer counts are attention layers; mamba layers are
+        # always waited for before the forward and are added by the config.
         self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
+            num_mamba_layers=len(self.mamba_layers),
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -197,20 +239,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
 
-        (self._groups, self.block_size, self._num_blocks,
-         self._page_bytes) = parse_kv_cache_config(kv_cache_config)
-        self._has_mamba = any(g.kind == "mamba" for g in self._groups)
-        self._mamba_layers = frozenset(
-            ln for g in self._groups if g.kind == "mamba" for ln in g.layer_names)
-        self._layer_group = {
-            ln: g.group_idx for g in self._groups for ln in g.layer_names}
-
         logger.info(
             "kvshrink hybrid path enabled (%s role, tp=%d rank=%d, "
             "block_size=%d, groups=%s)",
             "scheduler" if role == KVConnectorRole.SCHEDULER else "worker",
             self.tp_size, self.rank, self.block_size,
-            [(g.group_idx, g.kind) for g in self._groups])
+            [(g.group_idx, g.kind) for g in self.groups])
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
@@ -242,17 +276,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             block_hashes=request.block_hashes,
         )
         self._req_states[request.request_id] = state
-        policy = HybridHitPolicy(
-            self._groups,
-            lambda g, h: self._store().has(
-                [_hash_str(h)],
-                **({"label": "mamba" if self._groups[g].kind == "mamba" else "kv"}
-                   if self._has_mamba else {}),
-            )[0],
-            self.block_size, num_computed_tokens)
-        matched_tokens = policy.find_longest_cache_hit(
-            state.block_hashes, request.num_tokens
-        )
+
+        # One batched presence query per namespace, then a prefix scan.
+        hashes = [hash_str(h) for h in state.block_hashes]
+        kv_flags = self._store().has(hashes)
+        existence = {"kv": kv_flags}
+        mamba_flags = None
+        if self.has_mamba:
+            mamba_flags = self._store().has(hashes, label="mamba")
+            existence["mamba"] = mamba_flags
+        state.existence_cache = existence
+        matched_tokens = find_longest_prefix(
+            kv_flags, mamba_flags, self.block_size, request.num_tokens)
         num_new_tokens = max(0, matched_tokens - num_computed_tokens)
 
         # Decide sync vs async for this request. The load can only be async when
@@ -261,9 +296,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
-        # Mamba has no layer-load hook: finish every layer before resuming.
-        if self._has_mamba:
-            selected_layers = -1
         # A dynamic-map layer value of 0 selects synchronous loading. It is not
         # an async request that resumes before layer 0.
         use_async = num_new_tokens > 0 and selected_layers != 0
@@ -305,7 +337,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if load_end <= load_start:
             return
         group_ids = [tuple(ids[load_start:load_end]) for ids in block_ids]
-        for g_idx, group in enumerate(self._groups):
+        for g_idx, group in enumerate(self.groups):
             if group.kind == "mamba":
                 # Restore Mamba state directly into the execution slot (-1 - num_spec),
                 # prepending 0 sentinels so hashes[-1] aligns with the target block ID.
@@ -333,13 +365,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Prefill steps stay within the prompt, whose hashes cover every
         # full block; the decode overshoot case never reaches here (the
         # num_output_tokens gate filters it).
-        end = (state.num_computed_tokens + scheduled_tokens) // self.block_size
-        block_hashes = state.block_hashes[start:end]
-        if block_hashes:
-            block_ids = tuple(
-                tuple(ids[start:end]) for ids in state.group_block_ids
-            )
-            self._reqs_to_save.add_request(req_id, block_ids, block_hashes)
+        end = min(
+            (state.num_computed_tokens + scheduled_tokens) // self.block_size,
+            len(state.block_hashes),
+        )
+        # Only save blocks the store is missing in every namespace. A block
+        # present in one namespace but not another is still written for all
+        # groups; the put is merely redundant for the namespace that has it.
+        missing = [index for index in range(start, end)
+                   if not self._exists_everywhere(state, index)]
+        if not missing:
+            return
+        block_hashes = [state.block_hashes[index] for index in missing]
+        block_ids = tuple(
+            tuple(ids[index] for index in missing)
+            for ids in state.group_block_ids
+        )
+        self._reqs_to_save.add_request(req_id, block_ids, block_hashes)
+
+    def _exists_everywhere(self, state: ReqState, index: int) -> bool:
+        """Whether block `index` is already present in every namespace."""
+        if not state.existence_cache:
+            return False
+        for flags in state.existence_cache.values():
+            if index >= len(flags) or not flags[index]:
+                return False
+        return True
 
     def request_finished(
         self,
@@ -414,25 +465,39 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Exclude speculative draft layers while preserving registration order.
         kv_caches = {ln: cache for ln, cache in kv_caches.items()
                      if extract_layer_index(ln) < self.num_layers}
-        # Page geometry comes from vLLM's KVCacheConfig, not from the tensors;
-        # the store only binds the views (see kvstore._bind_pools).
-        page_layout = PageLayout(
-            num_blocks=self._num_blocks,
-            page_bytes=self._page_bytes,
-            kinds={ln: group.kind for group in self._groups
-                   for ln in group.layer_names if ln in kv_caches},
+        kinds = {ln: group.kind for group in self.groups
+                 for ln in group.layer_names if ln in kv_caches}
+
+        # Mamba layers first: the leading window selected by the async config
+        # must contain every mamba layer (they have no per-layer load hook),
+        # and only attention layers are waited on demand. Order within each
+        # kind is preserved.
+        ordered = [ln for ln in kv_caches if kinds.get(ln) == "mamba"]
+        ordered += [ln for ln in kv_caches if kinds.get(ln) != "mamba"]
+        kv_caches = {ln: kv_caches[ln] for ln in ordered}
+
+        # The connector owns the page binding; the store receives tensors whose
+        # dim 0 is the logical block and addresses them uniformly.
+        layout = PageLayout(
+            num_blocks=self.num_blocks,
+            page_bytes=self.page_bytes,
+            kinds={ln: kinds.get(ln, "attention") for ln in ordered},
         )
-        self._mamba_layers = self._mamba_layers.intersection(kv_caches)
-        self._last_layer_name = next(reversed(kv_caches))
-        self._layer_names = list(kv_caches.keys())
+        bound = bind_pages(kv_caches, layout)
+        self.mamba_layers = self.mamba_layers.intersection(bound)
+        # `wait_for_layer_load` resets the per-step bookkeeping on the last
+        # layer that is actually hooked: the last attention layer.
+        self._last_layer_name = next(
+            (ln for ln in reversed(ordered) if kinds.get(ln) != "mamba"), None)
+        self._layer_names = list(ordered)
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            kv_caches=kv_caches,
-            page_layout=page_layout,
+            kv_caches=bound,
+            block_dim=0,
             rank=self.rank,
             tp_size=self.tp_size,
         )
-        logger.info("Registered %d KV cache layers", len(kv_caches))
+        logger.info("Registered %d KV cache layers", len(bound))
 
     def start_load_kv(
         self,
@@ -442,6 +507,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
+
+        # vLLM zeroes recycled attention blocks on the compute stream for hybrid
+        # models (needs_kv_cache_zeroing == has_mamba_layers); our H2D copies run
+        # on a private stream, so retire that zeroing before issuing any load.
+        if self.has_mamba and self.vllm_device == "cuda":
+            torch.cuda.current_stream().synchronize()
 
         # A no-forward batch cannot consume promoted tasks layer by layer.
         if forward_context.attn_metadata is not None:
@@ -460,7 +531,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         sync_block_hashes: list[str] = []
         async_reqs: list[tuple[ReqId, ReqMeta]] = []
         for req_id, request in metadata.reqs_to_load.requests.items():
-            if len(request.group_block_ids) != len(self._groups) or any(
+            if len(request.group_block_ids) != len(self.groups) or any(
                 block_ids and len(block_ids) != len(request.block_hashes)
                 for block_ids in request.group_block_ids
             ):
@@ -486,22 +557,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         # Submit asynchronous loads per request; they are polled across
-        # scheduler steps in get_finished().
+        # scheduler steps in get_finished(). Mamba groups go first: every mamba
+        # layer must be resident before the forward (no per-layer hook), and
+        # the attention hooks then wait their own group. Groups that share one
+        # block table collapse into a single submission.
         for req_id, request in async_reqs:
             tasks: dict[str, Any] = {}
-            for group in self._groups:
-                block_ids, block_hashes = request.for_group(group.group_idx)
-                layer_names = [ln for ln in self._layer_names if ln in group.layer_names]
-                if not block_ids or not layer_names:
-                    continue
-                tasks.update(self._store().get(
-                    block_indices=block_ids,
-                    block_hashs=block_hashes,
-                    layer_names=layer_names,
-                    description=req_id,
-                    **({"label": "mamba" if group.kind == "mamba" else "kv"}
-                       if self._mamba_layers else {}),
-                ))
+            for kind, label in (("mamba", "mamba"), ("attention", "kv")):
+                batches: dict[tuple, list[str]] = {}
+                for group in self.groups:
+                    if group.kind != kind:
+                        continue
+                    block_ids, block_hashes = request.for_group(group.group_idx)
+                    layer_names = [ln for ln in self._layer_names
+                                   if ln in group.layer_names]
+                    if not block_ids or not layer_names:
+                        continue
+                    key = (tuple(block_ids), tuple(block_hashes))
+                    batches.setdefault(key, []).extend(layer_names)
+                for (ids, hashes), layer_names in batches.items():
+                    tasks.update(self._store().get(
+                        block_indices=list(ids),
+                        block_hashs=list(hashes),
+                        layer_names=layer_names,
+                        description=req_id,
+                        **({"label": label} if self.has_mamba else {}),
+                    ))
             self._pending_load_tasks[req_id] = tasks
             self._pending_load_layers[req_id] = request.async_load_layers
 
@@ -552,26 +633,26 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise TypeError("Unexpected connector metadata")
 
         for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(self._layer_group[layer_name])
+            block_ids, block_hashes = request.for_group(self.layer_group[layer_name])
             if not block_ids:
                 continue
             tasks = self._store().put(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
                 layer_names=[layer_name],
-                **({"label": "mamba" if layer_name in self._mamba_layers else "kv"}
-                   if self._mamba_layers else {}),
+                **({"label": "mamba" if layer_name in self.mamba_layers else "kv"}
+                   if self.mamba_layers else {}),
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
     def wait_for_save(self) -> None:
         """Submit Mamba states after forward; these layers have no save hook."""
-        if self._connector_metadata is None or not self._mamba_layers:
+        if self._connector_metadata is None or not self.mamba_layers:
             return
         metadata = self._get_connector_metadata()
         if not metadata.reqs_to_save.requests:
             return
-        for ln in self._mamba_layers:
+        for ln in self.mamba_layers:
             self.save_kv_layer(ln, None, None)
 
     def get_finished(

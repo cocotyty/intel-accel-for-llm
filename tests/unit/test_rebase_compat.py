@@ -9,8 +9,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from iaxl.kvstore import PageLayout
 from iaxl.kvstore import kvstore as module
+from kvshrink.kv_cache_pages import PageLayout, bind_pages
 
 
 @pytest.fixture
@@ -37,22 +37,15 @@ def test_dim1_benchmark_and_global_compression_skip(store_factory):
     assert store.kvcache_shape == [2, 3, 4]
 
 
-def test_hybrid_bound_pages_and_namespaces(store_factory):
+def test_bind_mamba_is_one_opaque_page_per_block():
     backing = torch.arange(3 * 64, dtype=torch.uint8).view(3, 64)
     conv = backing[:, :16]
-    store = store_factory("test", kv_caches={"m0": [conv]},
-                          page_layout=PageLayout(3, 64, {"m0": "mamba"}))
-    pages = store.kv_caches["m0"]
+    pages = bind_pages({"m0": [conv]}, PageLayout(3, 64, {"m0": "mamba"}))["m0"]
     assert pages.data_ptr() == backing.data_ptr()
     assert torch.equal(pages, backing)
-    store.put([1], ["hash"], label="mamba")
-    store.tensorzip.put_finish.assert_called_once_with("mamba", ["hash"])
-    assert store.tensorzip.put.call_args.kwargs["chunk_dim"] == 0
-    store.get([1], ["hash"], label="mamba")
-    assert store.tensorzip.get.call_args.kwargs["label"] == "mamba"
 
 
-def test_attention_is_reviewed_along_the_logical_block(store_factory):
+def test_bind_attention_reviews_along_the_logical_block():
     """A logical page spans `ratio` kernel blocks: binding re-views dim 0 so
     scheduler block IDs index it, keeping the trailing dims untouched."""
     num_blocks, ratio, kernel_tokens = 3, 4, 2
@@ -60,18 +53,28 @@ def test_attention_is_reviewed_along_the_logical_block(store_factory):
         num_blocks * ratio * 2 * kernel_tokens * 2, dtype=torch.float32).reshape(
             num_blocks * ratio, 2, kernel_tokens, 2)
     page_elements = ratio * 2 * kernel_tokens * 2
-    mamba = [torch.zeros(num_blocks, page_elements)]  # same page bytes
     page_bytes = page_elements * 4  # float32
-    store = store_factory(
-        "test", kv_caches={"a0": attn, "m0": mamba},
-        page_layout=PageLayout(num_blocks, page_bytes,
-                               {"a0": "attention", "m0": "mamba"}))
-    pages = store.kv_caches["a0"]
+    mamba = [torch.zeros(num_blocks, page_elements)]  # same page bytes
+    bound = bind_pages(
+        {"a0": attn, "m0": mamba},
+        PageLayout(num_blocks, page_bytes, {"a0": "attention", "m0": "mamba"}))
+    pages = bound["a0"]
     assert pages.shape == (num_blocks, ratio, 2, kernel_tokens, 2)
     assert pages[1].data_ptr() == attn[ratio].data_ptr()
     assert pages.untyped_storage().data_ptr() == attn.untyped_storage().data_ptr()
-    assert store.kv_caches["m0"].shape == (num_blocks, page_elements * 4)
-    assert store.block_dim == 0
+    assert bound["m0"].shape == (num_blocks, page_elements * 4)
+
+
+def test_store_label_namespaces(store_factory):
+    """The store carries the kv/mamba namespace; pages are already bound."""
+    backing = torch.zeros(3, 64, dtype=torch.uint8)
+    store = store_factory("test", block_dim=0, kv_caches={"m0": backing})
+    store.put([1], ["hash"], label="mamba")
+    store.tensorzip.put_finish.assert_called_once_with("mamba", ["hash"])
+    assert store.tensorzip.put.call_args.kwargs["label"] == "mamba"
+    assert store.tensorzip.put.call_args.kwargs["chunk_dim"] == 0
+    store.get([1], ["hash"], label="mamba")
+    assert store.tensorzip.get.call_args.kwargs["label"] == "mamba"
 
 
 def test_controller_does_not_require_block_dim(store_factory):
@@ -82,14 +85,14 @@ def test_controller_does_not_require_block_dim(store_factory):
         store_factory("test", kv_caches={"a0": torch.zeros(2, 3)})
 
 
-def test_both_shells_share_the_page_layout_kwarg():
+def test_both_shells_share_the_block_dim_kwarg():
     """The dispatch picks one shell at import; both must accept the connector call."""
     import inspect
     from iaxl.remote_pool.kvstore_remote import KVStoreRemote
 
     for cls in (module.KVStoreLocal, KVStoreRemote):
         params = inspect.signature(cls.__init__).parameters
-        assert "page_layout" in params and "layer_names" in params, cls
+        assert "block_dim" in params and "kv_caches" in params, cls
 
 
 def test_attention_connector_calls_remote_store_without_label(monkeypatch):
@@ -120,10 +123,10 @@ def test_attention_connector_calls_remote_store_without_label(monkeypatch):
     assert [call[-1] for call in calls] == ["get", "put"]
 
 
-@pytest.mark.parametrize("device,sync,expected", [
-    ("cuda", False, [False]), ("cuda", True, [True]), (None, False, []),
+@pytest.mark.parametrize("device,sync,expected_calls", [
+    ("cuda", False, 0), ("cuda", True, 1), (None, False, 0),
 ])
-def test_restore_orders_gpu_but_skips_cpu_daemon(monkeypatch, device, sync, expected):
+def test_restore_syncs_gpu_only_when_enabled(monkeypatch, device, sync, expected_calls):
     import iaxl.kvflow.flow as flow
 
     tensor = SimpleNamespace(
@@ -140,4 +143,4 @@ def test_restore_orders_gpu_but_skips_cpu_daemon(monkeypatch, device, sync, expe
     obj.chunk_pool = SimpleNamespace(allocate=lambda *args: [torch.zeros(8)])
     monkeypatch.setattr(flow, "stream_sync_on_get", sync)
     obj.get("kv", {"a0": tensor}, 0, [1], ["h"])
-    assert [c.kwargs["sync_cur_stream"] for c in ctx.xfer_wait_cur_stream.call_args_list] == expected
+    assert ctx.xfer_wait_cur_stream.call_count == expected_calls

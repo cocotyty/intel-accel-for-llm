@@ -69,7 +69,7 @@ class _FakeStore:
         return True
 
     def has(self, chunk_labels, label=None):
-        return [True]
+        return [True] * len(chunk_labels)
 
 
 def _worker(store, hybrid=True):
@@ -134,8 +134,9 @@ def test_async_queues_groups_per_request():
     metadata = _meta()
     metadata.reqs_to_load.requests.update(_meta(-1, "r2").reqs_to_load.requests)
     drive_start_load(worker, metadata)
+    # Mamba groups are submitted before the attention group.
     assert store.submitted == [
-        (layer, req_id) for req_id in ("r1", "r2") for layer in ATTN + GDN
+        (layer, req_id) for req_id in ("r1", "r2") for layer in GDN + ATTN
     ]
     assert store.waited == []
     store.landed = {"m0", *ATTN}
@@ -252,7 +253,7 @@ def _alloc(sched, block_ids, hashes, ext, is_async, layers=-1,
 
     st = ReqState(
         block_hashes=list(hashes),
-        group_block_ids=[[] for _ in sched._groups])
+        group_block_ids=[[] for _ in sched.groups])
     st.is_async = is_async
     st.async_load_layers = layers
     sched._req_states[req_id] = st
@@ -300,14 +301,20 @@ def test_async_plan_is_emitted_only_once():
         _empty_out()).reqs_to_load.requests == {}
 
 
-@pytest.mark.parametrize("selected_layers", [0, 1, 4, -1])
-def test_recurrent_models_force_full_async(selected_layers):
-    """Both disabled async and early-start configs become full async."""
+@pytest.mark.parametrize("selected_layers,expected", [
+    (0, len(GDN)), (1, 1 + len(GDN)), (4, 4 + len(GDN)), (-1, -1),
+])
+def test_recurrent_models_include_mamba_in_the_layer_count(
+        selected_layers, expected):
+    """The configured count is attention layers; mamba layers have no
+    per-layer hook, so they are always waited for and added on top. A
+    negative selection already means every layer and is not offset."""
     from conftest import HybridRequestScheduler
+    from kvshrink.async_load_config import AsyncLoadLayerConfig
 
-    class _Cfg:
-        def select(self, concurrency):
-            return selected_layers
+    cfg = AsyncLoadLayerConfig(
+        enabled=True, fixed_layers=selected_layers,
+        num_mamba_layers=len(GDN))
 
     class _Req:
         request_id = "r1"
@@ -316,10 +323,10 @@ def test_recurrent_models_force_full_async(selected_layers):
 
     hybrid = HybridRequestScheduler(
         [_group(0, "attention", ATTN), _group(1, "mamba", GDN)],
-        _FakeStore(), 16, async_load_config=_Cfg())
+        _FakeStore(), 16, async_load_config=cfg)
     external, use_async = hybrid.get_num_new_matched_tokens(_Req(), 0)
     assert external == 32 and use_async is True
-    assert hybrid._req_states["r1"].async_load_layers == -1
+    assert hybrid._req_states["r1"].async_load_layers == expected
 
 
 def test_async_mamba_targets_the_slot_vllm_reads_as_prev():
