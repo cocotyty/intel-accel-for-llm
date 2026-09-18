@@ -33,7 +33,7 @@ class _Store:
         self.committed = committed
         self.committed_pairs = committed_pairs
 
-    def has(self, chunk_labels, label=None):
+    def has(self, chunk_labels, label=None, truncate=True):
         """Presence is per (group, block hash): a group's layers are all
         written in one call and recorded as one unit, so a single layer
         can never be the odd one out. What CAN differ is one group

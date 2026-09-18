@@ -68,7 +68,7 @@ class _FakeStore:
         self.waited.extend(sorted(layers))
         return True
 
-    def has(self, chunk_labels, label=None):
+    def has(self, chunk_labels, label=None, truncate=True):
         return [True] * len(chunk_labels)
 
 

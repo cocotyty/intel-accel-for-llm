@@ -47,7 +47,7 @@ class _Store:
     def __init__(self):
         self.committed = set()
 
-    def has(self, chunk_labels, label=None):
+    def has(self, chunk_labels, label=None, truncate=True):
         return [int(c) in self.committed for c in chunk_labels]
 
 

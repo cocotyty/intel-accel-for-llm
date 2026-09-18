@@ -126,9 +126,9 @@ def find_longest_prefix(
     keyed by block ``b - 1``'s hash. The last prompt token is always
     recomputed, so the candidate never covers the whole prompt.
 
-    `kv_flags` / `mamba_flags` are the store's presence answers, truncated at
-    the first miss; that is exact for attention and conservative for mamba
-    (the scan stops at the first hole rather than looking past it).
+    `kv_flags` / `mamba_flags` are raw per-block presence: attention's leading
+    run is taken here, and the GDN scan must see past its own holes (only the
+    last boundary is typically saved), so the store must not pre-truncate.
     """
     limit = (num_tokens - 1) // block_size
     blocks = 0
@@ -279,11 +279,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # One batched presence query per namespace, then a prefix scan.
         hashes = [hash_str(h) for h in state.block_hashes]
-        kv_flags = self._store().has(hashes)
+        kv_flags = self._store().has(hashes, truncate=False)
         existence = {"kv": kv_flags}
         mamba_flags = None
         if self.has_mamba:
-            mamba_flags = self._store().has(hashes, label="mamba")
+            mamba_flags = self._store().has(
+                hashes, label="mamba", truncate=False)
             existence["mamba"] = mamba_flags
         state.existence_cache = existence
         matched_tokens = find_longest_prefix(

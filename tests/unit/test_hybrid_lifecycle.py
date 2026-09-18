@@ -63,7 +63,7 @@ def _mamba():
 
 
 class _MissStore:
-    def has(self, chunk_labels, label=None):
+    def has(self, chunk_labels, label=None, truncate=True):
         return [False]
 
 
@@ -73,7 +73,7 @@ class _HitStore:
     def __init__(self, committed):
         self.committed = committed
 
-    def has(self, chunk_labels, label=None):
+    def has(self, chunk_labels, label=None, truncate=True):
         return [int(chunk_labels[0]) in self.committed]
 
 

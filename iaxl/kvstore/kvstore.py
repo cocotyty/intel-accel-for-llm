@@ -263,12 +263,14 @@ class KVStoreLocal:
         )
 
     def has(self, block_hashs: Optional[List[str]] = None,
-            label: Optional[str] = None) -> List[bool]:
-        """Presence, truncated at the first miss.
+            label: Optional[str] = None,
+            truncate: bool = True) -> List[bool]:
+        """Presence per block hash.
 
-        The truncation is prefix semantics: a cached prefix is only
-        usable up to its first hole, so nothing past one is worth
-        reporting. ``label`` selects the namespace, as in ``put``.
+        ``truncate`` (default) applies prefix semantics: a cached prefix is
+        only usable up to its first hole, so nothing past one is reported.
+        Callers that scan the whole vector (e.g. a GDN snapshot at the last
+        boundary) pass ``truncate=False``. ``label`` selects the namespace.
         """
         if not block_hashs:
             self.tensorzip.record_flush()
@@ -278,6 +280,8 @@ class KVStoreLocal:
             label=label or self.LABEL,
             chunk_labels=block_hashs,
         )
+        if not truncate:
+            return results
 
         mask = np.array(results, dtype=np.bool_)
         idx = np.argmin(mask)
