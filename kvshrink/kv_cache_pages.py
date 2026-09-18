@@ -13,9 +13,12 @@ source vLLM's own connectors read (`offloading/worker.py`,
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, Mapping, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from .kvshrink_connector import GroupInfo
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,33 @@ def opaque_pages(
         tensor.untyped_storage()
     )
     return base.view(num_blocks, page_bytes)
+
+
+def bind_kv_caches(
+    kv_caches: Dict[str, torch.Tensor | list],
+    groups: Iterable["GroupInfo"],
+    num_blocks: int,
+    page_bytes: int,
+) -> Tuple[Dict[str, torch.Tensor], PageLayout]:
+    """Order and bind vLLM's KV caches for the connector.
+
+    Mamba layers are placed first: the leading window selected by the async
+    config must contain every mamba layer (they have no per-layer load hook),
+    and only attention layers are waited on demand. Order within each kind is
+    preserved. Returns the bound views and the `PageLayout` used, whose `kinds`
+    keys are in the new order.
+    """
+    kinds = {ln: group.kind for group in groups
+             for ln in group.layer_names if ln in kv_caches}
+    ordered = [ln for ln in kv_caches if kinds.get(ln) == "mamba"]
+    ordered += [ln for ln in kv_caches if kinds.get(ln) != "mamba"]
+    kv_caches = {ln: kv_caches[ln] for ln in ordered}
+    layout = PageLayout(
+        num_blocks=num_blocks,
+        page_bytes=page_bytes,
+        kinds={ln: kinds.get(ln, "attention") for ln in ordered},
+    )
+    return bind_pages(kv_caches, layout), layout
 
 
 def bind_pages(

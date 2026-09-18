@@ -37,7 +37,7 @@ from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .async_load_config import load_async_load_layer_config_from_env
-from .kv_cache_pages import PageLayout, bind_pages
+from .kv_cache_pages import bind_kv_caches
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -466,31 +466,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Exclude speculative draft layers while preserving registration order.
         kv_caches = {ln: cache for ln, cache in kv_caches.items()
                      if extract_layer_index(ln) < self.num_layers}
-        kinds = {ln: group.kind for group in self.groups
-                 for ln in group.layer_names if ln in kv_caches}
-
-        # Mamba layers first: the leading window selected by the async config
-        # must contain every mamba layer (they have no per-layer load hook),
-        # and only attention layers are waited on demand. Order within each
-        # kind is preserved.
-        ordered = [ln for ln in kv_caches if kinds.get(ln) == "mamba"]
-        ordered += [ln for ln in kv_caches if kinds.get(ln) != "mamba"]
-        kv_caches = {ln: kv_caches[ln] for ln in ordered}
-
-        # The connector owns the page binding; the store receives tensors whose
-        # dim 0 is the logical block and addresses them uniformly.
-        layout = PageLayout(
-            num_blocks=self.num_blocks,
-            page_bytes=self.page_bytes,
-            kinds={ln: kinds.get(ln, "attention") for ln in ordered},
-        )
-        bound = bind_pages(kv_caches, layout)
+        # Order and bind the pages connector-side; the store receives tensors
+        # whose dim 0 is the logical block and addresses them uniformly.
+        bound, layout = bind_kv_caches(
+            kv_caches, self.groups, self.num_blocks, self.page_bytes)
         self.mamba_layers = self.mamba_layers.intersection(bound)
         # `wait_for_layer_load` resets the per-step bookkeeping on the last
         # layer that is actually hooked: the last attention layer.
         self._last_layer_name = next(
-            (ln for ln in reversed(ordered) if kinds.get(ln) != "mamba"), None)
-        self._layer_names = list(ordered)
+            (ln for ln in reversed(list(layout.kinds))
+             if layout.kinds[ln] != "mamba"), None)
+        self._layer_names = list(bound)
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             kv_caches=bound,
