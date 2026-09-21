@@ -312,9 +312,7 @@ def test_recurrent_models_include_mamba_in_the_layer_count(
     from conftest import HybridRequestScheduler
     from kvshrink.async_load_config import AsyncLoadLayerConfig
 
-    cfg = AsyncLoadLayerConfig(
-        enabled=True, fixed_layers=selected_layers,
-        num_mamba_layers=len(GDN))
+    cfg = AsyncLoadLayerConfig(enabled=True, fixed_layers=selected_layers)
 
     class _Req:
         request_id = "r1"

@@ -75,6 +75,8 @@ def HybridRequestScheduler(groups, store, block_size,
     conn = object.__new__(KVShrinkConnector)
     conn.groups = list(groups)
     conn.has_mamba = any(g.kind == "mamba" for g in groups)
+    conn.mamba_layers = frozenset(
+        ln for g in groups if g.kind == "mamba" for ln in g.layer_names)
     conn.kvstore = store
     conn.block_size = block_size
     conn._async_load_layer_config = async_load_config or AsyncLoadLayerConfig(enabled=False)

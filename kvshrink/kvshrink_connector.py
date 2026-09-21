@@ -220,11 +220,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.layer_group = {
             ln: g.group_idx for g in self.groups for ln in g.layer_names}
 
-        # The configured layer counts are attention layers; mamba layers are
-        # always waited for before the forward and are added by the config.
         self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
-            num_mamba_layers=len(self.mamba_layers),
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -297,6 +294,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
+        # The config counts attention layers. Mamba layers have no per-layer
+        # load hook, must be resident before the forward and lead the worker's
+        # layer order, so widen the early-promote window to cover them. A
+        # negative selection already means every layer and is not offset.
+        if selected_layers >= 0 and self.has_mamba:
+            selected_layers += len(self.mamba_layers)
         # A dynamic-map layer value of 0 selects synchronous loading. It is not
         # an async request that resumes before layer 0.
         use_async = num_new_tokens > 0 and selected_layers != 0
@@ -430,10 +433,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             block_ids = cached_reqs.new_block_ids[index]
             state = self._req_states[req_id]
             state.num_computed_tokens = cached_reqs.num_computed_tokens[index]
-            # num_output_tokens counts async-scheduling placeholders, which
-            # are only added for decode steps -- 0 means still in prefill.
-            # This filters MTP decode, which schedules 1 + num_spec > 1.
-            if cached_reqs.num_output_tokens[index] != 0:
+            # Prefill only: a decode step carries output tokens (including MTP
+            # placeholders) and must not be treated as a save window.
+            if not cached_reqs.is_context_phase(req_id):
                 continue
             if block_ids:
                 for group_ids, ids in zip(state.group_block_ids, block_ids):

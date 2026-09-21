@@ -44,7 +44,8 @@ def test_scheduler_filters_decode_before_save(new_request, scheduled, num_output
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[] if new_request else ["r1"],
             new_block_ids=[None], num_computed_tokens=[0],
-            num_output_tokens=[num_output], resumed_req_ids=set()),
+            num_output_tokens=[num_output], resumed_req_ids=set(),
+            is_context_phase=lambda req_id: num_output == 0),
         num_scheduled_tokens={"r1": scheduled},
     ))
     assert ("r1" in metadata.reqs_to_save.requests) == expect_save

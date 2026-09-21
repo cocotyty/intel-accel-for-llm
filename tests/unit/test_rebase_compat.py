@@ -95,6 +95,17 @@ def test_both_shells_share_the_block_dim_kwarg():
         assert "block_dim" in params and "kv_caches" in params, cls
 
 
+def test_both_shells_share_data_path_signatures():
+    """The connector calls put/get/has with namespace kwargs on either shell."""
+    import inspect
+    from iaxl.remote_pool.kvstore_remote import KVStoreRemote
+
+    for name in ("put", "get", "has"):
+        local = list(inspect.signature(getattr(module.KVStoreLocal, name)).parameters)
+        remote = list(inspect.signature(getattr(KVStoreRemote, name)).parameters)
+        assert local == remote, name
+
+
 def test_attention_connector_calls_remote_store_without_label(monkeypatch):
     from conftest import HybridWorker, HybridRequestScheduler, make_spec, drive_start_load
     from iaxl.remote_pool.kvstore_remote import KVStoreRemote
@@ -107,7 +118,8 @@ def test_attention_connector_calls_remote_store_without_label(monkeypatch):
     remote._sync = lambda: None
     remote.rpc = SimpleNamespace(call=lambda *args: bytes([1]))
     calls = []
-    remote._xfer = lambda *args: calls.append(args) or {"a0": None}
+    remote._xfer = lambda *args, **kwargs: calls.append(
+        (args[-1], kwargs.get("label"))) or {"a0": None}
     groups = [GroupInfo(0, "attention", ("a0",), make_spec("attention", 16))]
     scheduler = HybridRequestScheduler(groups, remote, 16)
     scheduler.get_num_new_matched_tokens(SimpleNamespace(
@@ -120,7 +132,7 @@ def test_attention_connector_calls_remote_store_without_label(monkeypatch):
         async_load_layers=-1)
     drive_start_load(worker, KVShrinkConnectorMetadata(requests, requests))
     worker.save_kv_layer("a0", None, None)
-    assert [call[-1] for call in calls] == ["get", "put"]
+    assert calls == [("get", None), ("put", None)]
 
 
 @pytest.mark.parametrize("device,sync,expected_calls", [
