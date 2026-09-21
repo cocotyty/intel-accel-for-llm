@@ -326,14 +326,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
     def _view_as_blocks(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """View every layer as one contiguous ``(num_blocks, page_bytes)`` byte
-        page per logical block.
-
-        vLLM packs all layers into one backing allocation and hands out
-        kernel-block-granular strided views, so the connector binds from the
-        storage geometry (the page size from ``KVCacheConfig``), not from the
-        tensor's own shape. The store then indexes logical block IDs directly.
-        """
+        """View each layer's KV cache as contiguous ``(num_blocks, page)`` rows
+        per logical block, taken from the ``KVCacheConfig`` geometry."""
         num_blocks = self.kv_cache_config.num_blocks
         spec_by_layer: dict[str, Any] = {}
         for group in self.kv_cache_config.kv_cache_groups:
@@ -347,26 +341,36 @@ class KVShrinkConnector(KVConnectorBase_V1):
                     layer_name, group.kv_cache_spec
                 )
 
-        bound: dict[str, torch.Tensor] = {}
+        attn_dtype = next(
+            (
+                spec.dtype
+                for spec in spec_by_layer.values()
+                if isinstance(spec, AttentionSpec)
+            ),
+            None,
+        )
+        assert attn_dtype is not None
+
+        views: dict[str, torch.Tensor] = {}
         for layer_name, cache in kv_caches.items():
             spec = spec_by_layer[layer_name]
             ref = group_kernel_blocks(cache, num_blocks)
             page_bytes = spec.page_size_bytes
-            elem_size = ref.element_size()
-            block_stride = (
-                ref.stride(0) * elem_size
-                if isinstance(spec, AttentionSpec)
-                else page_bytes
-            )
-            bound[layer_name] = torch.tensor(
-                [], dtype=torch.int8, device=ref.device
+            assert page_bytes % attn_dtype.itemsize == 0
+            views[layer_name] = torch.tensor(
+                [], dtype=attn_dtype, device=ref.device
             ).set_(
                 ref.untyped_storage(),
-                ref.storage_offset() * elem_size,
-                (num_blocks, page_bytes),
-                (block_stride, 1),
+                ref.storage_offset(),
+                (num_blocks, page_bytes // attn_dtype.itemsize),
+                (
+                    ref.stride(0)
+                    if isinstance(spec, AttentionSpec)
+                    else page_bytes // attn_dtype.itemsize,
+                    1,
+                ),
             )
-        return bound
+        return views
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not kv_caches:
