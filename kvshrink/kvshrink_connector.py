@@ -352,19 +352,23 @@ class KVShrinkConnector(KVConnectorBase_V1):
             spec = spec_by_layer[layer_name]
             ref = group_kernel_blocks(cache, num_blocks)
             page_bytes = spec.page_size_bytes
-            elem_size = ref.element_size()
-            block_stride = (
-                ref.stride(0) * elem_size
+            # Keep the layer's real dtype so the store still knows bf16 vs fp8.
+            # Mamba has no single dtype (conv + ssm are packed as raw bytes), so
+            # it stays byte-addressed.
+            dtype = getattr(spec, "dtype", None) or torch.uint8
+            elem_size = torch.empty(0, dtype=dtype).element_size()
+            block_stride_elems = (
+                ref.stride(0)
                 if isinstance(spec, AttentionSpec)
-                else page_bytes
+                else page_bytes // elem_size
             )
             bound[layer_name] = torch.tensor(
-                [], dtype=torch.int8, device=ref.device
+                [], dtype=dtype, device=ref.device
             ).set_(
                 ref.untyped_storage(),
-                ref.storage_offset() * elem_size,
-                (num_blocks, page_bytes),
-                (block_stride, 1),
+                ref.storage_offset(),
+                (num_blocks, page_bytes // elem_size),
+                (block_stride_elems, 1),
             )
         return bound
 
