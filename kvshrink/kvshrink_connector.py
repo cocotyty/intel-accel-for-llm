@@ -19,7 +19,12 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+    group_kernel_blocks,
+)
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -102,13 +107,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
         self.model_config = vllm_config.model_config
         self.block_size = vllm_config.cache_config.block_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.use_mla = self.model_config.use_mla
         self.vllm_device = vllm_config.device_config.device_type
         self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
 
@@ -318,6 +323,51 @@ class KVShrinkConnector(KVConnectorBase_V1):
     # Worker Side Methods
     ############################################################
 
+    def _bind_pages(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """View every layer as one contiguous ``(num_blocks, page_bytes)`` byte
+        page per logical block.
+
+        vLLM packs all layers into one backing allocation and hands out
+        kernel-block-granular strided views, so the connector binds from the
+        storage geometry (the page size from ``KVCacheConfig``), not from the
+        tensor's own shape. The store then indexes logical block IDs directly.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        spec_by_layer: dict[str, Any] = {}
+        for group in self.kv_cache_config.kv_cache_groups:
+            specs = (
+                group.kv_cache_spec.kv_cache_specs
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else {}
+            )
+            for layer_name in group.layer_names:
+                spec_by_layer[layer_name] = specs.get(
+                    layer_name, group.kv_cache_spec
+                )
+
+        bound: dict[str, torch.Tensor] = {}
+        for layer_name, cache in kv_caches.items():
+            spec = spec_by_layer[layer_name]
+            ref = group_kernel_blocks(cache, num_blocks)
+            page_bytes = spec.page_size_bytes
+            elem_size = ref.element_size()
+            block_stride = (
+                ref.stride(0) * elem_size
+                if isinstance(spec, AttentionSpec)
+                else page_bytes
+            )
+            bound[layer_name] = torch.tensor(
+                [], dtype=torch.int8, device=ref.device
+            ).set_(
+                ref.untyped_storage(),
+                ref.storage_offset() * elem_size,
+                (num_blocks, page_bytes),
+                (block_stride, 1),
+            )
+        return bound
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
@@ -330,13 +380,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
                     raise RuntimeError("FlashInfer is not supported")
                 break
 
+        kv_caches = self._bind_pages(kv_caches)
         first_kv_cache = next(iter(kv_caches.values()))
-        block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            block_dim=block_dim,
+            block_dim=0,
             kv_caches=kv_caches,
             rank=self.rank,
             tp_size=self.tp_size,
@@ -403,7 +453,11 @@ class KVShrinkConnector(KVConnectorBase_V1):
             self._pending_load_layers[req_id] = request.async_load_layers
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if not self._current_get_tasks and not self._active_promoted_tasks:
+        if (
+            not self._current_get_tasks
+            and not self._early_promoted_tasks
+            and not self._active_promoted_tasks
+        ):
             return
 
         # Wait for the synchronous (batched) loads for this layer.
@@ -419,8 +473,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
         # Wait for the remaining layers of early-promoted async loads. Their
         # first N layers were already finalized in get_finished(); waiting on an
-        # already-finalized layer is a no-op.
-        for tasks in self._active_promoted_tasks.values():
+        # already-finalized layer is a no-op. Early-promoted tasks are waited
+        # here too because vLLM starts async loads after the forward, so the
+        # start_load_kv() hand-off to `_active_promoted_tasks` can land a step
+        # late; the promoted request's own forward must not race its load.
+        promoted = list(self._early_promoted_tasks.values())
+        promoted += list(self._active_promoted_tasks.values())
+        for tasks in promoted:
             success = self._store().get_wait(
                 get_results=tasks,
                 layer_names=[layer_name],
