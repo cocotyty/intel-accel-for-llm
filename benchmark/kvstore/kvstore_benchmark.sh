@@ -28,6 +28,7 @@ for arg in "$@"; do
 done
 
 export LD_PRELOAD="/usr/local/lib/libiomp5.so${LD_PRELOAD:+:$LD_PRELOAD}"
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4${LD_PRELOAD:+:$LD_PRELOAD}"
 
 if [[ "$USE_DSA" == "1" ]]; then
     export IAXL_DSA_GD_ENABLE=1
