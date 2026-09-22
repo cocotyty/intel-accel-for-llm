@@ -311,6 +311,10 @@ class KVShrinkConnector(KVConnectorBase_V1):
             if block_ids and block_ids[0] and is_prefill:
                 self._add_request_to_save(req_id, block_ids[0])
 
+        # kvshrink loads asynchronously, but its start_load_kv only submits
+        # host-side work; running it before the forward keeps the 0.23-style
+        # placement (0.29 would otherwise defer it to post_forward).
+        scheduler_output.has_sync_kv_loads = True
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
@@ -457,11 +461,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
             self._pending_load_layers[req_id] = request.async_load_layers
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if (
-            not self._current_get_tasks
-            and not self._early_promoted_tasks
-            and not self._active_promoted_tasks
-        ):
+        if not self._current_get_tasks and not self._active_promoted_tasks:
             return
 
         # Wait for the synchronous (batched) loads for this layer.
@@ -477,13 +477,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
         # Wait for the remaining layers of early-promoted async loads. Their
         # first N layers were already finalized in get_finished(); waiting on an
-        # already-finalized layer is a no-op. Early-promoted tasks are waited
-        # here too because vLLM starts async loads after the forward, so the
-        # start_load_kv() hand-off to `_active_promoted_tasks` can land a step
-        # late; the promoted request's own forward must not race its load.
-        promoted = list(self._early_promoted_tasks.values())
-        promoted += list(self._active_promoted_tasks.values())
-        for tasks in promoted:
+        # already-finalized layer is a no-op.
+        for tasks in self._active_promoted_tasks.values():
             success = self._store().get_wait(
                 get_results=tasks,
                 layer_names=[layer_name],
