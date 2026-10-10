@@ -20,7 +20,8 @@ export ENDPOINT=http://$HOST:$PORT
 
 input_len=8000
 output_len=128
-num_prompts=10
+num_prompts=${NUM_PROMPTS:-10}
+num_warmups=${NUM_WARMUPS:-5}
 concurrency=4
 hit_rate=80
 random_prefix_len=$((input_len * hit_rate / 100))
@@ -47,6 +48,6 @@ ARGS=(
 
 echo "=== Hit_rate=${hit_rate} Input=${input_len} (${random_prefix_len}+${random_input_len}), Output=${output_len} Concurrency=${concurrency}, num_prompts=${num_prompts} === "
 vllm bench serve "${ARGS[@]}" \
-    --num-warmups 5 \
+    --num-warmups $num_warmups \
     --num-prompts $num_prompts \
     --max-concurrency $concurrency
