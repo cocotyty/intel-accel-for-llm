@@ -31,8 +31,9 @@ class ThreadPool {
     // Calls fn(tid) for every tid in [0, n) and returns once all of them finish.
     void run(int n, const std::function<void(int)> &fn);
 
-    // Shared pool of IAXL_OMP_THREAD_NUM threads, created on first use.
-    static ThreadPool &instance();
+    // Shared pool of IAXL_OMP_THREAD_NUM threads, created on first use. Index 1 is the separate
+    // pool of the duplex decompression side, so it never waits for a compression run.
+    static ThreadPool &instance(int index = 0);
 
   private:
     void loop(int tid);
@@ -47,6 +48,9 @@ class ThreadPool {
     uint64_t generation_ = 0;
 };
 
+// Which ThreadPool::instance() run_threads uses on this thread (1 on the duplex unzip queue).
+inline thread_local int t_pool_index = 0;
+
 // Calls fn(tid) for every tid in [0, n) concurrently; a one-thread run stays on the caller.
 template <class Fn> void run_threads(int n, Fn &&fn) {
     if (n <= 0)
@@ -54,7 +58,7 @@ template <class Fn> void run_threads(int n, Fn &&fn) {
     if (n == 1) {
         fn(0);
     } else if (!envs.IAXL_USE_OMP) {
-        ThreadPool::instance().run(n, fn);
+        ThreadPool::instance(t_pool_index).run(n, fn);
     } else {
 #pragma omp parallel num_threads(n)
         {

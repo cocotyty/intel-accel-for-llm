@@ -12,6 +12,7 @@
 #include "context.h"
 #include "kv_pool.h"
 #include "kv_zip.h"
+#include "parallel.h"
 
 using namespace profiler;
 using namespace kv_zip;
@@ -65,8 +66,9 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
                         std::cout << "[KVClip] cache miss on unzip (will retry): "
                                   << chunk_labels[i] << "\n";
                         auto self = shared_from_this();
-                        omp_queue().submit(
+                        unzip_queue().submit(
                             [self]() {
+                                parallel::t_pool_index = envs.IAXL_ZIP_DUPLEX ? 1 : 0;
                                 try {
                                     self->execute(true);
                                 } catch (...) {
@@ -178,8 +180,9 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
     work->cpu_tensors = cpu_tensors;
     work->promise = promise;
 
-    omp_queue().submit(
+    unzip_queue().submit(
         [work]() {
+            parallel::t_pool_index = envs.IAXL_ZIP_DUPLEX ? 1 : 0;
             try {
                 work->execute(false);
             } catch (...) {

@@ -240,3 +240,18 @@ inline TaskQueue &omp_queue() {
 
     return queue;
 }
+
+// Decompression queue: omp_queue() itself unless IAXL_ZIP_DUPLEX, in which case decompression
+// gets its own thread so it runs concurrently with compression on omp_queue().
+inline TaskQueue &unzip_queue() {
+    if (!envs.IAXL_ZIP_DUPLEX)
+        return omp_queue();
+    omp_queue();  // same one-time OpenMP setup
+    static TaskQueue queue("OMP-Unzip");
+    static const bool initialized = []() {
+        queue.init();
+        return true;
+    }();
+    (void)initialized;
+    return queue;
+}

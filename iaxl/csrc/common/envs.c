@@ -87,6 +87,12 @@ __attribute__((constructor(101))) void envs_init(void) {
     if (envs.IAXL_OMP_THREAD_NUM < 1)
         envs.IAXL_OMP_THREAD_NUM = 1;
     envs.IAXL_USE_OMP = env_bool("IAXL_USE_OMP", 1);
+    envs.IAXL_ZIP_DUPLEX = env_bool("IAXL_ZIP_DUPLEX", 0);
+    // Default split: half of the instances (rounded down, at least 1) compress.
+    const int qat_half = envs.IAXL_QAT_INSTANCE_NUM / 2 > 0 ? envs.IAXL_QAT_INSTANCE_NUM / 2 : 1;
+    const int iaa_half = envs.IAXL_IAA_INSTANCE_NUM / 2 > 0 ? envs.IAXL_IAA_INSTANCE_NUM / 2 : 1;
+    envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES = env_int("IAXL_QAT_ZIP_COMPRESS_INSTANCES", qat_half);
+    envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES = env_int("IAXL_IAA_ZIP_COMPRESS_INSTANCES", iaa_half);
 
     envs.IAXL_KV_COMPRESSION = env_bool("IAXL_KV_COMPRESSION", 1);
     if (envs.IAXL_KV_COMPRESSION && !envs.IAXL_QAT_ZIP_ENABLE && !envs.IAXL_IAA_ZIP_ENABLE &&
@@ -143,5 +149,10 @@ __attribute__((constructor(101))) void envs_init(void) {
                envs.IAXL_ZIP_EXPONENT_ONLY ? "ON" : "OFF", envs.IAXL_KV_LOSSY_TRUNC,
                envs.IAXL_DSA_GD_ENABLE ? "ON" : "OFF",
                envs.IAXL_DSA_GD_RESET_ON_DESTROY ? "ON" : "OFF", envs.IAXL_PROFILE_MODE);
+        if (envs.IAXL_ZIP_DUPLEX)
+            printf("[iaxl] duplex: ON, compress instances qat=%d/%d iaa=%d/%d, "
+                   "decompress gets the rest\n",
+                   envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES, envs.IAXL_QAT_INSTANCE_NUM,
+                   envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES, envs.IAXL_IAA_INSTANCE_NUM);
     }
 }

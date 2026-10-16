@@ -57,10 +57,13 @@ void ThreadPool::loop(int tid) {
     }
 }
 
-ThreadPool &ThreadPool::instance() {
+ThreadPool &ThreadPool::instance(int index) {
     // Never destroyed: work may still be running on it while the process exits.
     static ThreadPool *pool = new ThreadPool(envs.IAXL_OMP_THREAD_NUM);
-    return *pool;
+    if (index == 0)
+        return *pool;
+    static ThreadPool *unzip_pool = new ThreadPool(envs.IAXL_OMP_THREAD_NUM);
+    return *unzip_pool;
 }
 
 } // namespace parallel

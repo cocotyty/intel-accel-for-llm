@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "env.h"
@@ -160,6 +161,27 @@ static void ensure_zip_init() {
     });
 }
 
+// Instances [lo, lo + n) of a backend with `total` instances that this side may use. Without
+// duplex every batch uses them all; with IAXL_ZIP_DUPLEX compression owns [0, C) and
+// decompression [C, total), so concurrent batches never share a slot.
+static void side_range(ZipBackend backend, int total, bool decompress, int *lo, int *n) {
+    *lo = 0;
+    *n = total;
+    if (!envs.IAXL_ZIP_DUPLEX || total == 0)
+        return;
+    IAXL_CHECK(backend != ZipBackend::CPU, "kv_zip: IAXL_ZIP_DUPLEX does not support CPU zip");
+    const int c = backend == ZipBackend::QAT ? envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES
+                                             : envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES;
+    IAXL_CHECK(c >= 1 && c < total,
+               "kv_zip: duplex needs 1 <= *_ZIP_COMPRESS_INSTANCES < instance count");
+    if (decompress) {
+        *lo = c;
+        *n = total - c;
+    } else {
+        *n = c;
+    }
+}
+
 // A backend slot, the item in flight on it and the thread that drives it.
 struct Lane {
     ZipBackend backend;
@@ -173,50 +195,61 @@ struct LanePlan {
     int threads;
 };
 
-// Which thread drives which slot depends only on the configuration, so it is planned once.
-static const LanePlan &lane_plan() {
-    static const LanePlan plan = [] {
-        ensure_zip_init();
-        const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
-        const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
-        const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
-        const int worker_count = qat_workers + iaa_workers + cpu_workers;
-        // Slot k of every worker comes before slot k + 1 of any, so that threads beyond the worker
-        // count split the slots of one worker. The backends keep all request state per slot.
-        std::vector<Lane> all;
-        for (int k = 0;; k++) {
-            const size_t before = all.size();
-            for (int w = 0; w < worker_count; w++) {
-                ZipBackend backend = ZipBackend::CPU;
-                int first = qat_workers + iaa_workers;
-                if (w < qat_workers) {
-                    backend = ZipBackend::QAT;
-                    first = 0;
-                } else if (w < qat_workers + iaa_workers) {
-                    backend = ZipBackend::IAA;
-                    first = qat_workers;
-                }
-                const int depth = ops(backend).queue_depth();
-                if (k < depth)
-                    all.push_back({backend, (w - first) * depth + k, kNoTask, w});
-            }
-            if (all.size() == before)
-                break;
+// Which thread drives which slot depends only on the configuration and on the side (compression
+// or decompression), so each side is planned once.
+static LanePlan make_lane_plan(bool decompress) {
+    ensure_zip_init();
+    const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
+    const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
+    const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
+
+    // (backend, instance) pairs this side drives: QAT first, then IAA, then CPU.
+    struct Worker {
+        ZipBackend backend;
+        int instance;
+    };
+    std::vector<Worker> workers;
+    for (auto [backend, total] : {std::pair{ZipBackend::QAT, qat_workers},
+                                  std::pair{ZipBackend::IAA, iaa_workers},
+                                  std::pair{ZipBackend::CPU, cpu_workers}}) {
+        int lo, n;
+        side_range(backend, total, decompress, &lo, &n);
+        for (int i = lo; i < lo + n; i++)
+            workers.push_back({backend, i});
+    }
+    const int worker_count = static_cast<int>(workers.size());
+    // Slot k of every worker comes before slot k + 1 of any, so that threads beyond the worker
+    // count split the slots of one worker. The backends keep all request state per slot, and a
+    // slot is addressed by its real instance index, which keeps the duplex ranges disjoint.
+    std::vector<Lane> all;
+    for (int k = 0;; k++) {
+        const size_t before = all.size();
+        for (int w = 0; w < worker_count; w++) {
+            const ZipBackend backend = workers[w].backend;
+            const int depth = ops(backend).queue_depth();
+            if (k < depth)
+                all.push_back({backend, workers[w].instance * depth + k, kNoTask, w});
         }
-        const int threads =
-            static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
-        // Up to one thread per worker, each worker stays on one thread so no instance is polled
-        // from two; extra threads take the slots round-robin.
-        for (size_t j = 0; j < all.size(); j++)
-            all[j].owner = threads <= worker_count ? all[j].owner % threads : int(j % threads);
-        return LanePlan{std::move(all), threads};
-    }();
-    return plan;
+        if (all.size() == before)
+            break;
+    }
+    const int threads = static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
+    // Up to one thread per worker, each worker stays on one thread so no instance is polled
+    // from two; extra threads take the slots round-robin.
+    for (size_t j = 0; j < all.size(); j++)
+        all[j].owner = threads <= worker_count ? all[j].owner % threads : int(j % threads);
+    return LanePlan{std::move(all), threads};
+}
+
+static const LanePlan &lane_plan(bool decompress) {
+    static const LanePlan compress_plan = make_lane_plan(false);
+    static const LanePlan decompress_plan = make_lane_plan(true);
+    return decompress ? decompress_plan : compress_plan;
 }
 
 template <class Next, class Submit, class Complete>
-static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) {
-    const LanePlan &plan = lane_plan();
+static void zip_pipeline(bool decompress, Next &&get_next, Submit &&submit, Complete &&complete) {
+    const LanePlan &plan = lane_plan(decompress);
 
     auto drive = [&](int tid) {
         std::vector<Lane> lanes;
@@ -360,6 +393,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
 
     std::atomic<size_t> next{0};
     zip_pipeline(
+        /*decompress=*/false,
         [&](ZipBackend) {
             const size_t s = next.fetch_add(1, std::memory_order_relaxed);
             return s < segs.size() ? s : kNoTask;
@@ -480,6 +514,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
     segs.insert(segs.end(), others.begin(), others.end());
     std::atomic<size_t> iaa_next{0}, other_next{iaa_end};
     zip_pipeline(
+        /*decompress=*/true,
         [&](ZipBackend backend) {
             if (backend == ZipBackend::IAA) {
                 const size_t s = iaa_next.fetch_add(1, std::memory_order_relaxed);

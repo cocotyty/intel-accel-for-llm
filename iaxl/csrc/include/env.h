@@ -62,6 +62,12 @@ struct Envs {
     int IAXL_CPU_ZIP_THREADS;
     int IAXL_OMP_THREAD_NUM;
     bool IAXL_USE_OMP;
+    // Duplex: decompression runs on its own queue/threads and instances, concurrently with
+    // compression. Instances [0, N) of a backend are split into compress [0, C) and
+    // decompress [C, N).
+    bool IAXL_ZIP_DUPLEX;
+    int IAXL_QAT_ZIP_COMPRESS_INSTANCES;
+    int IAXL_IAA_ZIP_COMPRESS_INSTANCES;
 
     bool IAXL_KV_COMPRESSION;
     int IAXL_KV_LOSSY_TRUNC;
