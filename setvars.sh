@@ -107,7 +107,7 @@ case "${IAXL_QAT_ZIP_ENABLE,,}" in
         ;;
     *) export IAXL_QAT_INSTANCE_NUM=0 ;;
 esac
-export IAXL_QAT_ZIP_QUEUE_DEPTH=${IAXL_QAT_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 4)
+export IAXL_QAT_ZIP_QUEUE_DEPTH=${IAXL_QAT_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 8)
 
 # ---- Intel IAA (compression accelerator, via Intel QPL) ---------------------
 export IAXL_IAA_DEVICES=${IAXL_IAA_DEVICES:-auto}                                # Comma-separated NUMA nodes for IAA jobs, or "auto"
