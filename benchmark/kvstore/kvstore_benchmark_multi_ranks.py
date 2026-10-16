@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 logger = logging.getLogger(__name__)
 
-TIMED_STEPS = ("warmup", "put", "get")
+TIMED_STEPS = ("warmup", "put", "get", "mix")
 RATIO_KEY = "compression_ratio (unzip/zip, higher=better)"
 STATUS_SUM_KEYS = (
     "current_bytes",
@@ -92,7 +92,7 @@ def aggregate(statuses: list, metrics: list) -> tuple:
     return status, total
 
 
-def schedule(kb, tp_size: int, conns: list) -> bool:
+def schedule(kb, tp_size: int, conns: list, args=None) -> bool:
     def call(step: str, ranks=range(tp_size)) -> list:
         for rank in ranks:
             conns[rank].send(step)
@@ -112,6 +112,14 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
     total_blocks = call("total_blocks", [0])[0]
     total_bytes = call("total_bytes", [0])[0]
     call("warmup")
+    if args is not None and args.mix is not None:
+        put_times = call("put")  # preload: the keys the mixed GETs read
+        print(f"\nPreload PUT (per rank {kb.format_bytes(total_bytes)}): "
+              f"{sum(total_bytes / t / (1024**3) for t in put_times):.3f} GiB/s summed over ranks")
+        results = call("mix")
+        verified = call("mix_verify")
+        kb.print_mix_report(results, verified, args.mix)
+        return all(verified)
     put_times = call("put")
     get_times = call("get")
     verified = call("verify")
@@ -182,7 +190,7 @@ def main() -> None:
         conns.append(parent_conn)
         procs.append(proc)
     try:
-        verified = schedule(kb, tp_size, conns)
+        verified = schedule(kb, tp_size, conns, args)
     finally:
         for conn in conns:
             try:

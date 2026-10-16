@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import collections
 import json
 import math
 import os
@@ -149,8 +150,53 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_METRICS_URL,
         help="KVStore REST endpoint for compression throughput metrics.",
     )
+    parser.add_argument(
+        "--mix",
+        default=None,
+        metavar="C:D",
+        help="Mixed mode: after the preload PUT, issue PUTs (compress, new keys) and GETs "
+        "(decompress, preloaded keys) interleaved at a C:D byte ratio, e.g. 12:40, and "
+        "report the compress/decompress throughput reached together.",
+    )
+    parser.add_argument(
+        "--mix-ops",
+        type=int,
+        default=60,
+        help="Mixed mode: total number of PUT+GET ops "
+        "(one op = one layer x --mix-op-blocks blocks).",
+    )
+    parser.add_argument(
+        "--mix-op-blocks",
+        type=int,
+        default=0,
+        help="Mixed mode: blocks per op (0 = all tested blocks of a layer).",
+    )
+    parser.add_argument(
+        "--mix-inflight",
+        type=int,
+        default=4,
+        help="Mixed mode: max ops in flight; the oldest is waited for before issuing more.",
+    )
+    parser.add_argument(
+        "--mix-put-keep",
+        type=int,
+        default=0,
+        help="Mixed mode: cycle PUT keys over this many rounds (overwriting older ones) so long "
+        "runs keep memory bounded; 0 = every round uses new keys.",
+    )
     add_env_arguments(parser)
     args = parser.parse_args(argv)
+    if args.mix is not None:
+        try:
+            c, d = (float(x) for x in args.mix.split(":"))
+        except ValueError:
+            parser.error("--mix must look like C:D, e.g. 12:40")
+        if c < 0 or d < 0 or c + d == 0:
+            parser.error("--mix ratios must be >= 0 and not both 0")
+        args.mix = (c, d)
+        if (args.mix_ops <= 0 or args.mix_inflight <= 0 or args.mix_op_blocks < 0
+                or args.mix_put_keep < 0):
+            parser.error("--mix-ops / --mix-inflight must be > 0, --mix-op-blocks >= 0")
     shape = tuple(args.kv_cache_shape)
     if shape[0] != 2:
         parser.error("the first --kv-cache-shape dimension must be 2 (key/value)")
@@ -575,6 +621,133 @@ class Benchmark:
             for name, tensor in self.kv_caches.items()
         )
 
+    # ---- mixed compress/decompress mode (--mix C:D)
+    # PUT ops read the even (tested) blocks and store them under new keys, GET ops fetch the
+    # keys stored by the preload PUT into the odd blocks, so the two never touch the same GPU
+    # memory. Ops are issued in one stream that keeps the C:D byte ratio at every point, with
+    # at most --mix-inflight ops outstanding.
+    def mix_plan(self) -> List[Tuple[str, str, List[int], List[str], int]]:
+        c, d = self.args.mix
+        op_blocks = self.args.mix_op_blocks or self.num_blocks
+        slices = [(s, min(s + op_blocks, self.num_blocks))
+                  for s in range(0, self.num_blocks, op_blocks)]
+        n_layers = len(self.layer_names)
+        plan, n_put, n_get = [], 0, 0
+        put_blocks = get_blocks = 0
+        keep = self.args.mix_put_keep
+        put_keys, get_keys, even_idx, odd_idx = {}, {}, {}, {}  # shared lists, built once
+        for _ in range(self.args.mix_ops):
+            # Pick the side that is furthest behind its share of the bytes.
+            if d == 0 or (c > 0 and put_blocks * d <= get_blocks * c):
+                s0, s1 = slices[n_put % len(slices)]
+                layer = self.layer_names[(n_put // len(slices)) % n_layers]
+                # Like vLLM, every layer of a block is stored under the same block hash; a new
+                # round of hashes starts once all layers have been put.
+                put_round = n_put // (len(slices) * n_layers)
+                if keep:
+                    put_round %= keep
+                if (put_round, s0) not in put_keys:
+                    put_keys[(put_round, s0)] = [f"mix{put_round}_{i}" for i in range(s0, s1)]
+                if s0 not in even_idx:
+                    even_idx[s0] = self.block_indices[s0:s1]
+                plan.append(("put", layer, even_idx[s0], put_keys[(put_round, s0)], s0))
+                n_put += 1
+                put_blocks += s1 - s0
+            else:
+                s0, s1 = slices[n_get % len(slices)]
+                layer = self.layer_names[(n_get // len(slices)) % n_layers]
+                if s0 not in odd_idx:
+                    odd_idx[s0] = [i + 1 for i in self.block_indices[s0:s1]]
+                    get_keys[s0] = self.block_hashes[s0:s1]
+                plan.append(("get", layer, odd_idx[s0], get_keys[s0], s0))
+                n_get += 1
+                get_blocks += s1 - s0
+        return plan
+
+    def mix(self) -> dict:
+        plan = self.mix_plan()
+        bytes_per_block = self.total_bytes // self.total_blocks
+        for tensor in self.kv_caches.values():
+            tensor[:, 1::2].zero_()  # GET targets; even blocks keep the PUT source data
+        self.mix_fetched = set()  # (layer, first, end) slices of tested blocks fetched by GET
+        torch.cuda.synchronize()
+        self.metrics(reset=1)
+        inflight = collections.deque()
+
+        def wait(entry):
+            kind, tasks = entry
+            ok = self.kvstore.put_wait(tasks) if kind == "put" else self.kvstore.get_wait(tasks)
+            if not ok:
+                raise RuntimeError(f"mixed {kind} did not complete")
+
+        put_blocks = get_blocks = n_put = n_get = 0
+        issue_s = wait_s = 0.0
+        start = time.perf_counter()
+        last_report = start
+        with torch.cuda.nvtx.range("benchmark MIX"):
+            for kind, layer, idx, hashes, s0 in plan:
+                t0 = time.perf_counter()
+                if self.rank == 0 and t0 - last_report >= 10:
+                    last_report = t0
+                    el = t0 - start
+                    zip_gbps = put_blocks * bytes_per_block / el / 1e9
+                    unzip_gbps = get_blocks * bytes_per_block / el / 1e9
+                    print(f"MIXPROG rank0 t={el:.0f}s ops={n_put + n_get}/{len(plan)} "
+                          f"zip {zip_gbps:.2f} GB/s unzip {unzip_gbps:.2f} GB/s "
+                          f"(x{self.tp_size} ranks ~ {self.tp_size * zip_gbps:.1f} / "
+                          f"{self.tp_size * unzip_gbps:.1f})", flush=True)
+                while len(inflight) >= self.args.mix_inflight:
+                    wait(inflight.popleft())
+                t1 = time.perf_counter()
+                wait_s += t1 - t0
+                if kind == "put":
+                    tasks = self.kvstore.put(
+                        idx, hashes, layer_names=[layer], description="mix PUT")
+                    put_blocks += len(idx)
+                    n_put += 1
+                else:
+                    tasks = self.kvstore.get(
+                        idx, hashes, layer_names=[layer], description="mix GET")
+                    get_blocks += len(idx)
+                    n_get += 1
+                    self.mix_fetched.add((layer, s0, s0 + len(idx)))
+                issue_s += time.perf_counter() - t1
+                inflight.append((kind, tasks))
+            t0 = time.perf_counter()
+            while inflight:
+                wait(inflight.popleft())
+            torch.cuda.synchronize()
+            wait_s += time.perf_counter() - t0
+        elapsed = time.perf_counter() - start
+        m = self.metrics()
+        return {
+            "elapsed": elapsed,
+            "issue_s": issue_s,
+            "wait_s": wait_s,
+            "put_ops": n_put,
+            "get_ops": n_get,
+            "put_bytes": put_blocks * bytes_per_block,
+            "get_bytes": get_blocks * bytes_per_block,
+            "compress_bytes": m["compress_bytes"],
+            "compress_ns": m["compress_ns"],
+            "decompress_bytes": m["decompress_bytes"],
+            "decompress_ns": m["decompress_ns"],
+        }
+
+    def mix_verify(self) -> bool:
+        # Each sampled tested block covered by a GET op must now hold its data in block + 1.
+        positions = [0, self.num_blocks // 2, self.num_blocks - 1]
+        checked = 0
+        for layer, s0, s1 in self.mix_fetched:
+            tensor = self.kv_caches[layer]
+            for k, pos in enumerate(positions):
+                if s0 <= pos < s1:
+                    got = tensor.select(BLOCK_DIM, self.block_indices[pos] + 1)
+                    if not torch.equal(got, self.expected[layer].select(BLOCK_DIM, k)):
+                        return False
+                    checked += 1
+        return checked > 0 or not self.mix_fetched
+
 
 def print_report(
     put_time: float,
@@ -615,6 +788,32 @@ def print_report(
     )
 
 
+def print_mix_report(results: List[dict], verified: List[bool], target) -> None:
+    c, d = target
+    print(f"\nMixed compress:decompress = {c:g}:{d:g} (bytes), {results[0]['put_ops']} PUT + "
+          f"{results[0]['get_ops']} GET ops per rank")
+    print("-" * 80)
+    print(f"{'Rank':>4} {'Wall s':>8} {'Issue s':>8} {'Wait s':>7} "
+          f"{'Zip GB/s':>9} {'Unzip GB/s':>10} "
+          f"{'ZipBusy%':>9} {'UnzipBusy%':>10} {'Zip-only':>9} {'Unzip-only':>10} {'Verify':>6}")
+    for rank, r in enumerate(results):
+        wall_ns = r["elapsed"] * 1e9
+        zip_only = r["compress_bytes"] / r["compress_ns"] if r["compress_ns"] else 0.0
+        unzip_only = r["decompress_bytes"] / r["decompress_ns"] if r["decompress_ns"] else 0.0
+        print(f"{rank:>4} {r['elapsed']:8.3f} {r['issue_s']:8.3f} {r['wait_s']:7.3f} "
+              f"{r['put_bytes'] / wall_ns:9.3f} {r['get_bytes'] / wall_ns:10.3f} "
+              f"{100 * r['compress_ns'] / wall_ns:9.1f} {100 * r['decompress_ns'] / wall_ns:10.1f} "
+              f"{zip_only:9.3f} {unzip_only:10.3f} {'pass' if verified[rank] else 'FAIL':>6}")
+    zip_sum = sum(r["put_bytes"] / (r["elapsed"] * 1e9) for r in results)
+    unzip_sum = sum(r["get_bytes"] / (r["elapsed"] * 1e9) for r in results)
+    print(f"{'Sum':>4} {'':>8} {'':>8} {'':>7} {zip_sum:9.3f} {unzip_sum:10.3f}")
+    wall_ns = max(r["elapsed"] for r in results) * 1e9
+    print(f"Mixed total (bytes / slowest wall): "
+          f"compress {sum(r['put_bytes'] for r in results) / wall_ns:.3f} GB/s, "
+          f"decompress {sum(r['get_bytes'] for r in results) / wall_ns:.3f} GB/s")
+    print(f"Mixed verification: {'passed' if all(verified) else 'FAILED'}")
+
+
 def run_benchmark(args: argparse.Namespace) -> bool:
     if get_accelerator_device() != "cuda":
         print("No CUDA device available; KVStore benchmark cannot run.")
@@ -624,6 +823,13 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     bench.print_config()
     bench.setup()
     bench.warmup()
+    if args.mix is not None:
+        put_time = bench.put()
+        print_result("PUT", put_time, bench.total_blocks, bench.total_bytes)
+        result = bench.mix()
+        verified = bench.mix_verify()
+        print_mix_report([result], [verified], args.mix)
+        return verified
     put_time = bench.put()
     get_time = bench.get()
     verified = bench.verify()
