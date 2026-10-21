@@ -88,9 +88,11 @@ __attribute__((constructor(101))) void envs_init(void) {
         envs.IAXL_OMP_THREAD_NUM = 1;
     envs.IAXL_USE_OMP = env_bool("IAXL_USE_OMP", 1);
     envs.IAXL_ZIP_DUPLEX = env_bool("IAXL_ZIP_DUPLEX", 0);
-    // Default split: half of the instances (rounded down, at least 1) compress.
-    const int qat_half = envs.IAXL_QAT_INSTANCE_NUM / 2 > 0 ? envs.IAXL_QAT_INSTANCE_NUM / 2 : 1;
-    const int iaa_half = envs.IAXL_IAA_INSTANCE_NUM / 2 > 0 ? envs.IAXL_IAA_INSTANCE_NUM / 2 : 1;
+    // Default split: half of the instances of each device (rounded down, at least 1) compress.
+    const int qat_ipd = envs.IAXL_QAT_ZIP_INSTANCES_PER_DEVICE;
+    const int iaa_ipd = envs.IAXL_IAA_ZIP_INSTANCES_PER_DEVICE;
+    const int qat_half = qat_ipd / 2 > 0 ? qat_ipd / 2 : 1;
+    const int iaa_half = iaa_ipd / 2 > 0 ? iaa_ipd / 2 : 1;
     envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES = env_int("IAXL_QAT_ZIP_COMPRESS_INSTANCES", qat_half);
     envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES = env_int("IAXL_IAA_ZIP_COMPRESS_INSTANCES", iaa_half);
 
@@ -150,9 +152,11 @@ __attribute__((constructor(101))) void envs_init(void) {
                envs.IAXL_DSA_GD_ENABLE ? "ON" : "OFF",
                envs.IAXL_DSA_GD_RESET_ON_DESTROY ? "ON" : "OFF", envs.IAXL_PROFILE_MODE);
         if (envs.IAXL_ZIP_DUPLEX)
-            printf("[iaxl] duplex: ON, compress instances qat=%d/%d iaa=%d/%d, "
-                   "decompress gets the rest\n",
-                   envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES, envs.IAXL_QAT_INSTANCE_NUM,
-                   envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES, envs.IAXL_IAA_INSTANCE_NUM);
+            printf("[iaxl] duplex: ON, compress instances per device qat=%d/%d iaa=%d/%d, "
+                   "decompress gets the rest; threads split %d/%d\n",
+                   envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES, envs.IAXL_QAT_ZIP_INSTANCES_PER_DEVICE,
+                   envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES, envs.IAXL_IAA_ZIP_INSTANCES_PER_DEVICE,
+                   envs.IAXL_OMP_THREAD_NUM / 2,
+                   envs.IAXL_OMP_THREAD_NUM - envs.IAXL_OMP_THREAD_NUM / 2);
     }
 }

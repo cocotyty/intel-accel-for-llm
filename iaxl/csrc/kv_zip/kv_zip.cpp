@@ -161,25 +161,36 @@ static void ensure_zip_init() {
     });
 }
 
-// Instances [lo, lo + n) of a backend with `total` instances that this side may use. Without
-// duplex every batch uses them all; with IAXL_ZIP_DUPLEX compression owns [0, C) and
-// decompression [C, total), so concurrent batches never share a slot.
-static void side_range(ZipBackend backend, int total, bool decompress, int *lo, int *n) {
-    *lo = 0;
-    *n = total;
-    if (!envs.IAXL_ZIP_DUPLEX || total == 0)
-        return;
+// Instances of a backend that this side may use. Without duplex every batch uses them all; with
+// IAXL_ZIP_DUPLEX each device's instances are split, compression owning [0, C) and decompression
+// [C, per-device count), so concurrent batches never share a slot and every device serves both
+// sides. C is IAXL_*_ZIP_COMPRESS_INSTANCES, per device.
+static std::vector<int> side_instances(ZipBackend backend, int total, bool decompress) {
+    std::vector<int> instances;
+    if (total <= 0)
+        return instances;
+    if (!envs.IAXL_ZIP_DUPLEX) {
+        for (int i = 0; i < total; i++)
+            instances.push_back(i);
+        return instances;
+    }
     IAXL_CHECK(backend != ZipBackend::CPU, "kv_zip: IAXL_ZIP_DUPLEX does not support CPU zip");
+    const int per_device = backend == ZipBackend::QAT ? envs.IAXL_QAT_ZIP_INSTANCES_PER_DEVICE
+                                                      : envs.IAXL_IAA_ZIP_INSTANCES_PER_DEVICE;
     const int c = backend == ZipBackend::QAT ? envs.IAXL_QAT_ZIP_COMPRESS_INSTANCES
                                              : envs.IAXL_IAA_ZIP_COMPRESS_INSTANCES;
-    IAXL_CHECK(c >= 1 && c < total,
-               "kv_zip: duplex needs 1 <= *_ZIP_COMPRESS_INSTANCES < instance count");
-    if (decompress) {
-        *lo = c;
-        *n = total - c;
-    } else {
-        *n = c;
+    IAXL_CHECK(per_device >= 1, "kv_zip: duplex needs a valid instances-per-device setting");
+    for (int lo = 0; lo < total; lo += per_device) {
+        const int n = std::min(per_device, total - lo);
+        IAXL_CHECK(n >= 2, "kv_zip: duplex needs at least 2 instances per device to split");
+        // At least one instance for each side on every device it uses.
+        const int compress_n = std::min(std::max(c, 1), n - 1);
+        const int start = decompress ? lo + compress_n : lo;
+        const int count = decompress ? n - compress_n : compress_n;
+        for (int i = start; i < start + count; i++)
+            instances.push_back(i);
     }
+    return instances;
 }
 
 // A backend slot, the item in flight on it and the thread that drives it.
@@ -212,9 +223,7 @@ static LanePlan make_lane_plan(bool decompress) {
     for (auto [backend, total] : {std::pair{ZipBackend::QAT, qat_workers},
                                   std::pair{ZipBackend::IAA, iaa_workers},
                                   std::pair{ZipBackend::CPU, cpu_workers}}) {
-        int lo, n;
-        side_range(backend, total, decompress, &lo, &n);
-        for (int i = lo; i < lo + n; i++)
+        for (int i : side_instances(backend, total, decompress))
             workers.push_back({backend, i});
     }
     const int worker_count = static_cast<int>(workers.size());
@@ -233,7 +242,12 @@ static LanePlan make_lane_plan(bool decompress) {
         if (all.size() == before)
             break;
     }
-    const int threads = static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
+    // Duplex runs two polling sides at once, so each side gets half of the thread budget: both
+    // keeping the full one would busy-wait over the same CPUs and starve each other.
+    int budget = envs.IAXL_OMP_THREAD_NUM;
+    if (envs.IAXL_ZIP_DUPLEX && budget > 1)
+        budget = decompress ? budget - budget / 2 : budget / 2;
+    const int threads = static_cast<int>(std::min<size_t>(budget, all.size()));
     // Up to one thread per worker, each worker stays on one thread so no instance is polled
     // from two; extra threads take the slots round-robin.
     for (size_t j = 0; j < all.size(); j++)
