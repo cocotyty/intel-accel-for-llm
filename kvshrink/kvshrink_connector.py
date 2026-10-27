@@ -3,6 +3,7 @@
 
 import logging
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -45,6 +46,34 @@ setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
 ReqId = str
+
+
+def _layer_key(layer_name: str) -> str:
+    """Short KVStore key: the part after the ``layers`` path component.
+
+    ``language_model.model.layers.14.linear_attn`` -> ``14.linear_attn``, so a
+    block is stored as ``mamba:<hash>:14.linear_attn`` instead of carrying the
+    whole module path. Names without a ``layers`` component are kept as-is.
+    """
+    parts = layer_name.split(".")
+    if "layers" in parts:
+        return ".".join(parts[parts.index("layers") + 1 :]) or layer_name
+    return layer_name
+
+
+def _layer_keys(layer_names: list[str]) -> dict[str, str]:
+    """Map vLLM layer names to unique KVStore keys.
+
+    Draft (MTP) layers are numbered from 0 as well -- ``mtp.layers.0.self_attn``
+    lives next to ``model.layers.0.self_attn`` -- so the short form is not
+    always unique. Colliding names keep their full name (unchanged behaviour).
+    """
+    keys = {name: _layer_key(name) for name in layer_names}
+    counts = Counter(keys.values())
+    keys = {name: key if counts[key] == 1 else name for name, key in keys.items()}
+    if len(set(keys.values())) != len(keys):
+        raise ValueError(f"Duplicate KV cache layer keys: {keys}")
+    return keys
 
 
 @dataclass
@@ -178,6 +207,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Ordered worker-side layer names (populated in register_kv_caches),
         # used to select the first N layers for async early-start.
         self._layer_names: list[str] = []
+        # vLLM layer name -> KVStore key, and the same keys per group (see
+        # _layer_key). Both are built once in register_kv_caches.
+        self._kv_keys: dict[str, str] = {}
+        self._group_keys: list[list[str]] = []
         # Async load bookkeeping (worker side).
         # Per-request tasks still loading across scheduler steps.
         self._pending_load_tasks: dict[ReqId, dict[str, Any]] = {}
@@ -515,8 +548,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         kv_caches = self._view_as_blocks(kv_caches)
         first_kv_cache = next(iter(kv_caches.values()))
+        # ``wait_for_layer_load`` compares against the name vLLM hands us.
         self._last_layer_name = next(reversed(kv_caches))
-        self._layer_names = list(kv_caches.keys())
+
+        # Store/serve blocks under short keys; the on-disk layout follows the
+        # key, so bumping the scheme needs a fresh cache dir.
+        self._kv_keys = _layer_keys(list(kv_caches))
+        kv_caches = {self._kv_keys[name]: cache for name, cache in kv_caches.items()}
+        self._layer_names = list(kv_caches)
+        self._group_keys = [
+            [self._kv_keys[name] for name in names] for _, names in self.groups
+        ]
+
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             block_dim=0,
@@ -589,7 +632,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 tasks.update(self._store().get(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=layer_names,
+                    layer_names=self._group_keys[index],
                     description=req_id,
                     label="mamba" if is_mamba else None,
                 ))
@@ -600,11 +643,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._current_get_tasks and not self._active_promoted_tasks:
             return
 
+        key = self._kv_keys.get(layer_name, layer_name)
+
         # Wait for the synchronous (batched) loads for this layer.
         if self._current_get_tasks:
             success = self._store().get_wait(
                 get_results=self._current_get_tasks,
-                layer_names=[layer_name],
+                layer_names=[key],
             )
             if not success:
                 raise RuntimeError(
@@ -617,7 +662,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for tasks in self._active_promoted_tasks.values():
             success = self._store().get_wait(
                 get_results=tasks,
-                layer_names=[layer_name],
+                layer_names=[key],
             )
             if not success:
                 raise RuntimeError(
@@ -650,7 +695,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             tasks = self._store().put(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
-                layer_names=[layer_name],
+                layer_names=[self._kv_keys[layer_name]],
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
@@ -660,14 +705,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             return
         metadata = self._get_connector_metadata()
         for req_id, request in metadata.reqs_to_save.requests.items():
-            for index, (is_mamba, layer_names) in enumerate(self.groups):
+            for index, (is_mamba, _) in enumerate(self.groups):
                 block_ids, block_hashes = request.for_group(index)
                 if not is_mamba or not block_ids:
                     continue
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=layer_names,
+                    layer_names=self._group_keys[index],
                     label="mamba",
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
