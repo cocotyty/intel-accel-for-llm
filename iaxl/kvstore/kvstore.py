@@ -1,7 +1,10 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import ctypes
 import logging
+import threading
+import time
 import torch
 import numpy as np
 from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
@@ -24,6 +27,49 @@ logger = logging.getLogger(__name__)
 def _get_default_cache_size_gb() -> float:
     available_bytes = psutil.virtual_memory().available
     return available_bytes / (10 * 1024**3)
+
+
+def _prefault_heap(size_gb: float, num_threads: int = 4) -> float:
+    """Touches size_gb of heap through the process allocator, then frees it.
+
+    The cache mallocs every compressed block while it fills, so without this the zip workers spend
+    much of their time in page faults. The allocator must keep the freed pages (setvars.sh sets
+    TCMALLOC_RELEASE_RATE / MIMALLOC_PURGE_DELAY). The threads inherit this rank's CPU binding,
+    so the pages land on its NUMA node. Returns the GB touched.
+    """
+    chunk = 1 << 20  # stays in the allocator's heap; far larger blocks are mmap'ed and unmapped on free
+    count = int(size_gb * 1024**3) // chunk
+    num_threads = min(num_threads, count)
+    if num_threads == 0:
+        return 0.0
+    libc = ctypes.CDLL(None)  # the LD_PRELOAD allocator
+    libc.malloc.restype = ctypes.c_void_p
+    libc.malloc.argtypes = [ctypes.c_size_t]
+    libc.free.argtypes = [ctypes.c_void_p]
+    barrier = threading.Barrier(num_threads)
+    touched = [0] * num_threads
+
+    def touch(index: int) -> None:
+        chunks = []
+        try:
+            for _ in range(count * index // num_threads, count * (index + 1) // num_threads):
+                ptr = libc.malloc(chunk)
+                if not ptr:
+                    break
+                ctypes.memset(ptr, 1, chunk)  # non-zero: a zero fill of fresh memory may be skipped
+                chunks.append(ptr)
+        finally:
+            barrier.wait()  # free only once all are touched, or malloc hands the same pages back
+            for ptr in chunks:
+                libc.free(ptr)
+            touched[index] = len(chunks) * chunk
+
+    threads = [threading.Thread(target=touch, args=(i,)) for i in range(num_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return sum(touched) / 1024**3
 
 
 class KVStoreLocal:
@@ -107,6 +153,15 @@ class KVStoreLocal:
             cache_size_gb=pool_size_gb,
             rank=rank,
         )
+        if not self.has_only_mode and envs.IAXL_KV_PREFAULT_GB > 0:
+            start = time.perf_counter()
+            touched = _prefault_heap(min(envs.IAXL_KV_PREFAULT_GB, pool_size_gb))
+            logger.info(
+                "Prefaulted %.1f GB of KV heap in %.2f s (rank %d)",
+                touched,
+                time.perf_counter() - start,
+                rank,
+            )
         start_profiling()
 
         logger.info(
