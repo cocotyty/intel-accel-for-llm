@@ -41,6 +41,13 @@ bookkeeping work; smaller chunks provide more independent work for threads.
 Concurrency is capped by the chunk count, so one chunk uses one thread even
 when more are configured. Neither choice changes the total byte budget.
 
+For comparison, mimalloc can directly unmap dedicated huge allocations on
+`free`, even when normal purging is disabled (`MIMALLOC_PURGE_DELAY=-1`). Those
+pages no longer benefit subsequent allocations. Tcmalloc with automatic release
+disabled can instead retain and split a large free span. The huge-allocation
+threshold is allocator/version dependent: a single large warmup allocation is
+useful with tcmalloc but is not a portable assumption across allocators.
+
 All chunks must remain allocated until touching finishes: freeing each chunk
 immediately would allow the next allocation to reuse the same pages instead of
 warming the requested budget.
