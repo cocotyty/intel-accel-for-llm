@@ -17,8 +17,8 @@
 
 namespace kv_pool {
 
-// Touch and release heap memory for reuse by subsequent cache allocations.
-size_t prefault_heap(size_t bytes);
+// Optional startup heap warmup, configured by the environment and capped at capacity.
+size_t prefault_heap(size_t capacity_bytes);
 
 inline constexpr char LABEL_SEP = ':';
 

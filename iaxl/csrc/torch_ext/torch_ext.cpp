@@ -17,10 +17,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.attr("device_type") = IAXL_DEVICE;
 
-    m.def("prefault_heap", &kv_pool::prefault_heap, py::arg("bytes"),
-          "Touch heap pages for cache reuse; thread/chunk settings come from the environment.",
-          py::call_guard<py::gil_scoped_release>());
-
     py::enum_<GpuTransferDirection>(m, "GpuTransferDirection")
         .value("H2D", GpuTransferDirection::H2D)
         .value("D2H", GpuTransferDirection::D2H);

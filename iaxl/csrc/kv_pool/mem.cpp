@@ -837,7 +837,9 @@ class Mem::Impl {
 };
 
 Mem::Mem(size_t capacity_bytes, Storage *storage, Record *record)
-    : impl_(std::make_unique<Impl>(capacity_bytes, storage, record)) {}
+    : impl_(std::make_unique<Impl>(capacity_bytes, storage, record)) {
+    prefault_heap(capacity_bytes);
+}
 Mem::~Mem() = default;
 
 void Mem::put(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,

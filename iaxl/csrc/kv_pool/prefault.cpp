@@ -5,6 +5,8 @@
 #include "env.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <new>
 #include <stdexcept>
 #include <thread>
@@ -12,9 +14,19 @@
 
 namespace kv_pool {
 
-size_t prefault_heap(size_t bytes) {
+size_t prefault_heap(size_t capacity_bytes) {
+    const char *value = std::getenv("IAXL_KV_PREFAULT_GB");
+    if (!value || !*value || capacity_bytes == 0)
+        return 0; // No implicit warmup budget for an unlimited cache.
+    char *end = nullptr;
+    const double gb = std::strtod(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(gb) || gb < 0)
+        throw std::invalid_argument("IAXL_KV_PREFAULT_GB must be a finite nonnegative number");
+    const double requested = gb * (size_t(1) << 30);
+    const size_t bytes = requested >= double(capacity_bytes) ? capacity_bytes : size_t(requested);
     if (bytes == 0)
         return 0;
+    const auto start = std::chrono::steady_clock::now();
     // 1 MiB amortizes malloc overhead while leaving chunks for parallel warmup.
     // This is a tuning choice, not the OS page size (nor a THP request).
     const size_t chunk = size_t(env_int("IAXL_KV_PREFAULT_CHUNK_MB", 1)) << 20;
@@ -60,6 +72,10 @@ size_t prefault_heap(size_t bytes) {
         if (!block)
             throw std::bad_alloc();
     // free() must retain these pages in the allocator for prefaulting to be useful.
+    blocks.clear();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "[kv_pool] Prefaulted %.3f GiB of heap in %.3f s (%zu thread(s), chunk %zu MiB)\n",
+                 double(bytes) / (size_t(1) << 30), seconds, threads, chunk >> 20);
     return bytes;
 }
 

@@ -2,13 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-import time
 import torch
 import numpy as np
 from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
 import psutil
 from ..envs import envs
-from ..torch_ext import prefault_heap
 from ..kvflow import KVFlow, Task, get_accelerator_device
 from ..remote_pool.remote_tensor import RemoteTensor
 from ..utils.profiler import (
@@ -109,15 +107,6 @@ class KVStoreLocal:
             cache_size_gb=pool_size_gb,
             rank=rank,
         )
-        if not self.has_only_mode and envs.IAXL_KV_PREFAULT_GB > 0:
-            start = time.perf_counter()
-            touched = prefault_heap(int(min(envs.IAXL_KV_PREFAULT_GB, pool_size_gb) * 1024**3))
-            logger.info(
-                "Prefaulted %.1f GiB of KV heap in %.2f s (rank %d)",
-                touched / 1024**3,
-                time.perf_counter() - start,
-                rank,
-            )
         start_profiling()
 
         logger.info(

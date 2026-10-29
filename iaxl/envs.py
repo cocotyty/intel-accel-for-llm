@@ -69,7 +69,6 @@ class Envs:
         )
 
         self.IAXL_DDR_POOL_SIZE_GB = _float_or_none("IAXL_DDR_POOL_SIZE_GB")
-        self.IAXL_KV_PREFAULT_GB = _float_or_none("IAXL_KV_PREFAULT_GB") or 0.0
         self.IAXL_SCRATCH_POOL_SIZE_GB = _int("IAXL_SCRATCH_POOL_SIZE_GB", 8)
 
         self.IAXL_PREALLOC_LIMIT = _int("IAXL_PREALLOC_LIMIT", 0)
