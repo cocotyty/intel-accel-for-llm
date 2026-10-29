@@ -99,7 +99,7 @@ export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYE
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
 export IAXL_KV_PREFAULT_GB=${IAXL_KV_PREFAULT_GB:-0}                     # Heap prefault budget per rank in GiB, capped at the DDR pool (0 = off)
 export IAXL_KV_PREFAULT_THREADS=${IAXL_KV_PREFAULT_THREADS:-1}           # Native prefault concurrency; 1 = caller only, more threads reduce startup latency
-export IAXL_KV_PREFAULT_CHUNK_MB=${IAXL_KV_PREFAULT_CHUNK_MB:-1}         # malloc chunk in MiB, NOT page size; see doc/design/kv-prefault.md
+export IAXL_KV_PREFAULT_CHUNK_MB=${IAXL_KV_PREFAULT_CHUNK_MB:-1}         # malloc chunk in MiB, NOT page size
 if [[ "$IAXL_KV_PREFAULT_GB" != "0" ]]; then # The allocator must then keep free heap memory instead of returning it to the OS
     export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0}
 fi
