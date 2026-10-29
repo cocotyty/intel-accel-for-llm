@@ -17,6 +17,9 @@
 
 namespace kv_pool {
 
+// Touch and release heap memory for reuse by subsequent cache allocations.
+size_t prefault_heap(size_t bytes);
+
 inline constexpr char LABEL_SEP = ':';
 
 [[noreturn]] inline void invalid_label(std::string_view value) {

@@ -97,10 +97,11 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
-export IAXL_KV_PREFAULT_GB=${IAXL_KV_PREFAULT_GB:-0}                     # Touch N GB of host heap per rank at startup, capped at the DDR pool, so compressed blocks do not page-fault (0 = off)
+export IAXL_KV_PREFAULT_GB=${IAXL_KV_PREFAULT_GB:-0}                     # Heap prefault budget per rank in GiB, capped at the DDR pool (0 = off)
+export IAXL_KV_PREFAULT_THREADS=${IAXL_KV_PREFAULT_THREADS:-1}           # Native prefault concurrency; 1 = caller only, more threads reduce startup latency
+export IAXL_KV_PREFAULT_CHUNK_MB=${IAXL_KV_PREFAULT_CHUNK_MB:-1}         # malloc chunk in MiB, NOT page size; see doc/design/kv-prefault.md
 if [[ "$IAXL_KV_PREFAULT_GB" != "0" ]]; then # The allocator must then keep free heap memory instead of returning it to the OS
     export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0}
-    export MIMALLOC_PURGE_DELAY=${MIMALLOC_PURGE_DELAY:--1}
 fi
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
