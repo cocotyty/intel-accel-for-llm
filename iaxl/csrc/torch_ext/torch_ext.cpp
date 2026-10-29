@@ -139,7 +139,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Create cache with capacity in bytes (0 = unlimited) and optional storage handler and "
              "record handler",
              py::arg("capacity_bytes") = 0, py::arg("storage") = nullptr,
-             py::arg("record") = nullptr)
+             py::arg("record") = nullptr, py::call_guard<py::gil_scoped_release>())
 
         .def(
             "put",

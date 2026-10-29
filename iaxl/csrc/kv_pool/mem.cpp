@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -161,9 +162,20 @@ class Mem::Impl {
 
         unpersisted_head_.unpersisted_next = &unpersisted_head_;
         unpersisted_head_.unpersisted_prev = &unpersisted_head_;
+        if (prefault_heap(capacity_bytes_))
+            trim_thread_ = std::thread([this] { trim_loop(); });
     }
 
-    ~Impl() { cache_.clear(); }
+    ~Impl() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            trim_stop_ = true;
+        }
+        trim_cv_.notify_one();
+        if (trim_thread_.joinable())
+            trim_thread_.join();
+        cache_.clear();
+    }
 
     void lock() { mutex_.lock(); }
     void unlock() { mutex_.unlock(); }
@@ -479,8 +491,14 @@ class Mem::Impl {
         return current_bytes_;
     }
 
-    size_t capacity_bytes() const { return capacity_bytes_; }
-    void set_capacity_bytes(size_t capacity) { capacity_bytes_ = capacity; }
+    size_t capacity_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return capacity_bytes_;
+    }
+    void set_capacity_bytes(size_t capacity) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        capacity_bytes_ = capacity;
+    }
 
     uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
     uint64_t hits_in_storage() const { return hits_in_storage_.load(std::memory_order_relaxed); }
@@ -806,6 +824,19 @@ class Mem::Impl {
         unpersisted_head_.unpersisted_prev = group;
     }
 
+    void trim_loop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!trim_cv_.wait_for(lock, std::chrono::seconds(10), [this] { return trim_stop_; })) {
+            if (!capacity_bytes_)
+                continue;
+            const size_t keep = capacity_bytes_ - std::min(capacity_bytes_, current_bytes_);
+            const size_t slack = capacity_bytes_ / 8;
+            lock.unlock(); // Returning pages can be slow; do not hold the cache lock.
+            trim_heap(keep, slack);
+            lock.lock();
+        }
+    }
+
     std::unordered_map<std::string, EntryGroup> cache_;
 
     EntryGroup lru_head_;
@@ -818,6 +849,9 @@ class Mem::Impl {
     std::atomic<bool> evict_enabled_;
 
     mutable std::mutex mutex_;
+    std::condition_variable trim_cv_;
+    bool trim_stop_ = false;
+    std::thread trim_thread_;
 
     std::atomic<int> deletion_guard_count_{0};
     std::mutex deletion_cv_mutex_;
@@ -837,9 +871,7 @@ class Mem::Impl {
 };
 
 Mem::Mem(size_t capacity_bytes, Storage *storage, Record *record)
-    : impl_(std::make_unique<Impl>(capacity_bytes, storage, record)) {
-    prefault_heap(capacity_bytes);
-}
+    : impl_(std::make_unique<Impl>(capacity_bytes, storage, record)) {}
 Mem::~Mem() = default;
 
 void Mem::put(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,

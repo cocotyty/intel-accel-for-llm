@@ -17,8 +17,9 @@
 
 namespace kv_pool {
 
-// Optional startup heap warmup, configured by the environment and capped at capacity.
-size_t prefault_heap(size_t capacity_bytes);
+// Warm the cache capacity through tcmalloc; false for zero capacity or other allocators.
+bool prefault_heap(size_t bytes);
+void trim_heap(size_t keep_bytes, size_t slack_bytes);
 
 inline constexpr char LABEL_SEP = ':';
 
