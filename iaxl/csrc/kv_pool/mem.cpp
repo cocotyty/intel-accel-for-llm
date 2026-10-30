@@ -4,6 +4,7 @@
 #include "iaxl_common.h"
 #include "env.h"
 #include "kv_pool.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,7 +24,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -162,20 +162,23 @@ class Mem::Impl {
 
         unpersisted_head_.unpersisted_next = &unpersisted_head_;
         unpersisted_head_.unpersisted_prev = &unpersisted_head_;
-        if (prefault_heap(capacity_bytes_))
-            trim_thread_ = std::thread([this] { trim_loop(); });
+        constexpr size_t chunk = 2 << 20;
+        std::vector<void *> blocks(capacity_bytes / chunk + (capacity_bytes % chunk != 0));
+        cpu_set_t caller_cpus;
+        IAXL_CHECK(sched_getaffinity(0, sizeof(caller_cpus), &caller_cpus) == 0, "get prefault affinity");
+        parallel::parallel_for(blocks.size(), [&](size_t i) {
+            const size_t size = std::min(chunk, capacity_bytes - i * chunk);
+            blocks[i] = malloc(size);
+            IAXL_CHECK(blocks[i], "KV heap prefault allocation failed");
+            memset(blocks[i], 1, size);
+        });
+        // parallel_for may rebind the caller; retain all chunks until every write finishes.
+        IAXL_CHECK(sched_setaffinity(0, sizeof(caller_cpus), &caller_cpus) == 0, "restore prefault affinity");
+        for (void *p : blocks)
+            free(p);
     }
 
-    ~Impl() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            trim_stop_ = true;
-        }
-        trim_cv_.notify_one();
-        if (trim_thread_.joinable())
-            trim_thread_.join();
-        cache_.clear();
-    }
+    ~Impl() { cache_.clear(); }
 
     void lock() { mutex_.lock(); }
     void unlock() { mutex_.unlock(); }
@@ -491,14 +494,8 @@ class Mem::Impl {
         return current_bytes_;
     }
 
-    size_t capacity_bytes() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return capacity_bytes_;
-    }
-    void set_capacity_bytes(size_t capacity) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        capacity_bytes_ = capacity;
-    }
+    size_t capacity_bytes() const { return capacity_bytes_; }
+    void set_capacity_bytes(size_t capacity) { capacity_bytes_ = capacity; }
 
     uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
     uint64_t hits_in_storage() const { return hits_in_storage_.load(std::memory_order_relaxed); }
@@ -824,19 +821,6 @@ class Mem::Impl {
         unpersisted_head_.unpersisted_prev = group;
     }
 
-    void trim_loop() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        while (!trim_cv_.wait_for(lock, std::chrono::seconds(10), [this] { return trim_stop_; })) {
-            if (!capacity_bytes_)
-                continue;
-            const size_t keep = capacity_bytes_ - std::min(capacity_bytes_, current_bytes_);
-            const size_t slack = capacity_bytes_ / 8;
-            lock.unlock(); // Returning pages can be slow; do not hold the cache lock.
-            trim_heap(keep, slack);
-            lock.lock();
-        }
-    }
-
     std::unordered_map<std::string, EntryGroup> cache_;
 
     EntryGroup lru_head_;
@@ -849,9 +833,6 @@ class Mem::Impl {
     std::atomic<bool> evict_enabled_;
 
     mutable std::mutex mutex_;
-    std::condition_variable trim_cv_;
-    bool trim_stop_ = false;
-    std::thread trim_thread_;
 
     std::atomic<int> deletion_guard_count_{0};
     std::mutex deletion_cv_mutex_;

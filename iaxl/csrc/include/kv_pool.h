@@ -17,10 +17,6 @@
 
 namespace kv_pool {
 
-// Warm the cache capacity through tcmalloc; false for zero capacity or other allocators.
-bool prefault_heap(size_t bytes);
-void trim_heap(size_t keep_bytes, size_t slack_bytes);
-
 inline constexpr char LABEL_SEP = ':';
 
 [[noreturn]] inline void invalid_label(std::string_view value) {

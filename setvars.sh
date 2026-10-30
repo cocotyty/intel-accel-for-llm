@@ -97,7 +97,6 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
-export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0}              # KV pool periodically returns excess free heap pages
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
