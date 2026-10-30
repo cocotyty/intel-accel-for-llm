@@ -164,16 +164,12 @@ class Mem::Impl {
         unpersisted_head_.unpersisted_prev = &unpersisted_head_;
         constexpr size_t chunk = 2 << 20;
         std::vector<void *> blocks(capacity_bytes / chunk + (capacity_bytes % chunk != 0));
-        cpu_set_t caller_cpus;
-        IAXL_CHECK(sched_getaffinity(0, sizeof(caller_cpus), &caller_cpus) == 0, "get prefault affinity");
         parallel::parallel_for(blocks.size(), [&](size_t i) {
             const size_t size = std::min(chunk, capacity_bytes - i * chunk);
             blocks[i] = malloc(size);
             IAXL_CHECK(blocks[i], "KV heap prefault allocation failed");
             memset(blocks[i], 1, size);
         });
-        // parallel_for may rebind the caller; retain all chunks until every write finishes.
-        IAXL_CHECK(sched_setaffinity(0, sizeof(caller_cpus), &caller_cpus) == 0, "restore prefault affinity");
         for (void *p : blocks)
             free(p);
     }
