@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import math
 import torch
 import numpy as np
 from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
@@ -107,6 +108,19 @@ class KVStoreLocal:
             cache_size_gb=pool_size_gb,
             rank=rank,
         )
+        if kv_caches:
+            # Size the scratch pool for the largest layer page. Mixed groups
+            # (MLA + indexer) have different page sizes; the first call must
+            # not create a pool that a later, larger page can overflow.
+            def page_bytes(tensor) -> int:
+                shape = list(tensor.shape)
+                shape.pop(self.block_dim)
+                return math.prod(shape) * tensor.element_size()
+
+            max_tensor = max(kv_caches.values(), key=page_bytes)
+            shape = list(max_tensor.shape)
+            shape.pop(self.block_dim)
+            self.tensorzip.ensure_pool(tuple(shape), max_tensor.dtype)
         start_profiling()
 
         logger.info(
@@ -162,6 +176,7 @@ class KVStoreLocal:
         layer_names: Optional[List[str]] = None,
         description: str = "",
         label: Optional[str] = None,
+        flush: bool = True,
     ) -> Dict[str, Task]:
         # A non-default label is its own namespace: each block hash gets one
         # more EntryGroup and record row.
@@ -193,7 +208,9 @@ class KVStoreLocal:
             skip_compression_count=local_skip,
         )
 
-        if label is not None or self.layer_names[-1] in layer_names:
+        if (label is not None and flush) or (
+            label is None and self.layer_names[-1] in layer_names
+        ):
             self.tensorzip.put_finish(label or self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
