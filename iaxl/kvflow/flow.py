@@ -151,6 +151,18 @@ class KVFlow:
         self._streams_initialized = True
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
 
+    def ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype) -> None:
+        """Pre-create the scratch pool with the largest block shape.
+
+        KV groups may have different page sizes (e.g. MLA + indexer). A single
+        pool sized by the first call would overflow when a later, larger page
+        arrives; sizing it up front keeps the existing single-pool data plane
+        while wasting only the padded tail of smaller pages.
+        """
+        if self.has_only_mode:
+            return
+        self._ensure_pool(tuple(block_shape), dtype)
+
     def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
         if self.chunk_pool is None:
             self.chunk_pool = ScratchPool(
@@ -175,6 +187,15 @@ class KVFlow:
             logger.warning("ScratchPool exhausted: waited %.3f ms (%d rounds) for %d blocks",
                            (time.perf_counter() - start) * 1e3, rounds, count)
         return tensors
+
+    @staticmethod
+    def _chunk_inner_contiguous(tensor: torch.Tensor, chunk_dim: int) -> bool:
+        stride = 1
+        for dim in range(tensor.dim() - 1, chunk_dim, -1):
+            if tensor.stride(dim) != stride:
+                return False
+            stride *= tensor.size(dim)
+        return True
 
     def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
         if isinstance(tensor, RemoteTensor):
@@ -223,7 +244,14 @@ class KVFlow:
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert (
+                isinstance(tensor, RemoteTensor)
+                or (
+                    chunk_dim == 0
+                    and self._chunk_inner_contiguous(tensor, chunk_dim)
+                )
+                or tensor.is_contiguous()
+            ), "GPU tensor chunks must be contiguous inside each chunk"
             assert tensor.shape == first_t.shape, "all tensors must have the same shape"
             assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
@@ -346,7 +374,14 @@ class KVFlow:
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert (
+                isinstance(tensor, RemoteTensor)
+                or (
+                    chunk_dim == 0
+                    and self._chunk_inner_contiguous(tensor, chunk_dim)
+                )
+                or tensor.is_contiguous()
+            ), "GPU tensor chunks must be contiguous inside each chunk"
             assert tensor.shape == first_t.shape, "all tensors must have the same shape"
             assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
             if priorities is not None and tensor_key not in priorities:

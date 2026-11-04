@@ -105,7 +105,7 @@ class KVStoreRemote:
 
     # -- data path -------------------------------------------------------------
     def _xfer(self, method, block_indices, block_hashs, layer_names, description, what, label=None,
-              priorities=None, bundle_id=0):
+              priorities=None, bundle_id=0, flush=True):
         if self.has_only_mode:
             raise RuntimeError(f"{what}() not available in has-only mode (kv_caches not provided)")
         names = layer_names or self.layer_names
@@ -118,7 +118,8 @@ class KVStoreRemote:
                     raise ValueError(f"priorities is missing layer {name}")
                 layer_priorities.append(priorities[name])
         payload = rpc.pack_blocks(block_indices, block_hashs, [self.layer_idx[n] for n in names],
-                                  description, label or "", layer_priorities, bundle_id)
+                                  description, label or "", layer_priorities, bundle_id,
+                                  flush=flush)
         job_id = int.from_bytes(self.rpc.call(method, payload), "little")
         tasks = {n: RemoteTask(job_id, n) for n in names}
         self._pending[job_id] = [tasks, len(tasks)]
@@ -127,10 +128,11 @@ class KVStoreRemote:
         return tasks
 
     def put(self, block_indices, block_hashs, layer_names=None, description="",
-            label=None) -> Dict[str, RemoteTask]:
+            label=None, flush=True) -> Dict[str, RemoteTask]:
         if not self.has_only_mode:
             self._sync()  # attention kernels must have written kv_caches before the daemon READs
-        return self._xfer(rpc.PUT, block_indices, block_hashs, layer_names, description, "put", label=label)
+        return self._xfer(rpc.PUT, block_indices, block_hashs, layer_names, description,
+                          "put", label=label, flush=flush)
 
     def get(self, block_indices, block_hashs, layer_names=None, description="",
             label=None, priorities=None, bundle_id=0) -> Dict[str, RemoteTask]:

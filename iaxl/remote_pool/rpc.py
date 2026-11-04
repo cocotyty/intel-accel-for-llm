@@ -58,14 +58,15 @@ def unpack_hashes(buf: bytes, off: int = 0):
 
 
 def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: str = "",
-                priorities: Optional[List[int]] = None, bundle_id: int = 0) -> bytes:
+                priorities: Optional[List[int]] = None, bundle_id: int = 0,
+                flush: bool = True) -> bytes:
     """`priorities`: one OMP-Main level per entry of `layer_idx` (GET only; None: level 0)."""
     desc = description.encode()
     lab = label.encode()
     levels = priorities or []
     return b"".join((
-        struct.pack("<IHHHHQ", len(block_indices), len(layer_idx), len(levels), len(desc),
-                    len(lab), bundle_id),
+        struct.pack("<IHHHHQB", len(block_indices), len(layer_idx), len(levels), len(desc),
+                    len(lab), bundle_id, flush),
         np.asarray(block_indices, dtype=np.int32).tobytes(),
         np.asarray(layer_idx, dtype=np.int16).tobytes(),
         np.asarray(levels, dtype=np.int8).tobytes(),
@@ -76,8 +77,8 @@ def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: 
 
 
 def unpack_blocks(buf: bytes):
-    n, nl, npri, nd, nlab, bundle_id = struct.unpack_from("<IHHHHQ", buf)
-    off = 20
+    n, nl, npri, nd, nlab, bundle_id, flush = struct.unpack_from("<IHHHHQB", buf)
+    off = 21
     indices = np.frombuffer(buf, np.int32, count=n, offset=off).tolist()
     off += 4 * n
     layer_idx = np.frombuffer(buf, np.int16, count=nl, offset=off).tolist()
@@ -87,7 +88,8 @@ def unpack_blocks(buf: bytes):
     hashes, off = unpack_hashes(buf, off)
     desc = buf[off:off + nd].decode()
     off += nd
-    return indices, hashes, layer_idx, desc, buf[off:off + nlab].decode(), priorities, bundle_id
+    return (indices, hashes, layer_idx, desc, buf[off:off + nlab].decode(),
+            priorities, bundle_id, bool(flush))
 
 
 def pack_has(block_hashs: List[str], label: str = "", truncate: bool = True) -> bytes:
@@ -263,10 +265,12 @@ class KVStoreService:
         self.layer_idx = {n: i for i, n in enumerate(self.layer_names)}
 
     def _xfer(self, peer, payload, is_put):
-        indices, hashes, layer_idx, desc, label, priorities, bundle_id = unpack_blocks(payload)
+        (indices, hashes, layer_idx, desc, label, priorities, bundle_id,
+         flush) = unpack_blocks(payload)
         names = [self.layer_names[i] for i in layer_idx] or None
         if is_put:
-            tasks = self.kvstore.put(indices, hashes, names, desc, label=label or None)
+            tasks = self.kvstore.put(indices, hashes, names, desc, label=label or None,
+                                     flush=flush)
         else:
             layer_priorities = None
             if priorities:
